@@ -1,0 +1,26 @@
+# deps
+node_modules/
+.venv/
+__pycache__/
+
+# build
+.next/
+dist/
+build/
+*.tsbuildinfo
+
+# env
+.env
+.env.local
+.env.*.local
+
+# data — seeded from fixtures on boot, never committed
+*.db
+*.db-journal
+*.sqlite
+
+# local agent scratch — see prompts/README.md
+prompts/
+
+# os
+.DS_Store
