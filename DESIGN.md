@@ -95,7 +95,12 @@ Seed loan `LN-2291`, Northwind Bakery LLC, $95,000. Carries `bank_account_number
 
 1. **Do contextual-access hooks fire for tools served by a registered Remote MCP server?**
    The docs do not say. If they don't, the architecture changes fundamentally.
-   *Blocking. Verify first.*
+   *Answered: yes — see `docs/spikes/02-remote-mcp-hooks.md` (#2). No longer blocking.
+   Two caveats carried forward: the toolkit name is a normalised form of the server's own
+   `serverInfo.name`, not the dashboard server ID, so the `loan-app` toolkit named under
+   **Tool surface** below is not a form Arcade can produce — read the real value off a
+   `/pre` payload before writing policy rules; and set each hook's failure mode to
+   fail-closed explicitly rather than assuming the default.*
 2. **What survives a hook denial over MCP?** We confirmed `@arcadeai/arcadejs` exposes
    `execution_id` and typed `CONTEXT_CHECK_FAILED` / `CONTEXT_DENIED` errors with
    `additional_prompt_content`. Over MCP those may flatten to `isError: true` + text.
