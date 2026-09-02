@@ -74,7 +74,7 @@ rules below load-bearing rather than cosmetic — and what makes getting them wr
 The engine passes caller identity to the MCP server itself out-of-band, in
 `_meta.arcade_context` on the `tools/call` params.
 
-### One caveat on "identical": `tool.metadata`
+### `tool.metadata` is never populated — for either kind of tool
 
 `ToolInfo` in the public schema
 ([`ArcadeAI/schemas`, `logic_extensions/http/1.0/schema.yaml`](https://github.com/ArcadeAI/schemas/blob/main/logic_extensions/http/1.0/schema.yaml))
@@ -84,20 +84,46 @@ has an optional fourth field beyond `name` / `toolkit` / `version`:
 metadata → { classification.service_domains, behavior.operations, extras }
 ```
 
-**It was absent from every payload captured here, and no hosted-toolkit payload was captured
-to compare against.** So "identical" is established for the three required fields and is
-untested for the one field most likely to differ.
+It was absent from every remote-tool payload. To find out whether that was a remote-server gap,
+a hosted-toolkit tool that *does* carry it was executed with a `/pre` hook attached.
+`Clickup.GetSystemGuidance@1.2.3` has this in its **definition**:
 
-There is a plausible reason it would differ: that metadata is supplied by Arcade's own tool
-definitions, and a third-party MCP server has no channel to provide it. If that is right, it
-is absent for remote tools by construction rather than by accident.
+```json
+{"behavior": {"operations": ["read"], "read_only": true, "destructive": false,
+              "idempotent": true, "open_world": true}}
+```
 
-**This matters to #7.** A policy rule keyed on `behavior.operations` — "writes need approval,
-reads don't" — would test green against a hosted-toolkit fixture and then match nothing for
-every `loan-app` tool. Same silent fail-open as the naming trap: a rule that matches nothing
-is indistinguishable from a rule that permits. Either derive read/write from the tool name in
-our own policy table, or capture a hosted-toolkit `/pre` payload and confirm the field is
-populated there before depending on it.
+Its captured `/pre` payload:
+
+```
+Clickup.GetSystemGuidance | tool keys: ['name','toolkit','version'] | metadata: null
+```
+
+Identical to the remote tool. The metadata lives in the tool definition and **is not propagated
+into hook payloads at all**.
+
+Two conclusions, and the second is the one that bites:
+
+1. "Payload identical to hosted toolkits" is confirmed, now including `metadata`. Both carry
+   only the three required fields.
+2. **`behavior.operations` is unavailable to hooks, full stop.** This is not a remote-server
+   gap — it is a hook-payload gap. ⚠️ **#7 must not key a policy rule on it.** Such a rule
+   matches nothing for hosted *and* remote tools alike, and a rule that matches nothing is
+   indistinguishable from a rule that permits. Derive read/write from our own policy table
+   keyed on `tool.name`, which is the only classification the hook actually receives.
+
+### Requirement checks run before `/pre`
+
+Executing a tool whose requirements are unmet returns
+`{"name":"tool_requirements_not_met","message":"secret not found: APOLLO_API_KEY"}` and
+**no `/pre` hook fires**. Authorization and secret requirements are evaluated before the
+pre-execution hook.
+
+A pre-hook therefore cannot observe, audit or override a call that failed requirements. For the
+demo this matters in one place: if a persona is not authorized for a tool, the control plane
+sees nothing at all — there is no `/pre` event to show on the panel, and no audit row. If an
+act depends on showing an unauthorized attempt, it has to be staged as a policy denial rather
+than an authorization failure.
 
 ## Tool namespacing
 
@@ -154,12 +180,17 @@ stripped from `loan-mcp-server`, leaving `loan` → `Loan`.
 **A policy rule keyed on `render-mcp-server.*` would match nothing**, because that is not what
 `tool.toolkit` contains. Filed upstream as #26.
 
-One limit on how far that goes. This establishes what a tool *resolves to*; it does not
-establish that the registered-ID form fails to resolve. Arcade could accept `spike-02-probe.ping_probe`
-as an execution alias, which would make the published example loose rather than wrong. A single
-Execute call with the server-ID form would settle it — **not run**, and the probe has since been
-torn down. It changes nothing downstream: `tool.toolkit` is what hook payloads carry either way,
-and that is what policy rules must key on.
+**And the registered-ID form is not an execution alias.** Tested directly:
+
+| `tool_name` passed to Execute | Result |
+|---|---|
+| `Loan.ping_probe` | ✅ resolved |
+| `Loan_ping_probe` | ✅ resolved |
+| `spike-02-probe.ping_probe` | ❌ `400 failed to parse tool name` |
+| `loan-mcp-server.ping_probe` | ❌ `400 failed to parse tool name` |
+
+The failure is a **parse** error, not "not found" — a hyphenated toolkit segment cannot form a
+well-formed name at all. So the published example is wrong, not merely loose.
 
 ### Before you write a policy rule: read the toolkit name off the wire
 
@@ -188,13 +219,16 @@ survives the normalisation changing under us.
   per [Build your own](https://docs.arcade.dev/en/guides/contextual-access/build-your-own).
 - retry is optional and off unless enabled; only transient failures (5xx, timeout, connection
   error) are retried, 4xx is not — also public, same page.
-- response caching: the extension's stored retry defaults were observed, but caching
-  behaviour was not exercised. The published docs describe it as off by default; **not
-  verified here**.
+- response caching was never exercised; the published docs describe it as off by default,
+  **not verified here**.
 - **`timeout_ms` exists at two levels and they are not the same field.** Creating the
   extension with `timeout_ms: 10000` on each webhook *endpoint* stored 10000 on the endpoint
   but left each *hook* at `5000`. If 5s is not what you want, set the hook-level value
-  explicitly and read it back. The accepted bounds were not probed.
+  explicitly and read it back.
+- **Endpoint-level bounds are 100 ms – 120 000 ms**, confirmed by probing the validator
+  (`timeout_ms must be 100 or greater`; 120001 rejected).
+- **Hooks are unique per `(hook_point, priority)`** — a second hook on the same point with the
+  same priority is rejected with `choose a different priority`.
 
 ## Failure mode: there is no default — you must state it
 
@@ -224,26 +258,24 @@ matches nothing.
 
 ## Confidence
 
-Each row below was observed. Full transcript in
+Everything below was observed. Full transcript in
 [`evidence/`](evidence/02-remote-mcp-hooks-transcript.md).
-
-Two scope limits on the table. The namespacing row confirms the algorithm on **one input**:
-`loan-mcp-server` → `Loan` exercises lowercase, the substring strip, and title-casing a single
-part. The multi-part join, the `Tools` fallback for a fully-stripped name, and version
-normalisation are all **untested**. And `tool.metadata` was absent from every captured payload
-with no hosted-toolkit payload to compare — see the caveat above.
 
 | Claim | |
 |---|---|
-| `/access`, `/pre`, `/post` all fire for a remote MCP server tool | ✅ both SDK and MCP gateway paths |
+| `/access`, `/pre`, `/post` all fire for a remote MCP server tool | ✅ SDK and MCP gateway paths |
 | Pre-hook denial blocks before the backend; `/post` skipped | ✅ both paths |
-| Access hook hides the tool from `tools/list` over a gateway, and it is uncallable | ✅ act 1's mechanic |
-| Toolkit resolves to `Loan` from `serverInfo.name = loan-mcp-server` | ✅ discriminated against both rival rules |
-| MCP wire name is `Loan_ping_probe` | ✅ |
-| Payload carries no field identifying tool origin | ✅ |
+| Access hook hides the tool from `tools/list`, and it is uncallable | ✅ act 1's mechanic |
+| Namespacing algorithm — substring strip, multi-part join, `Tools` fallback, version normalisation | ✅ four inputs, all predicted exactly |
+| The registered server ID is **not** an execution alias | ✅ `400 failed to parse tool name` |
+| Payload identical to hosted toolkits, including `tool.metadata` | ✅ compared against a hosted tool that carries metadata in its definition |
+| `tool.metadata` is never populated in hook payloads, for either kind | ✅ — see the #7 warning above |
+| Requirement failures short-circuit before `/pre` | ✅ no hook fires |
 | No default `failure_mode`; the field is required | ✅ |
 | Extension created inactive; retry off by default | ✅ |
+| Endpoint `timeout_ms` bounds 100 ms – 120 000 ms | ✅ probed |
 | A denial over MCP carries no `execution_id` | ✅ see below |
+| Response caching defaults | ⬜ **not exercised** — the one claim here taken from published docs rather than observed |
 
 ## Denials over MCP
 

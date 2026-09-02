@@ -343,3 +343,107 @@ enumerating every toolkit in the project (thousands of tools, ~1.6 MB). With a 5
 fail-closed timeout, `apps/hooks` must answer that quickly or every call in the project
 fails. Do not do per-request I/O in the access hook without caching.
 
+
+---
+
+# Part 3 — closing the open items
+
+Run 2026-09-02, second session, in the same throwaway project. Four probe variants on one
+process, each MCP endpoint reporting a different `serverInfo`, registered as four workers.
+
+## 10. Namespacing algorithm, four inputs
+
+Predictions written down before registering, then compared:
+
+| Worker ID | `serverInfo.name` | version | Predicted | Actual |
+|---|---|---|---|---|
+| `spike-02-probe` | `loan-mcp-server` | `1.0.0` | `Loan@1.0.0` | `Loan.ping_probe@1.0.0` ✅ |
+| `spike-02-multi` | `loan-app` | `1.0.0` | `LoanApp@1.0.0` | `LoanApp.ping_probe@1.0.0` ✅ |
+| `spike-02-strip` | `mcp-server` | `1.0.0` | `Tools@1.0.0` | `Tools.ping_probe@1.0.0` ✅ |
+| `spike-02-ver` | `probe-x` | `2.0.0-beta+build.5` | `ProbeX@2.0.0-betabuild.5` | `ProbeX.ping_probe@2.0.0-betabuild.5` ✅ |
+
+All four exact. This covers the branches Part 1 left untested: the **multi-part join**
+(`loan-app` → `LoanApp`), the **`Tools` fallback** when every character is stripped
+(`mcp-server` → `Tools`), and **version normalisation** (the `+` in `2.0.0-beta+build.5` is
+dropped, `-` and `.` survive).
+
+## 11. Is the registered ID an execution alias? No.
+
+Four name forms against `POST /v1/tools/execute`:
+
+| `tool_name` | Result |
+|---|---|
+| `Loan.ping_probe` | ✅ resolved, backend reached |
+| `Loan_ping_probe` | ✅ resolved (underscore form also accepted here) |
+| `spike-02-probe.ping_probe` | ❌ `400 malformed_request` |
+| `loan-mcp-server.ping_probe` | ❌ `400 malformed_request` |
+
+```
+{"name":"malformed_request","message":"failed to parse tool name spike-02-probe.ping_probe"}
+```
+
+Note the error is **parse failure**, not "tool not found" — consistent with toolkit names being
+alphanumeric-only, so a hyphenated form cannot be a well-formed name at all.
+
+**There is no execution alias.** The published `render-mcp-server.get_key_value` example is
+wrong rather than loose.
+
+## 12. `tool.metadata` — absent for hosted toolkits too
+
+Part 1 noted `tool.metadata` was missing from the remote tool's payloads, with no hosted
+comparison. Now compared directly.
+
+Scanning 1,200 catalogue entries for a tool that carries `metadata` **and** needs neither
+authorization nor secrets found exactly one: `Clickup.GetSystemGuidance@1.2.3`. Its
+**definition** carries:
+
+```json
+{"behavior": {"operations": ["read"], "read_only": true, "destructive": false,
+              "idempotent": true, "open_world": true}}
+```
+
+Executed with a `/pre` hook attached. The captured payload:
+
+```
+Clickup.GetSystemGuidance | tool keys: ['name', 'toolkit', 'version'] | metadata: null
+```
+
+**Identical to the remote tool.** The metadata exists in the tool definition and is simply not
+propagated into hook payloads, for either kind of tool.
+
+So two conclusions, and the second is the one that matters:
+
+1. "Payload identical to hosted toolkits" is **confirmed**, now including `tool.metadata` —
+   both carry only `name`, `toolkit`, `version`.
+2. **`behavior.operations` is unavailable to hooks entirely.** Not a remote-server gap — a
+   hook-payload gap. A policy rule keyed on it would match nothing for hosted *and* remote
+   tools alike.
+
+## 13. Requirement checks run before `/pre`
+
+`Apollo.GetApiUsage` was tried first and returned:
+
+```json
+{"name":"tool_requirements_not_met","message":"secret not found: APOLLO_API_KEY"}
+```
+
+**No `/pre` fired.** Authorization and secret requirements are evaluated *before* the
+pre-execution hook, so a tool whose requirements are unmet never reaches it. A pre-hook cannot
+observe, audit, or override a call that failed requirements.
+
+## 14. `timeout_ms` bounds
+
+Endpoint-level `timeout_ms` probed against the create endpoint:
+
+| Value | Result |
+|---|---|
+| `50`, `99` | ❌ `timeout_ms must be 100 or greater` |
+| `100` | ✅ accepted (rejected later, on a priority collision — a different error) |
+| `120000` | ✅ accepted (same) |
+| `120001`, `300000` | ❌ validation failure |
+
+**100 ms – 120 000 ms confirmed** at the endpoint level.
+
+Incidental: hooks are unique per `(hook_point, priority)` —
+`another hook already exists with this priority for the same hook point; choose a different priority`.
+Relevant if #13 ever wants two hooks on the same point.
