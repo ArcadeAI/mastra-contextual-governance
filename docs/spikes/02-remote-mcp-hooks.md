@@ -74,6 +74,31 @@ rules below load-bearing rather than cosmetic — and what makes getting them wr
 The engine passes caller identity to the MCP server itself out-of-band, in
 `_meta.arcade_context` on the `tools/call` params.
 
+### One caveat on "identical": `tool.metadata`
+
+`ToolInfo` in the public schema
+([`ArcadeAI/schemas`, `logic_extensions/http/1.0/schema.yaml`](https://github.com/ArcadeAI/schemas/blob/main/logic_extensions/http/1.0/schema.yaml))
+has an optional fourth field beyond `name` / `toolkit` / `version`:
+
+```
+metadata → { classification.service_domains, behavior.operations, extras }
+```
+
+**It was absent from every payload captured here, and no hosted-toolkit payload was captured
+to compare against.** So "identical" is established for the three required fields and is
+untested for the one field most likely to differ.
+
+There is a plausible reason it would differ: that metadata is supplied by Arcade's own tool
+definitions, and a third-party MCP server has no channel to provide it. If that is right, it
+is absent for remote tools by construction rather than by accident.
+
+**This matters to #7.** A policy rule keyed on `behavior.operations` — "writes need approval,
+reads don't" — would test green against a hosted-toolkit fixture and then match nothing for
+every `loan-app` tool. Same silent fail-open as the naming trap: a rule that matches nothing
+is indistinguishable from a rule that permits. Either derive read/write from the tool name in
+our own policy table, or capture a hosted-toolkit `/pre` payload and confirm the field is
+populated there before depending on it.
+
 ## Tool namespacing
 
 The toolkit name for a remote MCP server's tools is **not** the server ID you type into the
@@ -126,9 +151,15 @@ three different strings:
 Arcade resolved it to **`Loan.ping_probe@1.0.0`**. The `mcp` and `server` substrings are
 stripped from `loan-mcp-server`, leaving `loan` → `Loan`.
 
-**The published example is wrong**, or at best is loose prose about the server you registered
-rather than the name a tool resolves to. A policy rule written against `render-mcp-server.*`
-would match nothing. That is filed upstream as #26.
+**A policy rule keyed on `render-mcp-server.*` would match nothing**, because that is not what
+`tool.toolkit` contains. Filed upstream as #26.
+
+One limit on how far that goes. This establishes what a tool *resolves to*; it does not
+establish that the registered-ID form fails to resolve. Arcade could accept `spike-02-probe.ping_probe`
+as an execution alias, which would make the published example loose rather than wrong. A single
+Execute call with the server-ID form would settle it — **not run**, and the probe has since been
+torn down. It changes nothing downstream: `tool.toolkit` is what hook payloads carry either way,
+and that is what policy rules must key on.
 
 ### Before you write a policy rule: read the toolkit name off the wire
 
@@ -157,7 +188,9 @@ survives the normalisation changing under us.
   per [Build your own](https://docs.arcade.dev/en/guides/contextual-access/build-your-own).
 - retry is optional and off unless enabled; only transient failures (5xx, timeout, connection
   error) are retried, 4xx is not — also public, same page.
-- response caching is off by default.
+- response caching: the extension's stored retry defaults were observed, but caching
+  behaviour was not exercised. The published docs describe it as off by default; **not
+  verified here**.
 - **`timeout_ms` exists at two levels and they are not the same field.** Creating the
   extension with `timeout_ms: 10000` on each webhook *endpoint* stored 10000 on the endpoint
   but left each *hook* at `5000`. If 5s is not what you want, set the hook-level value
@@ -191,8 +224,14 @@ matches nothing.
 
 ## Confidence
 
-Everything below is measured. Full transcript in
+Each row below was observed. Full transcript in
 [`evidence/`](evidence/02-remote-mcp-hooks-transcript.md).
+
+Two scope limits on the table. The namespacing row confirms the algorithm on **one input**:
+`loan-mcp-server` → `Loan` exercises lowercase, the substring strip, and title-casing a single
+part. The multi-part join, the `Tools` fallback for a fully-stripped name, and version
+normalisation are all **untested**. And `tool.metadata` was absent from every captured payload
+with no hosted-toolkit payload to compare — see the caveat above.
 
 | Claim | |
 |---|---|
