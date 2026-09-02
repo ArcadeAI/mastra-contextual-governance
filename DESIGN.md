@@ -107,6 +107,10 @@ Seed loan `LN-2291`, Northwind Bakery LLC, $95,000. Carries `bank_account_number
    Determines whether panel correlation is exact or heuristic.
 3. **Does Arcade's stock Slack provider grant a user token with `chat:write`?**
    If not, register a custom Slack app as an Arcade auth provider. Act 2 depends on it.
+   *Answered: yes — see `docs/spikes/03-slack-scopes.md` (#3). No longer blocking. The stock
+   provider requests scopes as Slack `user_scope`, and a Block Kit `chat.postMessage` with the
+   resulting token succeeded and renders as the user. Act 2 posts as the requester. The tool
+   must request four scopes, not three: `users:read` is a prerequisite for `users:read.email`.*
 
 ## Sequence (~2.5 weeks)
 
