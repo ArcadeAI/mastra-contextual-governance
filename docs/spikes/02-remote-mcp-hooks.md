@@ -24,8 +24,8 @@ All three hooks fired. The full transcript, including every payload, is in
 [`evidence/02-remote-mcp-hooks-transcript.md`](evidence/02-remote-mcp-hooks-transcript.md) —
 anyone can re-run it and diff.
 
-One leg is **not** covered: the call was made over the SDK execute path, not through an MCP
-gateway. See [Outstanding](#outstanding).
+Then repeated over an **MCP gateway** — the path Mastra's `MCPClient` will use — including the
+access hook hiding the tool from `tools/list`. Both paths are covered.
 
 ## What holds, and why it is stable
 
@@ -45,11 +45,13 @@ Consequences worth relying on:
   Mastra's `MCPClient` will use) are governed on the same path as SDK calls. `tools/list` over
   that surface is access-filtered; `tools/call` runs pre and post.
 
-Observed directly. With the hooks permitting, the probe saw
+Observed directly, on both paths. With the hooks permitting, the probe saw
 **`/access` → `/pre` → tool reached the backend → `/post`**. With the pre-hook denying, it saw
 **`/access` → `/pre`** and nothing further: the backend was never reached and `/post` never
-ran. `execution_id` was identical across `/pre` and `/post`, so the two correlate exactly on
-the SDK path.
+ran. Identical over the SDK execute path and over an MCP gateway.
+
+`execution_id` is identical across `/pre` and `/post`, so the two correlate exactly — but see
+[Denials over MCP](#denials-over-mcp) for what the *client* can see, which is much less.
 
 ## Payload: identical to hosted toolkits
 
@@ -189,47 +191,84 @@ matches nothing.
 
 ## Confidence
 
-| Claim | Status |
+Everything below is measured. Full transcript in
+[`evidence/`](evidence/02-remote-mcp-hooks-transcript.md).
+
+| Claim | |
 |---|---|
-| `/access`, `/pre`, `/post` all fire for a remote MCP server tool | **Measured.** Full transcript in `evidence/` |
-| Pre-hook denial blocks before the backend is reached; `/post` is skipped | **Measured** |
-| `execution_id` correlates `/pre` and `/post` | **Measured**, on the SDK execute path |
-| Toolkit resolves to `Loan` from `serverInfo.name = loan-mcp-server` | **Measured.** Discriminated against both rival rules |
-| Payload carries no field identifying tool origin | **Measured** |
-| No default `failure_mode`; the field is required | **Measured** |
-| Extension is created inactive; retry off by default | **Measured** |
-| Hook payload shapes, response codes, 5s default | **Public**, cited, and matches what was captured |
-| Same behaviour when called through an **MCP gateway** rather than the SDK | **Not tested.** See Outstanding |
-| Denial's wire form *over MCP* (`isError` + text) | **Not tested.** SDK path shows `CONTEXT_DENIED` + prefixed message |
+| `/access`, `/pre`, `/post` all fire for a remote MCP server tool | ✅ both SDK and MCP gateway paths |
+| Pre-hook denial blocks before the backend; `/post` skipped | ✅ both paths |
+| Access hook hides the tool from `tools/list` over a gateway, and it is uncallable | ✅ act 1's mechanic |
+| Toolkit resolves to `Loan` from `serverInfo.name = loan-mcp-server` | ✅ discriminated against both rival rules |
+| MCP wire name is `Loan_ping_probe` | ✅ |
+| Payload carries no field identifying tool origin | ✅ |
+| No default `failure_mode`; the field is required | ✅ |
+| Extension created inactive; retry off by default | ✅ |
+| A denial over MCP carries no `execution_id` | ✅ see below |
 
-## Outstanding
+## Denials over MCP
 
-<a id="outstanding"></a>
+<a id="denials-over-mcp"></a>
 
-One leg remains. The calls above went through the SDK execute path. **The MCP gateway path —
-`https://api.arcade.dev/mcp/{gateway}`, which is what Mastra's `MCPClient` will use — was not
-exercised**, because creating a gateway is a dashboard action and is not exposed on either API
-surface reachable with a project key.
+This is `DESIGN.md` risk 2, and #6 owns the decision. Measured on both paths, and they differ.
 
-What it would settle:
+Over the **SDK execute path** a denial returns a structured error:
 
-- that `tools/list` over a gateway is access-filtered (act 1 depends on this specific path)
-- the wire form of a denial over MCP, which `DESIGN.md` risk 2 and #6 both turn on — whether
-  `execution_id` survives, or whether it flattens to `isError` + text
+```json
+{ "error": { "message": "Tool execution was denied by an extension policy: <error_message>",
+             "kind": "CONTEXT_DENIED", "developer_message": "<error_message>" } }
+```
 
-The rest of the setup is reusable: register the probe, attach the extension, create a gateway
-exposing `Loan.ping_probe`, and call it over Streamable HTTP. Perhaps twenty minutes once a
-gateway exists.
+Over an **MCP gateway** the same denial flattens to:
+
+```json
+{ "isError": true,
+  "content": [{ "type": "text",
+                "text": "Tool execution was denied by an extension policy: <error_message>" }] }
+```
+
+The hook saw `execution_id` on its own `/pre` payload. **The client sees no execution
+identifier, no typed error kind, and no `structuredContent`.**
+
+Two consequences:
+
+- **Good for act 2.** The hook's `error_message` reaches the model verbatim behind a fixed
+  prefix, so `DESIGN.md`'s "the hook writes the remediation instruction, not the system
+  prompt" holds over MCP.
+- **The panel cannot correlate exactly over MCP.** There is nothing to join on. Either the
+  panel correlates heuristically, or `apps/hooks` embeds its own correlation token *into the
+  `error_message` text* — which it controls — and the panel parses that back out. That second
+  option is worth considering before #14 commits to a design.
+
+## Operational findings worth carrying into #13
+
+**The `/access` response shape is under-documented, and getting it wrong fails closed.**
+`deny` and `only` take the same `Toolkits` shape as the request, so the innermost value is an
+*array*:
+
+```json
+{ "deny": { "Loan": { "tools": { "ping_probe": [{ "version": "1.0.0" }] } } } }
+```
+
+Returning `{}` there instead produced, on every tool in the project:
+
+```
+-32603 Your organization's tool access policy service could not be reached
+```
+
+A malformed hook response is indistinguishable from a dead hook server. The published guide
+types `only`/`deny` as "object" with no example; the canonical shape is in the public schema
+repo at `ArcadeAI/schemas`, `logic_extensions/http/1.0/schema.yaml`. Validate hook responses
+against that schema in CI.
+
+**The access hook is called repeatedly, and at least once with the whole catalog.** One
+`tools/list` produced four `/access` calls, one scoped to `Loan` and one enumerating every
+toolkit in the project — roughly 1.6 MB. Against a 5s fail-closed timeout, `apps/hooks` must
+answer that fast or every call in the project fails. No per-request I/O in the access hook
+without caching.
 
 ## Incidental, outside this slice
 
-**What survives a denial** (`DESIGN.md` risk 2, owned by #6). On the SDK path, measured: the
-hook's own `error_message` reaches the caller verbatim behind the fixed prefix
-`Tool execution was denied by an extension policy: `, with `kind: CONTEXT_DENIED` and the raw
-message repeated in `developer_message`. Good for act 2 — "the hook writes the remediation
-instruction" holds.
-
-**Over MCP this is still untested**, and that is the half #6 actually needs: whether
-`execution_id` and the typed kind survive the boundary or flatten to `isError` + text
-determines whether panel correlation is exact or heuristic. Do not string-match the prefix
-until it has been seen on the MCP wire. Pointer left on #6.
+Risk 2 got answered in passing — written up under
+[Denials over MCP](#denials-over-mcp) rather than here, since it is now measured rather than a
+guess. It remains #6's decision to make; pointer left on that issue.

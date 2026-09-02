@@ -216,3 +216,130 @@ Two things worth noting:
 
 - The plugin is created `status: inactive` and must be PATCHed to `active` before any hook fires.
 
+
+---
+
+# Part 2 — over an MCP gateway
+
+Gateway: `https://api.arcade.dev/mcp/gw_3ImsCcArZvgO537KghywE0nWIF8`, API-key audience,
+exposing `Loan.ping_probe`. This is the path Mastra's `MCPClient` will use.
+
+Two required headers beyond the bearer token: **`Arcade-User-Id`** (a request without it
+is rejected `401 Missing Arcade-User-Id header`) and the usual `Mcp-Session-Id` after
+`initialize`.
+
+## 5. Wire name over MCP
+
+`tools/list` returns:
+
+```
+Arcade_ListApps
+Loan_ping_probe
+```
+
+Confirms the `_` separator form: `Toolkit_tool_name`. The gateway's own `serverInfo.name`
+is its slug, `gw_3ImsCcArZvgO537KghywE0nWIF8`, with `title: loan-test`.
+
+## 6. Allow pass over MCP
+
+Hook sequence: **ACCESS → ACCESS → PRE → backend reached → POST**. Result:
+
+```json
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "{\"echoed\":\"over-the-gateway\",\"marker\":\"PROBE_REACHED_BACKEND\"}"
+    }
+  ],
+  "structuredContent": {
+    "echoed": "over-the-gateway",
+    "marker": "PROBE_REACHED_BACKEND"
+  }
+}
+```
+
+## 7. Deny pass over MCP — this is the answer #6 needs
+
+Hook sequence: **ACCESS → ACCESS → PRE**, backend never reached. The client receives:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "result": {
+    "isError": true,
+    "content": [
+      {
+        "type": "text",
+        "text": "Tool execution was denied by an extension policy: SPIKE02_DENIED_BY_PRE_HOOK. If you can read this string, the pre-hook fired for a remote MCP server tool and its message reached the model."
+      }
+    ]
+  }
+}
+```
+
+The hook itself saw `execution_id = tc_3ImsQm7QawPEv3eaksCjfiUuyDF` on its `/pre` payload.
+**None of that crosses the boundary.** Over MCP a denial is `isError: true` plus text —
+no `execution_id`, no typed error kind, no `structuredContent`. Compare the SDK path,
+which returns `kind: CONTEXT_DENIED` and a `developer_message`.
+
+The hook's `error_message` does survive verbatim behind the fixed prefix
+`Tool execution was denied by an extension policy: `.
+
+**Consequence for the control-plane panel: correlation over MCP cannot be exact.** There is
+no execution identifier in the client-visible payload to join on.
+
+## 8. Access hook filtering — act 1's mechanic
+
+With `/access` returning a deny list for `Loan.ping_probe`, `tools/list` over the gateway
+returns only `Arcade_ListApps`. The tool is gone.
+
+Calling it anyway by its wire name, to check the hiding is not merely cosmetic:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "error": {
+    "code": -32602,
+    "message": "tool not found",
+    "data": {
+      "internal_error": "failed to get tool loan.ping_probe@0: tool definition not found",
+      "name": "Loan_ping_probe"
+    }
+  }
+}
+```
+
+The backend was never reached — only ACCESS hooks fired, no `/pre`, no `tools/call`.
+So the tool is both invisible and uncallable. Act 1 works over MCP.
+
+## 9. Two operational findings
+
+**The `/access` response shape is under-documented and fails closed when wrong.** `deny`
+and `only` both take the same `Toolkits` shape as the request, so the innermost value is an
+*array* of version objects:
+
+```json
+{ "deny": { "Loan": { "tools": { "ping_probe": [{ "version": "1.0.0" }] } } } }
+```
+
+Returning `{}` for that inner value instead produced this, on every tool in the project:
+
+```
+-32603 Your organization's tool access policy service could not be reached, so access
+to this tool could not be verified.
+```
+
+A malformed hook response is indistinguishable from an unreachable hook server, and
+fail-closed then blocks everything. The published guide documents `only`/`deny` as
+"object" without an example; the canonical shape is in the public schema at
+`ArcadeAI/schemas`, `logic_extensions/http/1.0/schema.yaml`.
+
+**The access hook is called repeatedly, and at least once with the entire tool catalog.**
+A single `tools/list` produced four `/access` calls, one scoped to `Loan` and one
+enumerating every toolkit in the project (thousands of tools, ~1.6 MB). With a 5s
+fail-closed timeout, `apps/hooks` must answer that quickly or every call in the project
+fails. Do not do per-request I/O in the access hook without caching.
+
