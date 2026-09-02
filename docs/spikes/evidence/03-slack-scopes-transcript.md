@@ -169,4 +169,29 @@ message as the user. `missing_charset` is a warning about the request `Content-T
 ![Block Kit message rendered in the ArcadeDevTest DM as Mateo Torres](03-slack-block-kit-render.png)
 
 Header, two-column fields, justification section, green link button and context footer all
-render. The author line reads "Mateo Torres" with the user's avatar and no app badge.
+render. The author line reads "Mateo Torres 6:55 PM" with the user's avatar and no APP badge.
+
+## 8. Scope prerequisite probe — `users:read.email` without `users:read`
+
+Run after review, same project. A throwaway `user_id` so nothing was granted to a real user.
+
+`POST https://api.arcade.dev/v1/auth/authorize`
+
+```json
+{
+  "user_id": "spike03-scope-probe@example.invalid",
+  "auth_requirement": { "provider_id": "slack", "oauth2": { "scopes": ["users:read.email"] } }
+}
+```
+
+Arcade returned `status: pending` and a URL ending in `user_scope=users%3Aread.email%2C`.
+Opening it, Slack redirected to the workspace's `/oauth` page and rendered an error instead of
+a consent screen:
+
+```
+Arcade.dev could not be installed.
+Error details: Invalid permissions requested
+```
+
+No consent was shown and nothing was granted. Slack enforces `users:read` as a prerequisite of
+`users:read.email` at the authorize step, so #18 must request both.

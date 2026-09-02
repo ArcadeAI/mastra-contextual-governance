@@ -63,8 +63,10 @@ this demo needs are in that list.
 
 The scope list is a superset of what was requested because Arcade accumulates scopes per user
 per provider across authorizations, and this user had authorized the stock Slack toolkit
-before. Arcade's own `status.scopes` reports the same union. Whoever authorizes fresh will see
-exactly the four requested.
+before. Arcade's own `status.scopes` reports the same union. The authorize URL for a
+never-seen `user_id` carries exactly the four requested scopes under `user_scope`, so a fresh
+user should end up with exactly those four, but no fresh Slack account was available to
+confirm the token's final scope list. Marked as unverified below.
 
 ### Each scope, exercised
 
@@ -79,9 +81,9 @@ approver's email to a Slack ID, open the DM, post the Block Kit message.
 
 ### It renders as the requester
 
-The message shows in Slack under the authorizing user's name and avatar, with the full Block
-Kit layout (header, two-column fields, justification, a link button, a context footer). No
-"APP" badge next to the name. Screenshot in
+The message shows in Slack under the authorizing user's name, avatar and timestamp, with the
+full Block Kit layout (header, two-column fields, justification, a link button, a context
+footer). No "APP" badge next to the name. Screenshot in
 [`evidence/03-slack-block-kit-render.png`](evidence/03-slack-block-kit-render.png).
 
 One thing to know: the `chat.postMessage` response carries `bot_id`, `app_id` and a
@@ -94,9 +96,14 @@ renders it as the user. It does not mean the post went out as a bot.
 - **Post as the requester.** Fetch the requester's Slack token from Arcade at call time
   through the tool's `context.authorization.token`, declaring the `Slack` auth requirement
   with scopes `chat:write`, `im:write`, `users:read`, `users:read.email` on the tool. Do not
-  cache the token: it is a rotating token with a ~12 h life, and Arcade refreshes it.
-- **`users:read` must be requested alongside `users:read.email`.** Slack requires the former
-  for the latter to be grantable. Issue #3 listed three scopes; the tool needs four.
+  cache the token: `auth.test` reports a ~12 h life. Arcade's provider model is that it
+  holds the refresh token and renews on demand, but renewal past expiry was not observed in
+  this spike (see the confidence table). If #18 sees `token_expired` from Slack, this is the
+  first place to look.
+- **`users:read` must be requested alongside `users:read.email`.** Observed: an authorize
+  request for `users:read.email` alone produced a Slack error page, "Arcade.dev could not be
+  installed. Invalid permissions requested", before any consent screen (transcript §8).
+  Issue #3 listed three scopes; the tool needs four.
 - **Every persona that can trigger act 2 must authorize Slack once.** With the design's
   persona switcher over real emails, that means Dana's real account authorizes once and the
   token is bound to her `user_id`. Riley and Morgan need no Slack authorization to *receive*
@@ -138,5 +145,8 @@ requester never authorizes anything, and the delegated-auth beat of act 2 is los
 | `chat.postMessage` with `blocks` succeeds with that token | ✅ `ok: true`, rendered |
 | Renders as the user, not a bot | ✅ screenshot |
 | `users.lookupByEmail` and `conversations.open` work with the same token | ✅ |
+| Slack rejects `users:read.email` without `users:read` | ✅ "Invalid permissions requested" on the consent redirect, nothing granted |
+| Exact scope list on a token for a user with **no prior** Arcade Slack grant | ⬜ **not exercised** — both runs used a user holding the wider stock-toolkit grant. The authorize URL for a never-seen `user_id` carries exactly the four scopes, so the token type is settled; only the final list is unconfirmed |
+| Arcade refreshes the rotating token past its ~12 h expiry | ⬜ **not observed** — a re-run 30 min later returned the same auth record with `expires_in` counting down, consistent but not proof |
 | Opening a DM with a *different* user (the approver) | ⬜ **not exercised** — tested against self to avoid messaging a colleague. Slack's `im:write` covers any workspace member; the call is identical |
 | Custom-app and bot fallbacks | ⬜ **not exercised** — written from Arcade's published provider reference |
