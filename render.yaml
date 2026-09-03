@@ -5,13 +5,18 @@
 # Every service uses runtime: docker. Render does not detect Bun, so the
 # runtime is declared explicitly rather than left to detection.
 #
-# No disks, and both database paths point at /tmp. The seed-on-boot model that
-# makes this survivable is the PRD's decision (issue #1, "Identity, data,
-# platform"), not DESIGN.md's — DESIGN.md's Database row only assigns
-# ownership. Neither database survives a restart or redeploy, which is in
-# tension with DESIGN.md's "Policy DB owned by the hook server. Editable live
-# on stage": a rule edited mid-demo is lost if cg-hooks restarts. Tracked in
-# #29 — a DESIGN.md-level call, not a scaffold one.
+# Data persists; resetting is something you deliberately run. Decided on #29,
+# replacing the earlier "/tmp plus seed-on-boot, so redeploying is the reset"
+# model: each database-owning service mounts a disk and seeds from its fixture
+# only when the database has no schema, so a policy edited on stage and a loan
+# approved on stage are both still there after a restart. Getting back to a
+# clean state is `scripts/reset` (#23).
+#
+# cg-loan-mcp's disk is below. cg-hooks' lands with #12, which owns
+# governance.db's seeding.
+#
+# Services with disks give up zero-downtime deploys — Render stops the old
+# instance before starting the new one. Irrelevant for a demo.
 #
 # Cross-service addresses are host-form, derived with `fromService`. Never
 # hardcode an onrender.com URL here: those subdomains are global, so a taken
@@ -33,11 +38,22 @@ services:
     dockerContext: .
     healthCheckPath: /health
     autoDeployTrigger: commit
+    # Delete this block to run the loan book ephemerally and pay nothing for
+    # storage — the service re-seeds itself from the fixture on every boot,
+    # which is fine for a look at the demo and wrong for anything you would
+    # keep. A blueprint sync should not hand a forker a paid disk by surprise,
+    # so: 1 GB, the minimum, and it is one `disk:` key away from gone.
+    disk:
+      name: loans
+      mountPath: /data
+      sizeGB: 1
     envVars:
       - key: PORT
         value: 8080
+      # On the disk, not /tmp. The service creates the parent directory, so
+      # this also works unchanged against a bind mount or a local path.
       - key: LOANS_DB_PATH
-        value: /tmp/loans.db
+        value: /data/loans.db
 
   # The control plane. Serves /access, /pre and /post to Arcade Cloud, owns the
   # policy and audit database, and fans decisions out to the UI over SSE.

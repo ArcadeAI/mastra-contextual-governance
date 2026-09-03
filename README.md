@@ -12,9 +12,9 @@ Python `arcade-mcp` toolkit.
 
 ## Status
 
-Scaffold only. Every service is a stub that serves a health endpoint and nothing
-else — the point of this slice is that the deploy pipeline works before any logic
-goes into it.
+`apps/loan-mcp` is real: a Streamable HTTP MCP server over `loans.db`, with the four
+loan tools and the seed data the demo runs on. `apps/hooks` and `apps/web` are still
+stubs that serve a health endpoint and nothing else.
 
 See [`DESIGN.md`](./DESIGN.md) for the architecture and the decisions behind it, and
 [issue #1](https://github.com/ArcadeAI/mastra-contextual-governance/issues/1) for the
@@ -58,7 +58,7 @@ Run a service:
 
 ```sh
 bun run dev:hooks        # :8081
-bun run dev:loan-mcp     # :8082
+bun run dev:loan-mcp     # :8082, MCP at POST /mcp
 bun run dev:web          # :3000
 ```
 
@@ -66,7 +66,42 @@ Each service answers `GET /health`:
 
 ```sh
 curl localhost:8081/health   # {"status":"ok","service":"hooks",...}
+curl localhost:8082/health   # {"status":"ok","service":"loan-mcp","loans":8,...}
 ```
+
+## The loan book
+
+`apps/loan-mcp` is the system being governed, and it knows nothing about governance:
+no authority checks, no withheld fields, nothing consulted before a write is applied.
+`get_loan` hands back the borrower's bank account number, tax ID and the underwriter's
+notes in full, on purpose — redacting them is the post-execution hook's job, and a
+service that did it itself would leave nothing to demonstrate.
+
+That constraint is enforced by a test, not a convention:
+`apps/loan-mcp/test/knows-nothing-about-governance.test.ts` fails if the words
+`policy`, `role`, `limit`, `redact`, `authority`, `approver` or `permission` appear in
+its source. If you find yourself wanting to add a check there, it belongs in
+`apps/hooks`.
+
+Four tools: `search_loans`, `get_loan`, `approve_loan`, `deny_loan`. A decision is an
+event rather than a flag, so approving the same loan twice leaves two rows in its
+history instead of collapsing into an accidental no-op.
+
+`loans.db` is seeded from `apps/loan-mcp/src/fixtures/loans.json` when it has no
+schema, and left alone on every boot after that. Editing that fixture and deleting the
+database is the whole domain swap.
+
+### Registering it in Arcade
+
+Register the deployed service as a Remote MCP server pointing at `https://<host>/mcp`.
+
+**The toolkit name comes from the server, not from what you call it in the dashboard.**
+Arcade lowercases the `serverInfo.name` this service reports, strips every `mcp` and
+`server` *substring*, then PascalCases the rest — so a server calling itself `loan-mcp`
+becomes toolkit `Loan`. This one reports `loan-app`, which should survive as `LoanApp`.
+Read the real value off a `/pre` payload before keying a rule on it: a rule that matches
+nothing is indistinguishable from a rule that permits. Measured in
+[`docs/spikes/02-remote-mcp-hooks.md`](./docs/spikes/02-remote-mcp-hooks.md).
 
 ## Two things that will bite you
 
