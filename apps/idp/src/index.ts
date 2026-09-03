@@ -110,7 +110,22 @@ async function handleLogin(request: Request): Promise<Response> {
   const response = await callAuth("/sign-in/email", body, request);
 
   if (response.status === 401 || response.status === 403 || response.status === 400) {
-    return loginPage(pageUrl, { error: "That email and password did not match.", email });
+    // The plugin checks the signed query *before* the password, in a
+    // before-hook, and a query that is tampered with or older than ten minutes
+    // fails there as `invalid_signature`. Telling that persona their password
+    // was wrong would send them retyping it forever — the stale query is in
+    // the hidden field. Tell them the truth and where to restart.
+    const failure = (await response.clone().json().catch(() => null)) as
+      | { error?: string; code?: string }
+      | null;
+    const expired = failure?.error === "invalid_signature" || failure?.code === "INVALID_SIGNATURE";
+
+    return loginPage(pageUrl, {
+      error: expired
+        ? "This sign-in request has expired. Go back to the application and start again."
+        : "That email and password did not match.",
+      email,
+    });
   }
   if (!response.ok && response.status < 300) {
     return html(renderMessagePage("Sign-in failed", `The identity provider answered ${response.status}.`), 502);

@@ -10,7 +10,7 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { Subprocess } from "bun";
-import { rmSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -18,6 +18,10 @@ import { loadPeople } from "../src/db.ts";
 
 const ROOT = join(import.meta.dir, "..");
 const dbPath = join(tmpdir(), `cg-idp-${crypto.randomUUID()}`, "idp.db");
+// Everything the service prints, from boot to the end of the run. A file
+// rather than a pipe so "never logs the secret" can read all of it, not
+// whichever chunk happens to be first.
+const logPath = join(dirname(dbPath), "stdout.log");
 const REDIRECT_URI = "http://127.0.0.1:9/callback";
 const SECRET = "test-secret-".padEnd(48, "x");
 
@@ -79,7 +83,12 @@ beforeAll(async () => {
     BETTER_AUTH_SECRET: SECRET,
   };
 
-  child = Bun.spawn(["bun", join(ROOT, "src", "index.ts")], { env, stdout: "pipe", stderr: "pipe" });
+  mkdirSync(dirname(logPath), { recursive: true });
+  child = Bun.spawn(["bun", join(ROOT, "src", "index.ts")], {
+    env,
+    stdout: Bun.file(logPath),
+    stderr: "pipe",
+  });
 
   const deadline = Date.now() + 20_000;
   for (;;) {
@@ -303,20 +312,6 @@ describe("the OAuth client", () => {
     expect(creds.pkce).toBe("S256");
     expect(creds.userinfo_email_jsonpath).toBe("$.email");
   });
-
-  test("the service never logs the secret", async () => {
-    // The child's stdout is piped; nothing has read it, so it holds every line
-    // logged since boot. A boot that printed the secret would be one `render
-    // logs` away from anyone with dashboard access.
-    const creds = await credentials();
-    const reader = (child.stdout as ReadableStream<Uint8Array>).getReader();
-    const { value } = await reader.read();
-    reader.releaseLock();
-    const logged = new TextDecoder().decode(value);
-
-    expect(logged).toContain(creds.client_id);
-    expect(logged).not.toContain(creds.client_secret);
-  });
 });
 
 describe("authorization-code flow", () => {
@@ -375,6 +370,32 @@ describe("authorization-code flow", () => {
     const html = await login.text();
     expect(html).toContain("did not match");
     expect(html).toContain(dana.email);
+  });
+
+  test("a tampered or expired sign-in request is not reported as a wrong password", async () => {
+    const creds = await credentials();
+    const browser = new Browser();
+    const { challenge } = pkce();
+
+    const authorize = await browser.fetch(
+      authorizeUrl(creds.client_id, { code_challenge: challenge, code_challenge_method: "S256" }),
+    );
+    // A query older than ten minutes fails the same signature check as one
+    // with a flipped character; the latter is the one a test can produce.
+    const stale = queryOf(authorize.headers.get("location")!).replace(/sig=./, (m) =>
+      m.endsWith("A") ? "sig=B" : "sig=A",
+    );
+    const login = await browser.submit(`${baseUrl}/login`, {
+      email: dana.email,
+      password: dana.password,
+      oauth_query: stale,
+    });
+
+    expect(login.status).toBe(401);
+    const html = await login.text();
+    expect(html).toContain("expired");
+    expect(html).toContain("start again");
+    expect(html).not.toContain("did not match");
   });
 
   test("denying consent sends the client an access_denied error, not a code", async () => {
@@ -517,5 +538,42 @@ describe("reset does not rotate the OAuth client", () => {
 
     const { accessToken } = await authorizeAs(new Browser(), before, dana, { expectConsent: true });
     expect((await userinfo(accessToken)).email).toBe(dana.email);
+  });
+});
+
+describe("the log", () => {
+  // Last on purpose: by now the service has booted, served every flow above,
+  // survived a reset and been asked for its credentials several times. If any
+  // of that printed the secret, a `render logs` would have shown it.
+  test("never carries the client secret, over the whole run", async () => {
+    const creds = await credentials();
+    const logged = await Bun.file(logPath).text();
+
+    expect(logged).toContain(creds.client_id);
+    expect(logged).not.toContain(creds.client_secret);
+  });
+
+  test("the credentials script does not warn when the public URL is set", async () => {
+    const { err } = await runScript("oauth-client.ts", "--json");
+    expect(err).toBe("");
+  });
+
+  test("the credentials script warns when it would print localhost URLs", async () => {
+    const { IDP_PUBLIC_URL: _dropped, ...withoutUrl } = env;
+    const proc = Bun.spawn(["bun", join(ROOT, "scripts", "oauth-client.ts"), "--json"], {
+      env: withoutUrl,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [out, err] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+
+    // Credentials still right, URLs flagged.
+    expect((JSON.parse(out) as Credentials).client_id).toBe((await credentials()).client_id);
+    expect(err).toContain("warning");
+    expect(err).toContain("IDP_PUBLIC_URL");
   });
 });

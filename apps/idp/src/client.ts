@@ -12,8 +12,17 @@ import { generateRandomString } from "better-auth/crypto";
 import type { Auth } from "./auth.ts";
 import { clientSecretStorage, SCOPES } from "./auth.ts";
 
-/** How the client is found again. The name is the identity; the id is generated. */
+/** Shown on the login and consent pages: "Arcade is asking you to sign in." */
 export const OAUTH_CLIENT_NAME = "Arcade";
+
+/**
+ * The row's primary key, fixed. The `client_id` is generated, and `name` has
+ * no unique index, so the row is found — and, if two bootstraps interleave
+ * (the service booting on a fresh disk while someone runs `oauth-client` in a
+ * shell), the second insert is refused — on the one column SQLite will
+ * enforce for us.
+ */
+export const OAUTH_CLIENT_ROW_ID = "arcade";
 
 /**
  * PKCE is **on**. OAuth 2.1 requires it, Better Auth defaults to it, and
@@ -50,10 +59,7 @@ export async function ensureOAuthClient(
   { redirectUris, secret }: { redirectUris: string[]; secret: string },
 ): Promise<OAuthClientCredentials> {
   const ctx = await auth.$context;
-  const existing = await ctx.adapter.findOne<StoredClient>({
-    model: "oauthClient",
-    where: [{ field: "name", value: OAUTH_CLIENT_NAME }],
-  });
+  const existing = await findStoredClient(auth);
 
   if (existing) {
     if (!existing.clientSecret) {
@@ -87,27 +93,44 @@ export async function ensureOAuthClient(
   const clientSecret = generateRandomString(48, "a-z", "A-Z", "0-9");
   const now = new Date();
 
-  await ctx.adapter.create({
-    model: "oauthClient",
-    data: {
-      clientId,
-      clientSecret: await clientSecretStorage(secret).encrypt(clientSecret),
-      name: OAUTH_CLIENT_NAME,
-      redirectUris,
-      scopes: [...SCOPES],
-      tokenEndpointAuthMethod: "client_secret_post",
-      grantTypes: ["authorization_code", "refresh_token"],
-      responseTypes: ["code"],
-      applicationType: "web",
-      requirePKCE: REQUIRE_PKCE,
-      skipConsent: false,
-      disabled: false,
-      createdAt: now,
-      updatedAt: now,
-    },
-  });
+  try {
+    await ctx.adapter.create({
+      model: "oauthClient",
+      forceAllowId: true,
+      data: {
+        id: OAUTH_CLIENT_ROW_ID,
+        clientId,
+        clientSecret: await clientSecretStorage(secret).encrypt(clientSecret),
+        name: OAUTH_CLIENT_NAME,
+        redirectUris,
+        scopes: [...SCOPES],
+        tokenEndpointAuthMethod: "client_secret_post",
+        grantTypes: ["authorization_code", "refresh_token"],
+        responseTypes: ["code"],
+        applicationType: "web",
+        requirePKCE: REQUIRE_PKCE,
+        skipConsent: false,
+        disabled: false,
+        createdAt: now,
+        updatedAt: now,
+      },
+    });
+  } catch (error) {
+    // Lost the race: another bootstrap inserted the row between our lookup
+    // and our insert. Theirs is the client; ours never existed.
+    if (!/UNIQUE|constraint/i.test(String(error))) throw error;
+    return ensureOAuthClient(auth, { redirectUris, secret });
+  }
 
   return { clientId, clientSecret, redirectUris, created: true };
+}
+
+async function findStoredClient(auth: Auth): Promise<StoredClient | null> {
+  const ctx = await auth.$context;
+  return ctx.adapter.findOne<StoredClient>({
+    model: "oauthClient",
+    where: [{ field: "id", value: OAUTH_CLIENT_ROW_ID }],
+  });
 }
 
 /** Looks the client up by `client_id`, for the consent page's "X wants access" line. */

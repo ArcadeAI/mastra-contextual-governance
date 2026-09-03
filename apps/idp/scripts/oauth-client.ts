@@ -24,6 +24,17 @@ const client = await ensureOAuthClient(auth, {
 
 const json = process.argv.includes("--json");
 
+if (config.baseURLIsFallback) {
+  // The credentials are right regardless; the three URLs are not. On Render
+  // this means the shell did not carry RENDER_EXTERNAL_URL — set IDP_PUBLIC_URL
+  // on the service, or read the URLs off /health, which the running service
+  // computes from its own environment.
+  console.error(
+    `[idp] warning: no IDP_PUBLIC_URL or RENDER_EXTERNAL_URL set — the URLs below point at ` +
+      `${config.baseURL}, which is not the address Arcade should be given.`,
+  );
+}
+
 if (json) {
   console.log(
     JSON.stringify(

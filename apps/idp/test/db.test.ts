@@ -157,6 +157,24 @@ describe("resetPeople", () => {
 });
 
 describe("ensureOAuthClient", () => {
+  test("two bootstraps at once still leave exactly one client", async () => {
+    // The service booting on a fresh disk while someone runs `oauth-client`
+    // in a shell: both look, both find nothing, both insert. The row has a
+    // fixed primary key, so one insert loses and takes the winner's client.
+    const db = await openPeople(":memory:");
+    const auth = createAuth({ db, baseURL: "http://localhost:1", secret: SECRET });
+    const redirectUris = ["http://127.0.0.1:9/callback"];
+
+    const [a, b] = await Promise.all([
+      ensureOAuthClient(auth, { redirectUris, secret: SECRET }),
+      ensureOAuthClient(auth, { redirectUris, secret: SECRET }),
+    ]);
+
+    expect(a.clientId).toBe(b.clientId);
+    expect(a.clientSecret).toBe(b.clientSecret);
+    expect(db.query('SELECT COUNT(*) AS n FROM "oauthClient"').get()).toEqual({ n: 1 });
+  });
+
   test("brings the redirect URIs in line without touching the credentials", async () => {
     const db = await openPeople(":memory:");
     const auth = createAuth({ db, baseURL: "http://localhost:1", secret: SECRET });

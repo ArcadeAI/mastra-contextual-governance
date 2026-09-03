@@ -17,6 +17,8 @@ export interface IdpConfig {
   dbPath: string;
   /** Public origin and OAuth issuer. */
   baseURL: string;
+  /** True when nothing set the public URL and `baseURL` is the localhost fallback. */
+  baseURLIsFallback: boolean;
   secret: string;
   redirectUris: string[];
 }
@@ -31,9 +33,8 @@ export function readConfig(env: Record<string, string | undefined> = process.env
 
   // Render injects RENDER_EXTERNAL_URL into every service, so on Render
   // nothing has to be configured; locally the fallback is the port.
-  const baseURL = (env.IDP_PUBLIC_URL ?? env.RENDER_EXTERNAL_URL ?? `http://localhost:${port}`)
-    .trim()
-    .replace(/\/+$/, "");
+  const configuredURL = env.IDP_PUBLIC_URL?.trim() || env.RENDER_EXTERNAL_URL?.trim();
+  const baseURL = (configuredURL || `http://localhost:${port}`).replace(/\/+$/, "");
 
   const redirectUris = (env.IDP_OAUTH_REDIRECT_URIS ?? DEFAULT_ARCADE_REDIRECT_URI)
     .split(",")
@@ -44,6 +45,7 @@ export function readConfig(env: Record<string, string | undefined> = process.env
     port,
     dbPath: env.IDP_DB_PATH ?? "./idp.db",
     baseURL,
+    baseURLIsFallback: !configuredURL,
     secret: secret || DEV_SECRET,
     redirectUris,
   };

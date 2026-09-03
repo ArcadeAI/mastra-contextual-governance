@@ -57,6 +57,10 @@ bun run --cwd apps/idp oauth-client --json   # for scripts
 On Render: open a shell on the `cg-idp` service and run `bun run oauth-client`. The
 secret is stored encrypted (not hashed) so this works on any later day, and it is the
 **only** place the secret is ever printed — the boot log carries the id, never the secret.
+If the shell does not carry `RENDER_EXTERNAL_URL`, the script warns on stderr that the
+three URLs it prints point at localhost; the credentials are still right, and `/health`
+on the running service has the real URLs. Setting `IDP_PUBLIC_URL` on the service removes
+the question.
 
 Changing `IDP_OAUTH_REDIRECT_URIS` updates the client in place. The credentials do not change.
 
