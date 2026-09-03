@@ -9,12 +9,27 @@
  * the UI and this package all agree on one definition. Re-exported here for
  * convenience; `@cg/policy-schema` remains the single source.
  *
- * The four pure modules arrive in #7 (PolicyEngine), #8 (RedactionEngine),
- * #9 (ApproverRouter) and #10 (GrantChecker).
+ * The four pure modules: #7 (PolicyEngine, `./policy-engine.ts`), #8
+ * (RedactionEngine), #9 (ApproverRouter) and #10 (GrantChecker).
  */
 import { type Decision } from "@cg/policy-schema";
 
 export { Decision, Effect, GovernanceEvent, HookPoint } from "@cg/policy-schema";
+
+export {
+  compilePolicy,
+  evaluatePermission,
+  hiddenTools,
+  PolicyCompileError,
+  renderReason,
+  resolveVisibility,
+  type CompiledPolicy,
+  type PermissionInput,
+  type Policy,
+  type SubjectOrUnknown,
+  type ToolRef,
+  type VisibilityDecision,
+} from "./policy-engine.ts";
 
 /**
  * Arcade calls hooks over the public internet, so an outage must degrade to
