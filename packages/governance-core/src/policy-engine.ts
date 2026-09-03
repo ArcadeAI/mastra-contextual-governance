@@ -78,24 +78,33 @@ export type ToolRef = {
 };
 
 /**
- * The policy as loaded from the policy table plus configuration.
+ * Every governed toolkit — the `ARCADE_*_TOOLKIT` values from config, never
+ * hardcoded — mapped to the tools it serves, each mapped to the argument
+ * names a call to it must supply.
  *
- * `catalogue` maps every governed toolkit — the `ARCADE_*_TOOLKIT` values from
- * config, never hardcoded — to the tool names it serves. It is required, and
- * it is what lets a misspelled toolkit *or tool* in a rule be a compile error
- * instead of a rule that silently matches nothing. It is also the fail-closed
- * boundary at runtime: a call to anything the catalogue does not list is
- * denied, so a tool the policy has never heard of cannot slip through on the
- * "no rule matched" default.
+ *     { Widgets: { get_widget: ["widget_id"], update_widget: ["widget_id", "quantity"] } }
+ *
+ * Three jobs. At compile time it makes a misspelled toolkit *or tool* in a
+ * rule an error instead of a rule that silently matches nothing. At runtime it
+ * is the fail-closed boundary: a call to anything not listed is denied, so a
+ * tool the policy has never heard of cannot slip through on the "no rule
+ * matched" default. And the argument lists are what let the compiler check
+ * that a denial's remediation instruction names *the arguments the next tool
+ * actually needs*, not just some `name=value` token.
  */
+export type ToolCatalogue = Readonly<Record<string, Readonly<Record<string, readonly string[]>>>>;
+
+/** The policy as loaded from the policy table plus configuration. */
 export type Policy = {
-  readonly catalogue: Readonly<Record<string, readonly string[]>>;
+  readonly catalogue: ToolCatalogue;
   readonly rules: readonly PolicyRule[];
 };
 
+type CompiledCatalogue = ReadonlyMap<string, ReadonlyMap<string, readonly string[]>>;
+
 /** A `Policy` that `compilePolicy` has validated, sorted and prepared. */
 export type CompiledPolicy = {
-  readonly catalogue: ReadonlyMap<string, ReadonlySet<string>>;
+  readonly catalogue: CompiledCatalogue;
   readonly rules: readonly CompiledRule[];
   /** Brand: only `compilePolicy` produces one of these. */
   readonly [COMPILED]: true;
@@ -156,8 +165,8 @@ const PLACEHOLDER = /\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g;
 
 /** A `Toolkit.tool` reference inside prose. */
 const TOOL_REFERENCE = /\b([A-Za-z][A-Za-z0-9_-]*)\.([A-Za-z_][A-Za-z0-9_]*)\b/g;
-/** An argument mention: `name=` or a `{{inputs.…}}` placeholder. */
-const ARGUMENT_MENTION = /\b[A-Za-z_][A-Za-z0-9_]*=|\{\{\s*inputs\./;
+/** An argument named for the model to supply: `name=`. */
+const ARGUMENT_MENTION = /\b([A-Za-z_][A-Za-z0-9_]*)=/g;
 /**
  * The one sentence that exempts a `pre` denial from naming a remediation tool:
  * it tells the model, in so many words, that nothing it can call will help.
@@ -175,13 +184,14 @@ export const NO_REMEDIATION = "Do not retry";
  */
 export function compilePolicy(policy: Policy): CompiledPolicy {
   const problems: string[] = [];
-  const catalogue = new Map<string, ReadonlySet<string>>();
+  const catalogue = new Map<string, ReadonlyMap<string, readonly string[]>>();
 
   for (const [toolkit, tools] of Object.entries(policy.catalogue)) {
-    if (tools.length === 0) {
+    const entries = Object.entries(tools);
+    if (entries.length === 0) {
       problems.push(`catalogue: toolkit "${toolkit}" lists no tools, so nothing in it can be governed`);
     }
-    catalogue.set(toolkit, new Set(tools));
+    catalogue.set(toolkit, new Map(entries));
   }
   if (catalogue.size === 0) {
     problems.push(
@@ -211,7 +221,7 @@ export function compilePolicy(policy: Policy): CompiledPolicy {
     if (known && rule.match.tool !== WILDCARD && !known.has(rule.match.tool)) {
       problems.push(
         `${at}: references tool "${rule.match.tool}", which toolkit "${rule.match.toolkit}" ` +
-          `does not serve (serves: ${[...known].map((t) => `"${t}"`).join(", ")}). ` +
+          `does not serve (serves: ${[...known.keys()].map((t) => `"${t}"`).join(", ")}). ` +
           `A rule matching nothing is indistinguishable from a rule that permits.`,
       );
     }
@@ -235,8 +245,9 @@ export function compilePolicy(policy: Policy): CompiledPolicy {
     }
 
     if (rule.hook === "pre" && rule.effect === "deny") {
-      const problem = checkRemediation(rule.reason, catalogue);
-      if (problem) problems.push(`${at}: ${problem}`);
+      for (const problem of checkRemediation(rule.reason, catalogue)) {
+        problems.push(`${at}: ${problem}`);
+      }
     }
 
     for (const placeholder of rule.reason.matchAll(PLACEHOLDER)) {
@@ -274,34 +285,51 @@ export function compilePolicy(policy: Policy): CompiledPolicy {
 
 /**
  * A `pre` denial's `reason` is the only thing the model will read. It must
- * either name a next tool to call — a `Toolkit.tool` the catalogue lists —
- * together with at least one argument (`name=` or an `{{inputs.…}}`
- * placeholder), or say `Do not retry` so the model stops rather than guesses.
- * Anything else is an apology, and the compiler refuses it.
+ * either say `${NO_REMEDIATION}` so the model stops rather than guesses, or
+ * name a next tool to call — a `Toolkit.tool` the catalogue lists — and spell
+ * out, as `name=…`, *every* argument the catalogue says that tool needs. An
+ * argument the named tool does not accept is refused too: the model would
+ * try it and fail. Anything less is an apology, and the compiler refuses it.
  */
-function checkRemediation(
-  reason: string,
-  catalogue: ReadonlyMap<string, ReadonlySet<string>>,
-): string | null {
-  if (reason.includes(NO_REMEDIATION)) return null;
+function checkRemediation(reason: string, catalogue: CompiledCatalogue): string[] {
+  if (reason.includes(NO_REMEDIATION)) return [];
 
-  const named = [...reason.matchAll(TOOL_REFERENCE)].filter(([, toolkit, tool]) =>
-    catalogue.get(toolkit as string)?.has(tool as string),
-  );
-  if (named.length === 0) {
-    return (
+  const named = new Map<string, readonly string[]>();
+  for (const [reference, toolkit, tool] of reason.matchAll(TOOL_REFERENCE)) {
+    const args = catalogue.get(toolkit as string)?.get(tool as string);
+    if (args) named.set(reference, args);
+  }
+  if (named.size === 0) {
+    return [
       `a pre denial's reason must tell the model what to do next: name a catalogued ` +
-      `remediation tool as "Toolkit.tool" with its arguments, or say "${NO_REMEDIATION}". ` +
-      `Got: "${reason}"`
+        `remediation tool as "Toolkit.tool" with its arguments, or say "${NO_REMEDIATION}". ` +
+        `Got: "${reason}"`,
+    ];
+  }
+
+  const mentioned = new Set([...reason.matchAll(ARGUMENT_MENTION)].map((m) => m[1] as string));
+  const problems: string[] = [];
+  const accepted = new Set<string>();
+
+  for (const [reference, args] of named) {
+    for (const arg of args) accepted.add(arg);
+    const missing = args.filter((arg) => !mentioned.has(arg));
+    if (missing.length > 0) {
+      problems.push(
+        `a pre denial's reason names "${reference}" but not the argument(s) it needs: ` +
+          `${missing.map((a) => `"${a}"`).join(", ")}. Spell each out as "name=…"`,
+      );
+    }
+  }
+
+  const unknown = [...mentioned].filter((arg) => !accepted.has(arg));
+  if (unknown.length > 0) {
+    problems.push(
+      `a pre denial's reason mentions argument(s) ${unknown.map((a) => `"${a}"`).join(", ")}, ` +
+        `which ${[...named.keys()].map((r) => `"${r}"`).join(", ")} does not accept`,
     );
   }
-  if (!ARGUMENT_MENTION.test(reason)) {
-    return (
-      `a pre denial's reason names ${named.map((m) => `"${m[0]}"`).join(", ")} but no ` +
-      `arguments for it; mention them as "name=…" or with {{inputs.…}} placeholders`
-    );
-  }
-  return null;
+  return problems;
 }
 
 /** Returns a description of what is wrong with the condition, or `null`. */
@@ -428,7 +456,7 @@ function decide(ev: Evaluation): Decision {
   if (!served.has(tool.name)) {
     return failClosed(
       `DENIED: "${tool.name}" is not a tool the control plane governs in toolkit ` +
-        `"${tool.toolkit}" (governed: ${[...served].map((t) => `"${t}"`).join(", ")}). ` +
+        `"${tool.toolkit}" (governed: ${[...served.keys()].map((t) => `"${t}"`).join(", ")}). ` +
         `${NO_REMEDIATION} ${qualified}. If you meant one of the governed tools, call that one instead.`,
     );
   }

@@ -13,9 +13,13 @@ import { compilePolicy, resolveVisibility, evaluatePermission } from "@cg/govern
 
 const policy = compilePolicy({
   // Every governed toolkit (the ARCADE_*_TOOLKIT values from config, never
-  // hardcoded) and the tool names it serves. Required: it is both the typo
-  // check at compile time and the fail-closed boundary at runtime.
-  catalogue: { [toolkitName]: ["get_widget", "update_widget"], Approvals: ["request_approval"] },
+  // hardcoded), the tools it serves, and the arguments each call must supply.
+  // Required: it is the typo check at compile time, the fail-closed boundary
+  // at runtime, and what lets the compiler check remediation instructions.
+  catalogue: {
+    [toolkitName]: { get_widget: ["widget_id"], update_widget: ["widget_id", "quantity"] },
+    Approvals: { request_approval: ["resource_id", "quantity", "justification"] },
+  },
   rules,   // PolicyRule[] from governance.db
 });
 
@@ -63,18 +67,19 @@ arguments it needs, and may interpolate the call:
 ```
 DENIED: {{inputs.quantity}} exceeds your {{subject.clearance}} clearance.
 To proceed, call Approvals.request_approval with resource_id={{inputs.widget_id}},
-quantity={{inputs.quantity}} and a justification, then retry this call unchanged.
+quantity={{inputs.quantity}} and justification=<why>, then retry this call unchanged.
 ```
 
 Placeholders: `{{inputs.<dot.path>}}`, `{{subject.<field>}}`, `{{tool.toolkit}}`,
 `{{tool.name}}`. An absent value renders as `(not provided)`.
 
 **This is enforced, not advised.** A `pre` rule with `effect: deny` fails to compile unless
-its `reason` either names a catalogued tool as `Toolkit.tool` *and* mentions at least one
-argument (`name=…` or an `{{inputs.…}}` placeholder), or contains the words `Do not retry`,
-which tells the model to stop rather than guess. `"Insufficient authority."` is an apology
-and is refused. Access denials are exempt: they hide the tool, and the model never reads
-them.
+its `reason` either contains the words `Do not retry`, which tells the model to stop rather
+than guess, or names a catalogued tool as `Toolkit.tool` *and* spells out, as `name=…`,
+every argument the catalogue lists for that tool. An argument the tool does not accept is
+refused too. So `"Insufficient authority."` is an apology and is refused; so is
+`"Call Approvals.request_approval with banana=1."`. Access denials are exempt: they hide
+the tool, and the model never reads them.
 
 Engine-authored reasons (the fail-closed rows above) follow the same standard: they name the
 tool and input, and say whether a retry can fix it.

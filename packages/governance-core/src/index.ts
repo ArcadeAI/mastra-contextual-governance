@@ -20,6 +20,7 @@ export {
   compilePolicy,
   evaluatePermission,
   hiddenTools,
+  NO_REMEDIATION,
   PolicyCompileError,
   renderReason,
   resolveVisibility,
@@ -27,6 +28,7 @@ export {
   type PermissionInput,
   type Policy,
   type SubjectOrUnknown,
+  type ToolCatalogue,
   type ToolRef,
   type VisibilityDecision,
 } from "./policy-engine.ts";

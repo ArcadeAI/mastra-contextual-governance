@@ -42,10 +42,19 @@ import {
 const READ: ToolRef = { toolkit: SAMPLE_TOOLKIT, name: SAMPLE_READ_TOOL };
 const WRITE: ToolRef = { toolkit: SAMPLE_TOOLKIT, name: SAMPLE_WRITE_TOOL };
 const ESCALATE: ToolRef = { toolkit: "Approvals", name: "request_approval" };
-/** What the gateway serves, keyed by the toolkit names config carries. */
+/**
+ * What the gateway serves, keyed by the toolkit names config carries: each
+ * tool with the arguments a call to it must supply.
+ */
 const CATALOGUE = {
-  [SAMPLE_TOOLKIT]: [SAMPLE_READ_TOOL, SAMPLE_WRITE_TOOL],
-  Approvals: ["request_approval", "decide"],
+  [SAMPLE_TOOLKIT]: {
+    [SAMPLE_READ_TOOL]: ["widget_id"],
+    [SAMPLE_WRITE_TOOL]: ["widget_id", "quantity"],
+  },
+  Approvals: {
+    request_approval: ["resource_id", "quantity", "justification"],
+    decide: ["request_id", "decision"],
+  },
 };
 
 const operator: Subject = aSubject({
@@ -65,8 +74,8 @@ const director: Subject = aSubject({
 const REMEDIATION =
   "DENIED: {{inputs.quantity}} exceeds your {{subject.clearance}} clearance for " +
   "{{tool.toolkit}}.{{tool.name}}. To proceed, call Approvals.request_approval with " +
-  "resource_id={{inputs.widget_id}}, quantity={{inputs.quantity}} and a justification, " +
-  "then retry this call unchanged once it is approved.";
+  "resource_id={{inputs.widget_id}}, quantity={{inputs.quantity}} and justification=<why " +
+  "this is needed>, then retry this call unchanged once it is approved.";
 
 /** The rule every act-2 test is about: deny when quantity exceeds clearance. */
 const clearanceRule = aPolicyRule({ reason: REMEDIATION });
@@ -86,8 +95,8 @@ const hideWriteFromOperators = aPolicyRule({
 
 /** A reason that passes the remediation check without saying anything specific. */
 const ESCALATE_FIRST =
-  "Blocked. To proceed, call Approvals.request_approval with resource_id={{inputs.widget_id}} " +
-  "and a justification, then retry.";
+  "Blocked. To proceed, call Approvals.request_approval with resource_id={{inputs.widget_id}}, " +
+  "quantity={{inputs.quantity}} and justification=<why>, then retry.";
 
 function policy(rules: PolicyRule[], overrides: Partial<Policy> = {}) {
   return compilePolicy({ catalogue: CATALOGUE, rules, ...overrides });
@@ -238,8 +247,8 @@ describe("evaluatePermission: amounts against clearance", () => {
     const { reason } = call(supervisor, 95);
     expect(reason).toBe(
       "DENIED: 95 exceeds your 50 clearance for Widgets.update_widget. To proceed, call " +
-        "Approvals.request_approval with resource_id=WID-1, quantity=95 and a justification, " +
-        "then retry this call unchanged once it is approved.",
+        "Approvals.request_approval with resource_id=WID-1, quantity=95 and justification=<why " +
+        "this is needed>, then retry this call unchanged once it is approved.",
     );
   });
 });
@@ -699,7 +708,7 @@ describe("compilePolicy refuses a policy that cannot mean what it says", () => {
     ],
     [
       "a toolkit that lists no tools",
-      { catalogue: { ...CATALOGUE, Empty: [] }, rules: [] },
+      { catalogue: { ...CATALOGUE, Empty: {} }, rules: [] },
       /"Empty" lists no tools/,
     ],
     [
@@ -715,7 +724,26 @@ describe("compilePolicy refuses a policy that cannot mean what it says", () => {
     [
       "a pre denial naming a remediation tool but none of its arguments",
       withRules(rule({ ...base(), reason: "Call Approvals.request_approval first." })),
-      /"Approvals\.request_approval" but no arguments/,
+      /"Approvals\.request_approval" but not the argument\(s\) it needs: "resource_id", "quantity", "justification"/,
+    ],
+    [
+      "a pre denial naming a remediation tool but only some of its arguments",
+      withRules(
+        rule({ ...base(), reason: "Call Approvals.request_approval with resource_id=1, quantity=2." }),
+      ),
+      /"Approvals\.request_approval" but not the argument\(s\) it needs: "justification"/,
+    ],
+    [
+      "a pre denial naming an argument the remediation tool does not accept",
+      withRules(rule({ ...base(), reason: "Call Approvals.request_approval with banana=1." })),
+      /argument\(s\) "banana", which "Approvals\.request_approval" does not accept/,
+    ],
+    [
+      "a pre denial whose one argument is a value placeholder with no argument name",
+      withRules(
+        rule({ ...base(), reason: "Call Approvals.request_approval for {{inputs.widget_id}}." }),
+      ),
+      /not the argument\(s\) it needs/,
     ],
     [
       "an access rule with conditions, which /access could never evaluate",
@@ -813,15 +841,31 @@ describe("compilePolicy refuses a policy that cannot mean what it says", () => {
     ).not.toThrow();
   });
 
-  it("accepts a pre denial whose arguments are named as placeholders", () => {
+  it("accepts a pre denial that names every argument the remediation tool needs", () => {
     expect(() =>
       policy([
         rule({
           ...base(),
-          reason: "Call Approvals.request_approval for {{inputs.widget_id}}, then retry.",
+          reason:
+            "Call Approvals.request_approval with resource_id={{inputs.widget_id}}, " +
+            "quantity={{inputs.quantity}}, justification=<your reason>; then retry.",
         }),
       ]),
     ).not.toThrow();
+  });
+
+  it("checks each remediation tool named, when a reason names more than one", () => {
+    const both =
+      "Call Approvals.request_approval with resource_id=1, quantity=2, justification=x; " +
+      "once approved, Approvals.decide is called with request_id=<id>, decision=approve.";
+    expect(() => policy([rule({ ...base(), reason: both })])).not.toThrow();
+
+    const halfDone =
+      "Call Approvals.request_approval with resource_id=1, quantity=2, justification=x; " +
+      "then Approvals.decide with request_id=<id>.";
+    expect(() => policy([rule({ ...base(), reason: halfDone })])).toThrow(
+      /"Approvals\.decide" but not the argument\(s\) it needs: "decision"/,
+    );
   });
 
   it("does not hold access denials or allows to the remediation standard", () => {
