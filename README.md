@@ -13,8 +13,10 @@ Python `arcade-mcp` toolkit.
 ## Status
 
 `apps/loan-mcp` is real: a Streamable HTTP MCP server over `loans.db`, with the four
-loan tools and the seed data the demo runs on. `apps/hooks` and `apps/web` are still
-stubs that serve a health endpoint and nothing else.
+loan tools and the seed data the demo runs on. `apps/idp` is real: the enterprise's
+identity provider, Better Auth as an OAuth 2.1 server, with the four personas seeded and
+a login and consent page. `apps/hooks` and `apps/web` are still stubs that serve a
+health endpoint and nothing else.
 
 See [`DESIGN.md`](./DESIGN.md) for the architecture and the decisions behind it, and
 [issue #1](https://github.com/ArcadeAI/mastra-contextual-governance/issues/1) for the
@@ -30,6 +32,10 @@ apps/hooks       Bun — /access /pre /post, policy engine, audit, SSE.
 apps/loan-mcp    Bun — Streamable HTTP MCP server, the governed business system.
                  Owns loans.db. Registered in Arcade as a Remote MCP server.
                                                                        → Render
+apps/idp         Bun — Better Auth OAuth 2.1 provider, login and consent pages.
+                 Owns idp.db. A demo fixture standing in for the enterprise's
+                 real IdP; a forker deletes it and points at their Okta. Not a
+                 workspace member — has its own lockfile.              → Render
 tools/approvals  Python arcade-mcp — request_approval, decide.  → arcade deploy
 
 packages/governance-core   Hook framework, policy engine, audit, event bus.
@@ -46,7 +52,8 @@ Requires [Bun](https://bun.sh) 1.3.14.
 
 ```sh
 bun install
-cp .env.example .env     # then fill it in — every variable is documented in place
+bun install --cwd apps/idp   # not a workspace member; see apps/idp/README.md
+cp .env.example .env         # then fill it in — every variable is documented in place
 ```
 
 ```sh
@@ -59,6 +66,7 @@ Run a service:
 ```sh
 bun run dev:hooks        # :8081
 bun run dev:loan-mcp     # :8082, MCP at POST /mcp
+bun run dev:idp          # :8083, OAuth at /oauth2/*
 bun run dev:web          # :3000
 ```
 
@@ -67,6 +75,7 @@ Each service answers `GET /health`:
 ```sh
 curl localhost:8081/health   # {"status":"ok","service":"hooks",...}
 curl localhost:8082/health   # {"status":"ok","service":"loan-mcp","loans":8,...}
+curl localhost:8083/health   # {"status":"ok","service":"idp","people":4,...}
 ```
 
 ## The loan book
@@ -103,6 +112,16 @@ Read the real value off a `/pre` payload before keying a rule on it: a rule that
 nothing is indistinguishable from a rule that permits. Measured in
 [`docs/spikes/02-remote-mcp-hooks.md`](./docs/spikes/02-remote-mcp-hooks.md).
 
+## The identity provider
+
+`apps/idp` is what the loan tools authenticate against: Arcade is registered as an OAuth
+client of it, and the email it returns from `/oauth2/userinfo` is the identity every hook
+and every loan-book write is keyed on. It stands in for the enterprise's real IdP, and it
+has one operational rule — **resetting it must not rotate the OAuth client**, or the
+registration in the Arcade dashboard goes stale right before you present. Its reset script
+keeps the client; see [`apps/idp/README.md`](./apps/idp/README.md), including how to
+print the credentials and what to enter in Arcade.
+
 ## Two things that will bite you
 
 **Zod is pinned to 3.25.76.** Zod 4 changes internals the Arcade/Mastra path does
@@ -117,7 +136,7 @@ declares a dependency on an app package or imports from one.
 
 ## Deploying
 
-Three services deploy from [`render.yaml`](./render.yaml) as a Render blueprint.
+Four services deploy from [`render.yaml`](./render.yaml) as a Render blueprint.
 Render does not detect Bun, so each service declares `runtime: docker` and ships
 its own Dockerfile — do not rely on runtime detection.
 

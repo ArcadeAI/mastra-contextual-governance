@@ -18,8 +18,8 @@ interface Manifest {
   exports?: Record<string, string>;
   dependencies?: Record<string, string>;
   overrides?: Record<string, string>;
-  /** See `isGoverned`. */
-  cg?: { governed?: boolean };
+  /** See `isGoverned` and `isExternal`. */
+  cg?: { governed?: boolean; external?: boolean };
 }
 
 /**
@@ -37,6 +37,18 @@ interface Manifest {
  */
 function isGoverned(manifest: Manifest): boolean {
   return manifest.cg?.governed === true;
+}
+
+/**
+ * A stand-in for a system outside the template — `apps/idp`, the enterprise's
+ * identity provider (#36). A forker deletes it and points at their own, so it
+ * neither depends on anything under `packages/` nor is depended on. It is not
+ * a workspace member either (it needs zod 4, which the root override forbids),
+ * but this sweep reads directories rather than the workspace list, so it has
+ * to be exempted here by the same kind of flag.
+ */
+function isExternal(manifest: Manifest): boolean {
+  return manifest.cg?.external === true;
 }
 
 function readJson(path: string): Manifest {
@@ -120,7 +132,8 @@ describe("consumable without a build step", () => {
     // governance dependency inside the business system the demo claims cannot
     // influence its own governance. #33.
     const consumers = workspaces().filter(
-      ({ manifest }) => manifest.name !== PACKAGE_NAME && !isGoverned(manifest),
+      ({ manifest }) =>
+        manifest.name !== PACKAGE_NAME && !isGoverned(manifest) && !isExternal(manifest),
     );
 
     expect(consumers.length).toBeGreaterThan(0);
@@ -129,6 +142,12 @@ describe("consumable without a build step", () => {
       expect(`${dir}: ${manifest.dependencies?.[PACKAGE_NAME]}`).toBe(
         `${dir}: workspace:*`,
       );
+    }
+  });
+
+  it("is not declared by an external stand-in either", () => {
+    for (const { dir, manifest } of workspaces().filter(({ manifest }) => isExternal(manifest))) {
+      expect(`${dir}: ${manifest.dependencies?.[PACKAGE_NAME]}`).toBe(`${dir}: undefined`);
     }
   });
 

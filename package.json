@@ -4,6 +4,7 @@
   "type": "module",
   "workspaces": [
     "apps/*",
+    "!apps/idp",
     "packages/*"
   ],
   "scripts": {
@@ -11,13 +12,17 @@
     "build": "bun run --filter '*' build",
     "dev:hooks": "bun run --cwd apps/hooks dev",
     "dev:loan-mcp": "bun run --cwd apps/loan-mcp dev",
-    "dev:web": "bun run --cwd apps/web dev"
+    "dev:web": "bun run --cwd apps/web dev",
+    "dev:idp": "bun run --cwd apps/idp dev"
   },
   "devDependencies": {
     "@types/bun": "^1.3.0",
     "typescript": "^5.9.2"
   },
-  "//": "zod is pinned to 3.x on purpose — see DESIGN.md and .env.example. Zod 4 changes internals that the Arcade/Mastra path does not support yet.",
+  "//": [
+    "zod is pinned to 3.x on purpose — see DESIGN.md and .env.example. Zod 4 changes internals that the Arcade/Mastra path does not support yet.",
+    "apps/idp is excluded from the workspace on purpose: it stands in for the enterprise IdP and Better Auth needs zod 4, which the override below forbids. It has its own lockfile — see apps/idp/package.json."
+  ],
   "overrides": {
     "zod": "3.25.76"
   }

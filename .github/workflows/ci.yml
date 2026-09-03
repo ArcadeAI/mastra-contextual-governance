@@ -25,14 +25,28 @@ jobs:
       - name: Install
         run: bun install --frozen-lockfile
 
+      # apps/idp is not a workspace member — it stands in for the enterprise
+      # IdP and needs zod 4, which the root override forbids — so it installs
+      # and typechecks on its own. `bun test` below still finds its tests.
+      - name: Install apps/idp
+        run: bun install --frozen-lockfile --cwd apps/idp
+
       - name: Typecheck
         run: bun run typecheck
+
+      - name: Typecheck apps/idp
+        run: bun run --cwd apps/idp typecheck
 
       # The hook contract is generated from a vendored copy of Arcade's OpenAPI
       # document. `bun test` catches a stale committed file too, but this step
       # names the cause and the fix instead of failing as an opaque string diff.
       - name: Hook contract is regenerated from the vendored spec
         run: bun run --cwd packages/policy-schema generate:check
+
+      # idp.db's schema is generated from the installed Better Auth. A stale
+      # file fails `bun test` too, but this names the fix.
+      - name: idp schema is regenerated from the installed Better Auth
+        run: bun run --cwd apps/idp generate:check
 
       - name: Test
         run: bun test
@@ -50,13 +64,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        service: [hooks, loan-mcp, web]
+        service: [hooks, loan-mcp, web, idp]
     steps:
       - uses: actions/checkout@v4
 
       - uses: docker/setup-buildx-action@v3
 
-      # All three services are runtime: docker with hand-written Dockerfiles,
+      # All four services are runtime: docker with hand-written Dockerfiles,
       # so without this the entire container path is only ever exercised by a
       # Render deploy. A workspace added without its matching
       # `COPY packages/<new>/package.json` line would keep CI green and then
