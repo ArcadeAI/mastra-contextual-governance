@@ -49,7 +49,40 @@ the `MCPApp(name=...)` in `loan/__init__.py`, not the package name in
 
 ## The toolkit name, measured
 
-See `ARCADE_LOAN_TOOLKIT` in `.env.example` and the report on #35. The section
-below is filled from real payloads, never from a derivation.
+Deployed 2026-09-03 into the `mastra governance dev` Arcade project, alongside a
+throwaway probe named `loan_mcp_probe` — an underscore and the substring `mcp`,
+so one deploy discriminates every naming rule on the table. Read back with
+`GET /v1/workers/<server>/tools`:
 
-_Measurement pending — see #35._
+| `MCPApp(name=...)` | `toolkit.name` | `fully_qualified_name` |
+|---|---|---|
+| `loan` | `Loan` | `Loan.SearchLoans@1.0.0`, `Loan.GetLoan@1.0.0`, `Loan.ApproveLoan@1.0.0`, `Loan.DenyLoan@1.0.0` |
+| `loan_mcp_probe` | `LoanMcpProbe` | `LoanMcpProbe.PingProbe@1.0.0` |
+
+Three things follow, and two of them were not what the issue assumed:
+
+1. **Normalised, not raw.** The toolkit is the server name split on
+   underscores and PascalCased. `mcp` is *not* stripped — that is where
+   `arcade deploy` differs from Remote MCP registration (spike #2).
+2. **Underscores do not survive into a resolvable name.** Against
+   `POST /v1/tools/execute`, `LoanMcpProbe.PingProbe` ran; `loan_mcp_probe.PingProbe`
+   and `loan_mcp_probe.ping_probe` were `400 failed to parse tool name`;
+   `LoanMcpProbe.ping_probe` was `tool_not_found`.
+3. **Tool names are PascalCased too, by `arcade-mcp` itself**, before Arcade
+   ever sees them: the function `get_loan` is the tool `GetLoan`. The MCP wire
+   name the agent sees through a gateway is therefore `Loan_GetLoan`. The
+   descriptions still say `get_loan`; whether that wording should follow the
+   wire name is a question for the prompt-coaching review, not this slice.
+
+So `ARCADE_LOAN_TOOLKIT=Loan`, and policy rules key on `tool.toolkit = "Loan"`
+with `tool.name` in `SearchLoans`, `GetLoan`, `ApproveLoan`, `DenyLoan`.
+
+`tool.toolkit` on a live `/pre` payload is recorded on #35 once a hook
+extension in that project is pointed at a receiver; spike #2 found the
+workers-API toolkit name and the payload's `tool.toolkit` identical.
+
+Two operational notes. `LOAN_APP_PUBLIC_HOST` was uploaded with a placeholder
+and must be re-set to the real Render host once `cg-loan-app` exists
+(`arcade secret set LOAN_APP_PUBLIC_HOST <host>`). And the tools require the
+`cg-idp` auth provider, which #13 registers; until then a call fails the
+requirement check before any hook fires — by design, see above.
