@@ -73,6 +73,8 @@ Three things follow, and two of them were not what the issue assumed:
    name the agent sees through a gateway is therefore `Loan_GetLoan`. The
    descriptions still say `get_loan`; whether that wording should follow the
    wire name is a question for the prompt-coaching review, not this slice.
+   **#14** (the first end-to-end slice) and any eval work should know the
+   model reads "call `get_loan`" while holding a tool named `Loan_GetLoan`.
 
 So `ARCADE_LOAN_TOOLKIT=Loan`, and policy rules key on `tool.toolkit = "Loan"`
 with `tool.name` in `SearchLoans`, `GetLoan`, `ApproveLoan`, `DenyLoan`.

@@ -39,6 +39,22 @@ class TestDefinition:
             "DenyLoan": ["loan_id", "reason"],
         }
 
+    def test_carries_the_previous_surface_annotations_as_behavior(self) -> None:
+        # #30's readOnlyHint / destructiveHint / idempotentHint / openWorldHint,
+        # as arcade-mcp Behavior. Dropped once already; this keeps them.
+        behavior = {
+            t.definition.name: t.definition.metadata.behavior.model_dump(exclude={"operations"})
+            for t in app._catalog
+        }
+        read = {"read_only": True, "destructive": False, "idempotent": True, "open_world": False}
+        write = {"read_only": False, "destructive": False, "idempotent": False, "open_world": False}
+        assert behavior == {
+            "SearchLoans": read,
+            "GetLoan": read,
+            "ApproveLoan": write,
+            "DenyLoan": write,
+        }
+
     def test_status_is_an_enum_on_the_wire(self) -> None:
         tool = next(t for t in app._catalog if t.definition.name == "SearchLoans")
         status = next(p for p in tool.definition.input.parameters if p.name == "status")

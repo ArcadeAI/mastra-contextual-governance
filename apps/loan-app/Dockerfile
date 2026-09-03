@@ -18,7 +18,10 @@ RUN bun install --frozen-lockfile --production --filter '@cg/loan-app'
 
 COPY tsconfig.base.json ./
 COPY packages ./packages
-COPY apps/loan-app ./apps/loan-app
+# `src` only. `test/` has no business in the image, and `scripts/dev-idp.ts`
+# is a laptop-only identity stand-in that must not ship anywhere it could be
+# mistaken for the real provider.
+COPY apps/loan-app/src ./apps/loan-app/src
 
 ENV NODE_ENV=production
 EXPOSE 8080
