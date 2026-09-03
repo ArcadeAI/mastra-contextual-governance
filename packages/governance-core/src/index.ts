@@ -10,7 +10,8 @@
  * convenience; `@cg/policy-schema` remains the single source.
  *
  * The four pure modules: #7 (PolicyEngine, `./policy-engine.ts`), #8
- * (RedactionEngine), #9 (ApproverRouter) and #10 (GrantChecker).
+ * (RedactionEngine), #9 (ApproverRouter, `./approver-router.ts`) and #10
+ * (GrantChecker).
  */
 import { type Decision } from "@cg/policy-schema";
 
@@ -34,6 +35,8 @@ export {
   type ValidatedGrant,
   type VisibilityDecision,
 } from "./policy-engine.ts";
+
+export { routeApproval, type RoutingResult } from "./approver-router.ts";
 
 /**
  * Arcade calls hooks over the public internet, so an outage must degrade to
