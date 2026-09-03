@@ -1,28 +1,26 @@
 /**
  * The governance layer: hook framework, policy engine, redaction, audit,
- * event bus. Deliberately free of any loan-domain vocabulary, and — enforced
- * by `test/no-app-dependencies.test.ts` — of any dependency on `apps/*`.
- * Swapping the domain means replacing `apps/loan-mcp`, never touching this.
+ * event bus. Deliberately free of any business-domain vocabulary, and —
+ * enforced by `test/no-app-dependencies.test.ts` — of any dependency on
+ * `apps/*`. Swapping the domain means replacing the governed app, never
+ * touching this.
+ *
+ * The types live one layer down in `@cg/policy-schema` (#5) so that the apps,
+ * the UI and this package all agree on one definition. Re-exported here for
+ * convenience; `@cg/policy-schema` remains the single source.
  *
  * The four pure modules arrive in #7 (PolicyEngine), #8 (RedactionEngine),
  * #9 (ApproverRouter) and #10 (GrantChecker).
  */
-import { Effect, type GovernanceEvent, type HookPoint } from "@cg/policy-schema";
+import { type Decision } from "@cg/policy-schema";
 
-export { Effect, type GovernanceEvent, type HookPoint };
-
-/** What every hook returns. `override` carries a modified payload for `modify`. */
-export interface Decision {
-  effect: Effect;
-  reason: string;
-  rule_id: string | null;
-  override?: unknown;
-}
+export { Decision, Effect, GovernanceEvent, HookPoint } from "@cg/policy-schema";
 
 /**
  * Arcade calls hooks over the public internet, so an outage must degrade to
  * denial rather than to open access (PRD user story 24). Hooks declare their
- * failure mode explicitly — spike #2 warns against relying on the default.
+ * failure mode explicitly — spike #2 measured that there is no default to
+ * inherit: `failure_mode` is a required field.
  */
 export const FAIL_CLOSED: Decision = {
   effect: "deny",

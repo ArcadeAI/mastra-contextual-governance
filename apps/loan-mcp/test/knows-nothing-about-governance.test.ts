@@ -84,6 +84,16 @@ describe("apps/loan-mcp knows nothing about governance", () => {
     expect(offenders).toEqual([]);
   });
 
+  test("declares itself the governed app, so the boundary is enforced from both sides", async () => {
+    const manifest = await Bun.file(join(import.meta.dir, "..", "package.json")).json();
+
+    // `packages/policy-schema` sweeps every workspace and requires it to
+    // declare `@cg/policy-schema`; this flag is how it knows to exempt this
+    // one. Without it the sweep puts the governance vocabulary back inside the
+    // business system, and the two tests contradict each other. #33.
+    expect(manifest.cg?.governed).toBe(true);
+  });
+
   test("declares no dependency on anything under packages/", async () => {
     const manifest = await Bun.file(join(import.meta.dir, "..", "package.json")).json();
     const declared = Object.keys({
