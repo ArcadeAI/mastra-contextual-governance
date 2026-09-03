@@ -16,8 +16,14 @@ const policy = compilePolicy({
   // hardcoded), the tools it serves, and the arguments each call must supply.
   // Required: it is the typo check at compile time, the fail-closed boundary
   // at runtime, and what lets the compiler check remediation instructions.
+  // A trailing `?` marks an argument optional: not required on the call, usable
+  // in conditions, not usable as a {{inputs.…}} placeholder.
   catalogue: {
-    [toolkitName]: { get_widget: ["widget_id"], update_widget: ["widget_id", "quantity"] },
+    [toolkitName]: {
+      search_widgets: ["status?", "min_quantity?", "max_quantity?"],
+      get_widget: ["widget_id"],
+      update_widget: ["widget_id", "quantity"],
+    },
     Approvals: { request_approval: ["resource_id", "quantity", "justification"] },
   },
   rules,   // PolicyRule[] from governance.db
@@ -31,8 +37,12 @@ evaluatePermission({ subject, tool, inputs, policy, grants });   // → Decision
 ```
 
 `subject` is `Subject | null` — the hook handler (#12) resolves `context.user_id` to a
-`Subject`; `null` means nobody matched. `grants` are grants #10 has already judged valid;
-the engine only checks that one applies to this subject and tool.
+`Subject`; `null` means nobody matched. `grants` are `ValidatedGrant`s: grants that #10's
+`GrantChecker` has judged valid *for this call* (expiry, uses, approver ≠ subject,
+`resource_id`, pinned inputs, ceiling against the call's own value) and marked so with
+`attestGrantValidated`. That function is the only way to produce the type, so a grant cannot
+reach the engine without passing through validation. The engine itself only checks that a
+grant applies to this subject and tool.
 
 ### What a decision means
 
@@ -54,10 +64,20 @@ Disabled rules never fire.
 
 A rule that matches nothing is indistinguishable at runtime from a rule that permits. So
 compilation is loud: it refuses, with every problem listed, a rule whose toolkit or tool the
-catalogue does not list, whose condition value makes no sense for its operator (`gt "10"`,
-`in "eu"`, an invalid regex), an `access` rule with conditions (there are no inputs at
-`/access`), a `modify` effect, a duplicate id, a `reason` placeholder rooted outside
-`inputs`, `subject` or `tool` — and a `pre` denial whose reason is not actionable (below).
+catalogue does not list, whose condition reads an input no matched tool accepts (a typo
+there would fail closed forever, telling the model to set an input the tool does not take),
+whose condition value makes no sense for its operator (`gt "10"`, `in "eu"`, an invalid
+regex), an `exists: false` on a required argument (dead: the call is denied before any rule
+runs), a subject matcher that can never match (empty `roles` or `user_ids`,
+`clearance_below <= 0`, an empty clearance band), an `access` rule with conditions (there are
+no inputs at `/access`), a `modify` effect, a duplicate id, a `reason` placeholder rooted
+outside `inputs`, `subject` or `tool` — and a `pre` denial whose reason is not actionable
+(below).
+
+**The one loudness gap, stated.** The engine holds no roster, so a misspelled *role* or
+*user id* in `subjects` cannot be caught at compile time: such a rule matches nobody and the
+default allow applies. The guarantee covers `match`, `conditions` and everything the schema
+makes provable; role and user-id spelling is #12's seed data's to get right.
 
 ### Denial reasons
 

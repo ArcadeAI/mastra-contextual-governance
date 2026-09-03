@@ -17,6 +17,7 @@ import { type Decision } from "@cg/policy-schema";
 export { Decision, Effect, GovernanceEvent, HookPoint } from "@cg/policy-schema";
 
 export {
+  attestGrantValidated,
   compilePolicy,
   evaluatePermission,
   hiddenTools,
@@ -30,6 +31,7 @@ export {
   type SubjectOrUnknown,
   type ToolCatalogue,
   type ToolRef,
+  type ValidatedGrant,
   type VisibilityDecision,
 } from "./policy-engine.ts";
 

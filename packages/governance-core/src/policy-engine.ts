@@ -84,15 +84,28 @@ export type ToolRef = {
  *
  *     { Widgets: { get_widget: ["widget_id"], update_widget: ["widget_id", "quantity"] } }
  *
- * Three jobs. At compile time it makes a misspelled toolkit *or tool* in a
- * rule an error instead of a rule that silently matches nothing. At runtime it
- * is the fail-closed boundary: a call to anything not listed is denied, so a
- * tool the policy has never heard of cannot slip through on the "no rule
- * matched" default. And the argument lists are what let the compiler check
- * that a denial's remediation instruction names *the arguments the next tool
- * actually needs*, not just some `name=value` token.
+ * An argument is required unless its name ends in `?`, which marks it optional:
+ *
+ *     { Widgets: { search_widgets: ["status?", "min_quantity?", "max_quantity?"] } }
+ *
+ * Four jobs. At compile time it makes a misspelled toolkit *or tool* in a
+ * rule an error instead of a rule that silently matches nothing, and likewise a
+ * condition on an input no matched tool accepts. At runtime it is the
+ * fail-closed boundary: a call to anything not listed, or missing a required
+ * argument, is denied, so nothing unknown rides the "no rule matched" default.
+ * The required lists are what let a `{{inputs.x}}` placeholder be provably
+ * fillable. And the argument lists are what let the compiler check that a
+ * denial's remediation instruction names *the arguments the next tool actually
+ * needs*, not just some `name=value` token.
  */
 export type ToolCatalogue = Readonly<Record<string, Readonly<Record<string, readonly string[]>>>>;
+
+/** One catalogued tool's arguments, split as the engine needs them. */
+type ToolArguments = {
+  readonly required: readonly string[];
+  readonly optional: readonly string[];
+  readonly all: ReadonlySet<string>;
+};
 
 /** The policy as loaded from the policy table plus configuration. */
 export type Policy = {
@@ -100,7 +113,7 @@ export type Policy = {
   readonly rules: readonly PolicyRule[];
 };
 
-type CompiledCatalogue = ReadonlyMap<string, ReadonlyMap<string, readonly string[]>>;
+type CompiledCatalogue = ReadonlyMap<string, ReadonlyMap<string, ToolArguments>>;
 
 /** A `Policy` that `compilePolicy` has validated, sorted and prepared. */
 export type CompiledPolicy = {
@@ -128,8 +141,27 @@ export type PermissionInput = {
    * Grants that #10 has already judged valid. The engine only checks that a
    * grant applies to this subject and this tool.
    */
-  readonly grants?: readonly Grant[];
+  readonly grants?: readonly ValidatedGrant[];
 };
+
+/**
+ * A grant that `GrantChecker` (#10) has judged valid *for this call*: unexpired,
+ * unrevoked, uses remaining, approver ≠ subject, `resource_id` and pinned
+ * inputs matching the call's inputs, and the call's value at or below the
+ * ceiling. The engine reads none of that — it only checks that the grant
+ * applies to this subject and tool — so the type is what forces the caller to
+ * have done the checking. Only `attestGrantValidated` produces one.
+ */
+export type ValidatedGrant = Grant & { readonly [VALIDATED]: true };
+
+/**
+ * The single door into `ValidatedGrant`. Call it at the end of grant
+ * validation and nowhere else; it is deliberately greppable so a review can
+ * find every place a grant is declared valid.
+ */
+export function attestGrantValidated(grant: Grant): ValidatedGrant {
+  return { ...grant, [VALIDATED]: true };
+}
 
 /** Raised by `compilePolicy`. `problems` has one line per offending rule. */
 export class PolicyCompileError extends Error {
@@ -147,6 +179,9 @@ export class PolicyCompileError extends Error {
 // ---------------------------------------------------------------------------
 
 const COMPILED: unique symbol = Symbol("compiled-policy");
+const VALIDATED: unique symbol = Symbol("validated-grant");
+
+const ARGUMENT_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 const WILDCARD = "*";
 
@@ -212,14 +247,28 @@ export const NO_REMEDIATION = "Do not retry";
  */
 export function compilePolicy(policy: Policy): CompiledPolicy {
   const problems: string[] = [];
-  const catalogue = new Map<string, ReadonlyMap<string, readonly string[]>>();
+  const catalogue = new Map<string, ReadonlyMap<string, ToolArguments>>();
 
   for (const [toolkit, tools] of Object.entries(policy.catalogue)) {
     const entries = Object.entries(tools);
     if (entries.length === 0) {
       problems.push(`catalogue: toolkit "${toolkit}" lists no tools, so nothing in it can be governed`);
     }
-    catalogue.set(toolkit, new Map(entries));
+    const compiledTools = new Map<string, ToolArguments>();
+    for (const [tool, declared] of entries) {
+      const required: string[] = [];
+      const optional: string[] = [];
+      for (const entry of declared) {
+        const name = entry.endsWith("?") ? entry.slice(0, -1) : entry;
+        if (!ARGUMENT_NAME.test(name)) {
+          problems.push(`catalogue: "${toolkit}.${tool}" declares argument "${entry}", which is not a valid name`);
+        } else if (required.includes(name) || optional.includes(name)) {
+          problems.push(`catalogue: "${toolkit}.${tool}" declares argument "${name}" twice`);
+        } else (entry.endsWith("?") ? optional : required).push(name);
+      }
+      compiledTools.set(tool, { required, optional, all: new Set([...required, ...optional]) });
+    }
+    catalogue.set(toolkit, compiledTools);
   }
   if (catalogue.size === 0) {
     problems.push(
@@ -273,11 +322,16 @@ export function compilePolicy(policy: Policy): CompiledPolicy {
     }
 
     for (const problem of checkReason(rule, catalogue)) problems.push(`${at}: ${problem}`);
+    if (rule.subjects) {
+      for (const problem of checkSubjectMatcher(rule.subjects)) problems.push(`${at}: ${problem}`);
+    }
 
+    const matched = matchedArguments(rule.match, catalogue);
     const conditions: CompiledCondition[] = [];
     for (const condition of rule.conditions) {
-      const problem = checkCondition(condition);
-      if (problem) problems.push(`${at}: condition on "${condition.input}" ${problem}`);
+      for (const problem of checkCondition(condition, matched)) {
+        problems.push(`${at}: condition on "${condition.input}" ${problem}`);
+      }
       conditions.push({
         ...condition,
         regex:
@@ -297,12 +351,45 @@ export function compilePolicy(policy: Policy): CompiledPolicy {
   return { catalogue, rules: compiled, [COMPILED]: true };
 }
 
-/** The argument lists of every catalogued tool a matcher can match. */
+/**
+ * A subject matcher that can never match is a rule that silently permits. The
+ * engine holds no roster, so a misspelled role or user id cannot be caught here
+ * — that is the one loudness gap the README states — but the parts that are
+ * provable from the schema alone are refused.
+ */
+function checkSubjectMatcher(m: NonNullable<PolicyRule["subjects"]>): string[] {
+  const problems: string[] = [];
+  if (m.roles !== null && m.roles.length === 0) {
+    problems.push(`subjects.roles is an empty list, which matches nobody; use null to mean "any role"`);
+  }
+  if (m.user_ids !== null && m.user_ids.length === 0) {
+    problems.push(`subjects.user_ids is an empty list, which matches nobody; use null to mean "anyone"`);
+  }
+  if (m.clearance_below !== null && m.clearance_below <= 0) {
+    problems.push(
+      `subjects.clearance_below is ${m.clearance_below}, but clearance is never negative, ` +
+        `so no subject can be below it`,
+    );
+  }
+  if (
+    m.clearance_below !== null &&
+    m.clearance_at_least !== null &&
+    m.clearance_below <= m.clearance_at_least
+  ) {
+    problems.push(
+      `subjects.clearance_at_least (${m.clearance_at_least}) is not below subjects.clearance_below ` +
+        `(${m.clearance_below}), so the band is empty and matches nobody`,
+    );
+  }
+  return problems;
+}
+
+/** The arguments of every catalogued tool a matcher can match. */
 function matchedArguments(
   match: ToolMatcher,
   catalogue: CompiledCatalogue,
-): ReadonlyArray<readonly string[]> {
-  const out: (readonly string[])[] = [];
+): ReadonlyArray<ToolArguments> {
+  const out: ToolArguments[] = [];
   for (const [toolkit, tools] of catalogue) {
     if (match.toolkit !== WILDCARD && match.toolkit !== toolkit) continue;
     for (const [tool, args] of tools) {
@@ -342,7 +429,7 @@ function checkReason(rule: PolicyRule, catalogue: CompiledCatalogue): string[] {
   type Invocation = {
     reference: string;
     /** `null` when the reference is not a catalogued tool. */
-    args: readonly string[] | null;
+    args: ToolArguments | null;
     given: string[];
     valueless: string[];
   };
@@ -435,18 +522,18 @@ function checkReason(rule: PolicyRule, catalogue: CompiledCatalogue): string[] {
           `instruction, or a literal`,
       );
     }
-    const missing = args.filter((arg) => !given.includes(arg));
+    const missing = args.required.filter((arg) => !given.includes(arg));
     if (missing.length > 0) {
       problems.push(
         `a pre denial's reason names "${reference}" but not the argument(s) it needs: ` +
           `${quote(missing)}. Spell each out as "name=value" after the tool name`,
       );
     }
-    const unknown = given.filter((arg) => !args.includes(arg));
+    const unknown = given.filter((arg) => !args.all.has(arg));
     if (unknown.length > 0) {
       problems.push(
         `a pre denial's reason gives "${reference}" argument(s) ${quote(unknown)}, which it ` +
-          `does not accept (it takes: ${quote(args)})`,
+          `does not accept (it takes: ${quote([...args.all])})`,
       );
     }
   }
@@ -454,7 +541,7 @@ function checkReason(rule: PolicyRule, catalogue: CompiledCatalogue): string[] {
 }
 
 /** What is wrong with one `{{…}}` placeholder, or `null`. */
-function checkPlaceholder(whole: string, matched: ReadonlyArray<readonly string[]>): string | null {
+function checkPlaceholder(whole: string, matched: ReadonlyArray<ToolArguments>): string | null {
   const path = whole.slice(2, -2).trim();
   const [root, field, ...rest] = path.split(".");
   const bad = (why: string) => `reason placeholder "${whole}" ${why}`;
@@ -463,10 +550,10 @@ function checkPlaceholder(whole: string, matched: ReadonlyArray<readonly string[
     return bad(`must be exactly "inputs.<argument>", "subject.<field>" or "tool.<field>"`);
   }
   if (root === "inputs") {
-    return matched.length > 0 && matched.every((args) => args.includes(field))
+    return matched.length > 0 && matched.every((args) => args.required.includes(field))
       ? null
       : bad(
-          `names an input that is not a catalogued argument of every tool this rule matches, ` +
+          `names an input that is not a required argument of every tool this rule matches, ` +
             `so it could be absent when the reason is rendered`,
         );
   }
@@ -479,8 +566,44 @@ function checkPlaceholder(whole: string, matched: ReadonlyArray<readonly string[
   return bad(`must start with inputs, subject or tool`);
 }
 
-/** Returns a description of what is wrong with the condition, or `null`. */
-function checkCondition(condition: Condition): string | null {
+/**
+ * Returns a description of what is wrong with the condition, or `null`.
+ *
+ * Beyond operator/value shape, the input path is checked against the
+ * catalogue: its first segment must be an argument (required or optional) of
+ * every tool the rule can match. Otherwise a typo in the path yields a rule
+ * that fails closed forever with an instruction — "retry with `quantitiy`
+ * set" — that the model cannot follow. And `exists: false` on an argument
+ * every matched tool *requires* is dead: the engine denies a call missing a
+ * required argument before any rule runs, so the condition can never be true.
+ */
+function checkCondition(condition: Condition, matched: ReadonlyArray<ToolArguments>): string[] {
+  const problems: string[] = [];
+  const head = condition.input.split(".")[0] as string;
+  if (matched.length === 0 || !matched.every((args) => args.all.has(head))) {
+    const accepted = [...new Set(matched.flatMap((args) => [...args.all]))];
+    problems.push(
+      `reads an input that is not a catalogued argument of every tool this rule matches ` +
+        `(accepted: ${accepted.map((a) => `"${a}"`).join(", ") || "none"}); the rule would fail ` +
+        `closed forever, telling the model to set an input the tool does not take`,
+    );
+  } else if (
+    condition.operator === "exists" &&
+    condition.value === false &&
+    matched.every((args) => args.required.includes(head))
+  ) {
+    problems.push(
+      `uses "exists: false" on an argument every matched tool requires; a call without it is ` +
+        `denied before any rule runs, so this condition can never be true and the rule never fires`,
+    );
+  }
+  const shape = checkConditionShape(condition);
+  if (shape) problems.push(shape);
+  return problems;
+}
+
+/** What is wrong with the operator/value pairing, or `null`. */
+function checkConditionShape(condition: Condition): string | null {
   const { operator, value } = condition;
   switch (operator) {
     case "exists":
@@ -576,7 +699,7 @@ type Evaluation = {
   readonly tool: ToolRef;
   readonly inputs: Inputs;
   readonly policy: CompiledPolicy;
-  readonly grants: readonly Grant[];
+  readonly grants: readonly ValidatedGrant[];
 };
 
 function decide(ev: Evaluation): Decision {
@@ -600,8 +723,8 @@ function decide(ev: Evaluation): Decision {
         `report that the toolkit name in the policy configuration does not match the deployed one.`,
     );
   }
-  const required = served.get(tool.name);
-  if (!required) {
+  const args = served.get(tool.name);
+  if (!args) {
     return failClosed(
       `DENIED: "${tool.name}" is not a tool the control plane governs in toolkit ` +
         `"${tool.toolkit}" (governed: ${[...served.keys()].map((t) => `"${t}"`).join(", ")}). ` +
@@ -613,7 +736,7 @@ function decide(ev: Evaluation): Decision {
   // consulted. This is also what makes `{{inputs.<argument>}}` placeholders
   // in reasons safe: by the time a rule renders one, the input is present.
   if (hook === "pre") {
-    const missing = required.filter((arg) => inputs[arg] === undefined || inputs[arg] === null);
+    const missing = args.required.filter((arg) => inputs[arg] === undefined || inputs[arg] === null);
     if (missing.length > 0) {
       const list = missing.map((a) => `"${a}"`).join(", ");
       return failClosed(
@@ -685,7 +808,7 @@ function matchesSubject(rule: CompiledRule, subject: Subject): boolean {
   return true;
 }
 
-function grantApplies(grant: Grant, subject: Subject, tool: ToolRef): boolean {
+function grantApplies(grant: ValidatedGrant, subject: Subject, tool: ToolRef): boolean {
   return grant.subject_id === subject.user_id && matchesTool(grant.match, tool);
 }
 

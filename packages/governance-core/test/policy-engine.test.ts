@@ -26,6 +26,7 @@ import {
 } from "@cg/policy-schema";
 
 import {
+  attestGrantValidated,
   compilePolicy,
   evaluatePermission,
   hiddenTools,
@@ -49,8 +50,18 @@ const ESCALATE: ToolRef = { toolkit: "Approvals", name: "request_approval" };
  */
 const CATALOGUE = {
   [SAMPLE_TOOLKIT]: {
-    [SAMPLE_READ_TOOL]: ["widget_id"],
-    [SAMPLE_WRITE_TOOL]: ["widget_id", "quantity"],
+    [SAMPLE_READ_TOOL]: ["widget_id", "verbose?"],
+    // Required arguments, then the optional ones (`?`) the condition tests read.
+    [SAMPLE_WRITE_TOOL]: [
+      "widget_id",
+      "quantity",
+      "status?",
+      "region?",
+      "note?",
+      "target?",
+      "override_code?",
+      "justification?",
+    ],
   },
   Approvals: {
     request_approval: ["resource_id", "quantity", "justification"],
@@ -99,7 +110,9 @@ function fullInputs(tool: ToolRef): Record<string, unknown> {
   const args = (CATALOGUE as Record<string, Record<string, readonly string[]>>)[tool.toolkit]?.[
     tool.name
   ];
-  return Object.fromEntries((args ?? []).map((arg) => [arg, `${arg}-value`]));
+  return Object.fromEntries(
+    (args ?? []).filter((arg) => !arg.endsWith("?")).map((arg) => [arg, `${arg}-value`]),
+  );
 }
 
 /** A reason that passes the remediation check without saying anything specific. */
@@ -487,7 +500,7 @@ describe("evaluatePermission: grants", () => {
   });
 
   it("allows with an applicable grant, keeping the rule the grant lifted", () => {
-    const decision = evaluatePermission({ ...blocked, policy: compiled, grants: [aGrant()] });
+    const decision = evaluatePermission({ ...blocked, policy: compiled, grants: [attestGrantValidated(aGrant())] });
     expect(decision.effect).toBe("allow");
     expect(decision.rule_id).toBe("rule.clearance");
     expect(decision.reason).toMatch(/grant/i);
@@ -495,14 +508,16 @@ describe("evaluatePermission: grants", () => {
   });
 
   it("ignores a grant issued to somebody else", () => {
-    const grant = aGrant({ subject_id: SAMPLE_SUBJECT_IDS.director });
+    const grant = attestGrantValidated(aGrant({ subject_id: SAMPLE_SUBJECT_IDS.director }));
     expect(evaluatePermission({ ...blocked, policy: compiled, grants: [grant] }).effect).toBe(
       "deny",
     );
   });
 
   it("ignores a grant for a different tool", () => {
-    const grant = aGrant({ match: { toolkit: SAMPLE_TOOLKIT, tool: SAMPLE_READ_TOOL } });
+    const grant = attestGrantValidated(
+      aGrant({ match: { toolkit: SAMPLE_TOOLKIT, tool: SAMPLE_READ_TOOL } }),
+    );
     expect(evaluatePermission({ ...blocked, policy: compiled, grants: [grant] }).effect).toBe(
       "deny",
     );
@@ -515,7 +530,7 @@ describe("evaluatePermission: grants", () => {
       tool: WRITE,
       inputs: { widget_id: "WID-1" },
       policy: compiled,
-      grants: [aGrant()],
+      grants: [attestGrantValidated(aGrant())],
     });
     expect(decision.effect).toBe("deny");
     expect(decision.reason).toMatch(/not provided/);
@@ -693,7 +708,7 @@ describe("evaluatePermission: several rules", () => {
     const snapshot = structuredClone(inputs);
     const subject = aSubject();
     const subjectSnapshot = structuredClone(subject);
-    evaluatePermission({ subject, tool: WRITE, inputs, policy: compiled, grants: [aGrant()] });
+    evaluatePermission({ subject, tool: WRITE, inputs, policy: compiled, grants: [attestGrantValidated(aGrant())] });
     expect(inputs).toEqual(snapshot);
     expect(subject).toEqual(subjectSnapshot);
   });
@@ -813,6 +828,72 @@ describe("compilePolicy refuses a policy that cannot mean what it says", () => {
       /says "Do not retry" but also instructs a call \("Approvals\.request_approval"\)/,
     ],
     [
+      "a subject matcher with an empty roles list, which matches nobody",
+      withRules(rule({ ...base(), subjects: { roles: [] }, reason: STOP })),
+      /subjects\.roles is an empty list, which matches nobody/,
+    ],
+    [
+      "a subject matcher with an empty user_ids list, which matches nobody",
+      withRules(rule({ ...base(), subjects: { user_ids: [] }, reason: STOP })),
+      /subjects\.user_ids is an empty list, which matches nobody/,
+    ],
+    [
+      "a subject matcher below a clearance of zero, which no subject can be",
+      withRules(rule({ ...base(), subjects: { clearance_below: 0 }, reason: STOP })),
+      /clearance_below is 0, but clearance is never negative/,
+    ],
+    [
+      "a subject matcher whose clearance band is empty",
+      withRules(
+        rule({ ...base(), subjects: { clearance_at_least: 50, clearance_below: 50 }, reason: STOP }),
+      ),
+      /band is empty and matches nobody/,
+    ],
+    [
+      "a condition on an input no matched tool accepts — a typo that would fail closed forever",
+      withRules(
+        rule({
+          ...base(),
+          conditions: [{ input: "quantitiy", operator: "gt", value: 50 }],
+          reason: STOP,
+        }),
+      ),
+      /condition on "quantitiy" reads an input that is not a catalogued argument.*"quantity".*fail closed forever/s,
+    ],
+    [
+      "a condition on an input not common to every tool a wildcard rule matches",
+      withRules(
+        rule({
+          ...base(),
+          match: { toolkit: SAMPLE_TOOLKIT, tool: "*" },
+          conditions: [{ input: "quantity", operator: "gt", value: 50 }],
+          reason: STOP,
+        }),
+      ),
+      /condition on "quantity" reads an input that is not a catalogued argument of every tool/,
+    ],
+    [
+      "exists: false on a required argument, which can never be true",
+      withRules(
+        rule({
+          ...base(),
+          conditions: [{ input: "quantity", operator: "exists", value: false }],
+          reason: STOP,
+        }),
+      ),
+      /"exists: false" on an argument every matched tool requires.*can never be true/s,
+    ],
+    [
+      "a catalogue argument that is not a valid name",
+      { catalogue: { ...CATALOGUE, Odd: { do_thing: ["has space"] } }, rules: [] },
+      /"Odd\.do_thing" declares argument "has space", which is not a valid name/,
+    ],
+    [
+      "a catalogue argument declared twice",
+      { catalogue: { ...CATALOGUE, Odd: { do_thing: ["a", "a?"] } }, rules: [] },
+      /"Odd\.do_thing" declares argument "a" twice/,
+    ],
+    [
       "a pre denial whose arguments follow an uncatalogued tool reference",
       withRules(
         rule({
@@ -887,32 +968,32 @@ describe("compilePolicy refuses a policy that cannot mean what it says", () => {
     ],
     [
       "gt with a non-numeric value",
-      withRules(rule({ ...base(), conditions: [{ input: "q", operator: "gt", value: "10" }] })),
+      withRules(rule({ ...base(), conditions: [{ input: "quantity", operator: "gt", value: "10" }] })),
       /"gt" with a non-numeric value/,
     ],
     [
       "in with a value that is not an array",
-      withRules(rule({ ...base(), conditions: [{ input: "q", operator: "in", value: "eu" }] })),
+      withRules(rule({ ...base(), conditions: [{ input: "quantity", operator: "in", value: "eu" }] })),
       /"in" with a value that is not an array/,
     ],
     [
       "matches with an invalid regular expression",
-      withRules(rule({ ...base(), conditions: [{ input: "q", operator: "matches", value: "(" }] })),
+      withRules(rule({ ...base(), conditions: [{ input: "quantity", operator: "matches", value: "(" }] })),
       /invalid regular expression/,
     ],
     [
       "matches with a non-string value",
-      withRules(rule({ ...base(), conditions: [{ input: "q", operator: "matches", value: 1 }] })),
+      withRules(rule({ ...base(), conditions: [{ input: "quantity", operator: "matches", value: 1 }] })),
       /"matches" with a value that is not a string/,
     ],
     [
       "eq with nothing to compare against",
-      withRules(rule({ ...base(), conditions: [{ input: "q", operator: "eq" }] })),
+      withRules(rule({ ...base(), conditions: [{ input: "quantity", operator: "eq" }] })),
       /"eq" with no value/,
     ],
     [
       "exceeds_clearance given a value it would ignore",
-      withRules(rule({ ...base(), conditions: [{ input: "q", operator: "exceeds_clearance", value: 5 }] })),
+      withRules(rule({ ...base(), conditions: [{ input: "quantity", operator: "exceeds_clearance", value: 5 }] })),
       /takes no value/,
     ],
     [
@@ -930,7 +1011,7 @@ describe("compilePolicy refuses a policy that cannot mean what it says", () => {
             "quantity={{inputs.missing_quantity}}, justification={{inputs.missing_reason}}.",
         }),
       ),
-      /"\{\{inputs\.missing_id\}\}" names an input that is not a catalogued argument/,
+      /"\{\{inputs\.missing_id\}\}" names an input that is not a required argument/,
     ],
     [
       "a reason placeholder for an input not common to every tool a wildcard rule matches",
@@ -941,7 +1022,7 @@ describe("compilePolicy refuses a policy that cannot mean what it says", () => {
           reason: `{{inputs.widget_id}} is frozen. ${NO_REMEDIATION}.`,
         }),
       ),
-      /"\{\{inputs\.widget_id\}\}" names an input that is not a catalogued argument of every tool/,
+      /"\{\{inputs\.widget_id\}\}" names an input that is not a required argument of every tool/,
     ],
     [
       "a reason placeholder into subject.attributes, which nothing guarantees",
@@ -1000,8 +1081,8 @@ describe("compilePolicy refuses a policy that cannot mean what it says", () => {
     expect(caught).toBeInstanceOf(PolicyCompileError);
     const { problems } = caught as PolicyCompileError;
     expect(problems).toHaveLength(2);
-    expect(problems[0]).toContain('rule "rule.one"');
-    expect(problems[1]).toContain('rule "rule.two"');
+    expect(problems.filter((p) => p.includes('rule "rule.one"'))).toHaveLength(1);
+    expect(problems.filter((p) => p.includes('rule "rule.two"'))).toHaveLength(1);
   });
 
   it("accepts a wildcard on either or both segments", () => {
@@ -1043,6 +1124,40 @@ describe("compilePolicy refuses a policy that cannot mean what it says", () => {
         policy([rule({ ...base(), reason: `Call Approvals.request_approval with ${args}.` })]),
       ).not.toThrow();
     }
+  });
+
+  it("accepts conditions on optional arguments, nested under them, and exists: false on them", () => {
+    expect(() =>
+      policy([
+        rule({
+          ...base(),
+          conditions: [
+            { input: "status", operator: "eq", value: "closed" },
+            { input: "target.region", operator: "eq", value: "eu" },
+            { input: "justification", operator: "exists", value: false },
+          ],
+          reason: STOP,
+        }),
+      ]),
+    ).not.toThrow();
+  });
+
+  it("does not require optional arguments on the call, and lets a placeholder name only required ones", () => {
+    // `verbose?` is optional on READ: absent is fine, and it cannot be a placeholder.
+    const compiled = policy([]);
+    expect(
+      evaluatePermission({ subject: director, tool: READ, inputs: { widget_id: "W" }, policy: compiled })
+        .effect,
+    ).toBe("allow");
+    expect(() =>
+      policy([
+        rule({
+          ...base(),
+          match: { toolkit: SAMPLE_TOOLKIT, tool: SAMPLE_READ_TOOL },
+          reason: `{{inputs.verbose}} is not allowed. ${NO_REMEDIATION}.`,
+        }),
+      ]),
+    ).toThrow(/"\{\{inputs\.verbose\}\}" names an input that is not a required argument/);
   });
 
   it("does not mistake a placeholder's dotted path for a tool reference", () => {
