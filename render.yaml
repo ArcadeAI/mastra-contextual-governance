@@ -9,6 +9,12 @@
 # doubles as the demo reset (DESIGN.md, "Database"), so they are ephemeral on
 # purpose and a restart is a clean slate.
 #
+# Cross-service addresses are host-form, derived with `fromService`. Never
+# hardcode an onrender.com URL here: those subdomains are global, so a taken
+# service name gets silently suffixed and the hardcoded value would then
+# address somebody else's service. Confirmed the hard way — `cg-web` was
+# already taken on the first sync of this blueprint.
+#
 # Secrets are `sync: false`, so a blueprint sync prompts for them instead of
 # putting them in git. See `.env.example` for where to obtain each one.
 
@@ -49,11 +55,17 @@ services:
         sync: false
       - key: ARCADE_LOAN_TOOLKIT
         sync: false
-      # Render blueprints have no string interpolation and `fromService` can
-      # only emit a bare host, never a scheme — so cross-service URLs are
-      # written out. The hostnames follow from the service names above.
-      - key: LOAN_MCP_PUBLIC_URL
-        value: https://cg-loan-mcp.onrender.com
+      # `fromService` emits a bare host, never a scheme, and blueprints have
+      # no string interpolation — so the contract for cross-service addresses
+      # is host-form and the consumer adds the scheme. Deriving it beats
+      # writing the hostname out: onrender.com subdomains are global, so a
+      # taken name gets silently suffixed and a hardcoded URL would then
+      # point at a stranger's service.
+      - key: LOAN_MCP_PUBLIC_HOST
+        fromService:
+          name: cg-loan-mcp
+          type: web
+          property: host
 
   # Next.js: chat, persona switcher, approval page, control-plane panel. The
   # Mastra agent runs in this service's route handlers.
@@ -85,9 +97,15 @@ services:
         sync: false
       - key: PERSONA_MORGAN_EMAIL
         sync: false
-      - key: HOOKS_PUBLIC_URL
-        value: https://cg-hooks.onrender.com
+      - key: HOOKS_PUBLIC_HOST
+        fromService:
+          name: cg-hooks
+          type: web
+          property: host
       # Browser-visible copy: the control-plane panel subscribes to the hook
       # server's SSE stream directly from the client.
-      - key: NEXT_PUBLIC_HOOKS_URL
-        value: https://cg-hooks.onrender.com
+      - key: NEXT_PUBLIC_HOOKS_HOST
+        fromService:
+          name: cg-hooks
+          type: web
+          property: host
