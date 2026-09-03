@@ -29,4 +29,3 @@ const server = Bun.serve({
 });
 
 console.log(`[${SERVICE}] listening on :${server.port}`);
-
