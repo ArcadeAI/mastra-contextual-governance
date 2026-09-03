@@ -1,0 +1,93 @@
+# One blueprint provisions every service Render is responsible for: `web`,
+# `hooks`, and `loan-mcp`. `tools/approvals` is deliberately absent — it is
+# Python and ships via `arcade deploy`.
+#
+# Every service uses runtime: docker. Render does not detect Bun, so the
+# runtime is declared explicitly rather than left to detection.
+#
+# No disks. Both SQLite databases are seeded from fixtures on boot, which
+# doubles as the demo reset (DESIGN.md, "Database"), so they are ephemeral on
+# purpose and a restart is a clean slate.
+#
+# Secrets are `sync: false`, so a blueprint sync prompts for them instead of
+# putting them in git. See `.env.example` for where to obtain each one.
+
+services:
+  # The governed business system. Registered in Arcade as a Remote MCP server.
+  - type: web
+    name: cg-loan-mcp
+    runtime: docker
+    plan: starter
+    region: oregon
+    dockerfilePath: ./apps/loan-mcp/Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    envVars:
+      - key: PORT
+        value: 8080
+      - key: LOANS_DB_PATH
+        value: /tmp/loans.db
+
+  # The control plane. Serves /access, /pre and /post to Arcade Cloud, owns the
+  # policy and audit database, and fans decisions out to the UI over SSE.
+  - type: web
+    name: cg-hooks
+    runtime: docker
+    plan: starter
+    region: oregon
+    dockerfilePath: ./apps/hooks/Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    envVars:
+      - key: PORT
+        value: 8080
+      - key: GOVERNANCE_DB_PATH
+        value: /tmp/governance.db
+      - key: ARCADE_HOOK_SIGNING_SECRET
+        sync: false
+      - key: ARCADE_LOAN_TOOLKIT
+        sync: false
+      # Render blueprints have no string interpolation and `fromService` can
+      # only emit a bare host, never a scheme — so cross-service URLs are
+      # written out. The hostnames follow from the service names above.
+      - key: LOAN_MCP_PUBLIC_URL
+        value: https://cg-loan-mcp.onrender.com
+
+  # Next.js: chat, persona switcher, approval page, control-plane panel. The
+  # Mastra agent runs in this service's route handlers.
+  - type: web
+    name: cg-web
+    runtime: docker
+    plan: starter
+    region: oregon
+    dockerfilePath: ./apps/web/Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    envVars:
+      - key: PORT
+        value: 8080
+      - key: MODEL_ID
+        value: claude-sonnet-5
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: ARCADE_API_KEY
+        sync: false
+      - key: ARCADE_GATEWAY_ID
+        sync: false
+      - key: PERSONA_DANA_EMAIL
+        sync: false
+      - key: PERSONA_SAM_EMAIL
+        sync: false
+      - key: PERSONA_RILEY_EMAIL
+        sync: false
+      - key: PERSONA_MORGAN_EMAIL
+        sync: false
+      - key: HOOKS_PUBLIC_URL
+        value: https://cg-hooks.onrender.com
+      # Browser-visible copy: the control-plane panel subscribes to the hook
+      # server's SSE stream directly from the client.
+      - key: NEXT_PUBLIC_HOOKS_URL
+        value: https://cg-hooks.onrender.com
