@@ -1,5 +1,5 @@
 {
-  "name": "@cg/loan-mcp",
+  "name": "@cg/loan-app",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -14,7 +14,6 @@
     "governed": true
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.30.0",
     "zod": "3.25.76"
   },
   "devDependencies": {

@@ -8,18 +8,18 @@ WORKDIR /app
 # Manifests first, so a source-only change reuses the install layer.
 COPY package.json bun.lock ./
 COPY apps/hooks/package.json ./apps/hooks/
-COPY apps/loan-mcp/package.json ./apps/loan-mcp/
+COPY apps/loan-app/package.json ./apps/loan-app/
 COPY apps/web/package.json ./apps/web/
 COPY packages/governance-core/package.json ./packages/governance-core/
 COPY packages/policy-schema/package.json ./packages/policy-schema/
 
 # --filter keeps `apps/web`'s Next.js toolchain out of this image.
-RUN bun install --frozen-lockfile --production --filter '@cg/loan-mcp'
+RUN bun install --frozen-lockfile --production --filter '@cg/loan-app'
 
 COPY tsconfig.base.json ./
 COPY packages ./packages
-COPY apps/loan-mcp ./apps/loan-mcp
+COPY apps/loan-app ./apps/loan-app
 
 ENV NODE_ENV=production
 EXPOSE 8080
-CMD ["bun", "apps/loan-mcp/src/index.ts"]
+CMD ["bun", "apps/loan-app/src/index.ts"]

@@ -1,7 +1,7 @@
 /**
  * The defining constraint of this service, enforced rather than asserted.
  *
- * `apps/loan-mcp` is the system being governed. If a check ever appears in
+ * `apps/loan-app` is the system being governed. If a check ever appears in
  * here, the demo stops proving anything: the whole claim is that the controls
  * live outside the business system, in a control plane it cannot influence.
  * The pull to add "just one guard" here is real, so this test is the thing
@@ -67,7 +67,7 @@ const FORBIDDEN = [
   // people to add exemptions.
 ] as const;
 
-describe("apps/loan-mcp knows nothing about governance", () => {
+describe("apps/loan-app knows nothing about governance", () => {
   test.each(FORBIDDEN)("no source file mentions %s", async (_word, pattern) => {
     const offenders = (await sourceFiles())
       .filter((file) => pattern.test(file.text))

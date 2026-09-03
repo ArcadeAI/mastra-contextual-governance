@@ -6,7 +6,8 @@
 const SERVICES = [
   ["apps/web", "this app — chat, persona switcher, approval page, panel"],
   ["apps/hooks", "the control plane — /access, /pre, /post, audit, SSE"],
-  ["apps/loan-mcp", "the governed business system, over Remote MCP"],
+  ["apps/loan-app", "the governed business system — a plain HTTP API"],
+  ["tools/loan", "Python arcade-mcp toolkit — the loan tools, ships via arcade deploy"],
   ["tools/approvals", "Python arcade-mcp toolkit — ships via arcade deploy"],
 ] as const;
 

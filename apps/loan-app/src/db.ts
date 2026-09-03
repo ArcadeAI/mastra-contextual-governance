@@ -22,6 +22,12 @@ export interface LoanDecision {
   /** Dollars, present on approvals only. */
   amount: number | null;
   reason: string | null;
+  /**
+   * Who recorded it — the email the API derived from the caller's token.
+   * `null` only for decisions that came in with the seed, which predate the
+   * system and have no actor to name.
+   */
+  decided_by: string | null;
   decided_at: string;
 }
 
@@ -57,6 +63,7 @@ const decisionFixtureSchema = z.object({
   decision: z.enum(["approved", "denied"]),
   amount: z.number().nullable(),
   reason: z.string().nullable(),
+  decided_by: z.string().nullable().default(null),
   decided_at: z.string(),
 });
 
@@ -106,6 +113,7 @@ const SCHEMA = `
     decision   TEXT    NOT NULL CHECK (decision IN ('approved', 'denied')),
     amount     INTEGER,
     reason     TEXT,
+    decided_by TEXT,
     decided_at TEXT    NOT NULL
   );
 
@@ -192,8 +200,8 @@ export function seed(db: Database, loans: LoanSeed[]): void {
     `);
 
     const insertDecision = db.prepare<unknown, NamedBindings>(`
-      INSERT INTO loan_decisions (loan_id, decision, amount, reason, decided_at)
-      VALUES ($loan_id, $decision, $amount, $reason, $decided_at)
+      INSERT INTO loan_decisions (loan_id, decision, amount, reason, decided_by, decided_at)
+      VALUES ($loan_id, $decision, $amount, $reason, $decided_by, $decided_at)
     `);
 
     try {
@@ -245,7 +253,7 @@ export function getLoan(db: Database, loanId: string): LoanRecord | null {
 
   const decisions = db
     .query<LoanDecision, { $loan_id: string }>(
-      `SELECT decision, amount, reason, decided_at
+      `SELECT decision, amount, reason, decided_by, decided_at
          FROM loan_decisions
         WHERE loan_id = $loan_id
         ORDER BY id ASC`,
@@ -261,6 +269,9 @@ export function getLoan(db: Database, loanId: string): LoanRecord | null {
  * Returns the updated record, or `null` if no such loan exists. Applies the
  * decision exactly as asked: any question of whether the caller should have
  * been able to make it was settled — or not — before the call reached here.
+ *
+ * `decided_by` is who made it, as the API read it off the caller's token. It
+ * is recorded, never consulted.
  */
 export function recordDecision(
   db: Database,
@@ -269,9 +280,11 @@ export function recordDecision(
     decision: "approved" | "denied";
     amount: number | null;
     reason: string | null;
+    decided_by?: string | null;
   },
 ): LoanRecord | null {
   const decided_at = new Date().toISOString();
+  const decided_by = input.decided_by ?? null;
 
   const applied = db.transaction(() => {
     const exists = db
@@ -283,9 +296,18 @@ export function recordDecision(
     if (exists === null) return false;
 
     db.query<unknown, NamedBindings>(
-      `INSERT INTO loan_decisions (loan_id, decision, amount, reason, decided_at)
-       VALUES ($loan_id, $decision, $amount, $reason, $decided_at)`,
-    ).run(bind({ ...input, decided_at }));
+      `INSERT INTO loan_decisions (loan_id, decision, amount, reason, decided_by, decided_at)
+       VALUES ($loan_id, $decision, $amount, $reason, $decided_by, $decided_at)`,
+    ).run(
+      bind({
+        loan_id: input.loan_id,
+        decision: input.decision,
+        amount: input.amount,
+        reason: input.reason,
+        decided_by,
+        decided_at,
+      }),
+    );
 
     db.query("UPDATE loans SET status = $status WHERE loan_id = $loan_id").run({
       $status: input.decision,
