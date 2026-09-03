@@ -16,6 +16,8 @@ import { type Decision } from "@cg/policy-schema";
 
 export { Decision, Effect, GovernanceEvent, HookPoint } from "@cg/policy-schema";
 
+export { routeApproval, type RoutingResult } from "./approver-router.ts";
+
 /**
  * Arcade calls hooks over the public internet, so an outage must degrade to
  * denial rather than to open access (PRD user story 24). Hooks declare their
