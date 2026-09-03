@@ -44,6 +44,7 @@ the engine only checks that one applies to this subject and tool.
 | Unknown subject | `deny` | `null` |
 | Toolkit not in the catalogue | `deny` | `null` |
 | Tool not in its toolkit's catalogue entry (typo, case, prefix, or a tool the policy never heard of) | `deny` | `null` |
+| A `/pre` call missing a catalogued argument of its tool | `deny` | `null` |
 | A rule's condition reads an input that is missing or of the wrong type | `deny` | that rule's id |
 
 Rules are evaluated in ascending `priority`, ties broken by `id`; first match wins.
@@ -70,17 +71,22 @@ To proceed, call Approvals.request_approval with resource_id={{inputs.widget_id}
 quantity={{inputs.quantity}} and justification=<why>, then retry this call unchanged.
 ```
 
-Placeholders: `{{inputs.<dot.path>}}`, `{{subject.<field>}}`, `{{tool.toolkit}}`,
-`{{tool.name}}`. An absent value renders as `(not provided)`.
+Placeholders are exactly two segments and every one is provable at compile time:
+`{{inputs.<argument>}}` where the argument is catalogued for *every* tool the rule can match
+(the engine requires those inputs on the call, so the value is always there),
+`{{subject.user_id|display_name|role|clearance}}`, and `{{tool.toolkit|name}}`. A placeholder
+the engine cannot guarantee to fill is a compile error, not a `(not provided)` at runtime.
 
 **This is enforced, not advised.** A `pre` rule with `effect: deny` fails to compile unless
 its `reason` either contains the words `Do not retry`, which tells the model to stop rather
-than guess, or names a catalogued tool as `Toolkit.tool` *and* spells out, as `name=value`,
-every argument the catalogue lists for that tool. The value is a `{{inputs.…}}` placeholder,
-a `<what to supply>` instruction to the model, a quoted string or a literal; `name=` with
-nothing after it is refused, and so is an argument the tool does not accept. So
-`"Insufficient authority."` is refused as an apology, `"…with banana=1."` for the unknown
-argument, and `"…with resource_id=, quantity=, justification=."` for the missing values. Access denials are exempt: they hide
+than guess, or names a catalogued tool as `Toolkit.tool` *and*, after that name, spells out
+as `name=value` every argument the catalogue lists for that tool. Arguments belong to the
+tool reference they follow, so a reason naming two tools is checked as two invocations. The
+value is a `{{inputs.…}}` placeholder, a `<what to supply>` instruction to the model, a
+quoted string or a literal; `name=` with nothing after it is refused, and so is an argument
+the tool does not accept. So `"Insufficient authority."` is refused as an apology,
+`"…with banana=1."` for the unknown argument, `"…with resource_id=, quantity=,
+justification=."` for the missing values, and two tools with swapped argument lists for both. Access denials are exempt: they hide
 the tool, and the model never reads them.
 
 Engine-authored reasons (the fail-closed rows above) follow the same standard: they name the

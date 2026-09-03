@@ -29,6 +29,7 @@ import {
   compilePolicy,
   evaluatePermission,
   hiddenTools,
+  NO_REMEDIATION,
   PolicyCompileError,
   resolveVisibility,
   type Policy,
@@ -92,6 +93,14 @@ const hideWriteFromOperators = aPolicyRule({
   reason: "Your role cannot use this tool.",
   priority: 10,
 });
+
+/** Every catalogued argument of `tool`, filled with a placeholder value. */
+function fullInputs(tool: ToolRef): Record<string, unknown> {
+  const args = (CATALOGUE as Record<string, Record<string, readonly string[]>>)[tool.toolkit]?.[
+    tool.name
+  ];
+  return Object.fromEntries((args ?? []).map((arg) => [arg, `${arg}-value`]));
+}
 
 /** A reason that passes the remediation check without saying anything specific. */
 const ESCALATE_FIRST =
@@ -258,26 +267,48 @@ describe("evaluatePermission: missing and malformed parameters fail closed", () 
   const call = (inputs: Record<string, unknown>) =>
     evaluatePermission({ subject: supervisor, tool: WRITE, inputs, policy: compiled });
 
-  const cases: ReadonlyArray<readonly [label: string, inputs: Record<string, unknown>, tells: RegExp]> =
-    [
-      ["missing entirely", { widget_id: "WID-1" }, /"quantity".*not provided/],
-      ["present but null", { widget_id: "WID-1", quantity: null }, /"quantity".*not provided/],
-      ["a numeric string", { widget_id: "WID-1", quantity: "95" }, /must be a number.*string "95"/],
-      ["a boolean", { widget_id: "WID-1", quantity: true }, /must be a number.*boolean true/],
-      ["an object", { widget_id: "WID-1", quantity: { value: 95 } }, /must be a number.*an object/],
-      ["an array", { widget_id: "WID-1", quantity: [95] }, /must be a number.*an array/],
-      ["NaN", { widget_id: "WID-1", quantity: Number.NaN }, /must be a number/],
-      ["Infinity", { widget_id: "WID-1", quantity: Number.POSITIVE_INFINITY }, /must be a number/],
-    ];
+  // A catalogued argument that is absent is malformed before any rule is
+  // consulted, so no rule id. A present-but-wrong-typed one is caught by the
+  // rule that tried to read it.
+  const cases: ReadonlyArray<
+    readonly [label: string, inputs: Record<string, unknown>, rule_id: string | null, tells: RegExp]
+  > = [
+    ["missing entirely", { widget_id: "WID-1" }, null, /"quantity".*not provided/],
+    ["present but null", { widget_id: "WID-1", quantity: null }, null, /"quantity".*not provided/],
+    ["a numeric string", { widget_id: "WID-1", quantity: "95" }, "rule.clearance", /must be a number.*string "95"/],
+    ["a boolean", { widget_id: "WID-1", quantity: true }, "rule.clearance", /must be a number.*boolean true/],
+    ["an object", { widget_id: "WID-1", quantity: { value: 95 } }, "rule.clearance", /must be a number.*an object/],
+    ["an array", { widget_id: "WID-1", quantity: [95] }, "rule.clearance", /must be a number.*an array/],
+    ["NaN", { widget_id: "WID-1", quantity: Number.NaN }, "rule.clearance", /must be a number/],
+    ["Infinity", { widget_id: "WID-1", quantity: Number.POSITIVE_INFINITY }, "rule.clearance", /must be a number/],
+  ];
 
-  for (const [label, inputs, tells] of cases) {
+  for (const [label, inputs, rule_id, tells] of cases) {
     it(`denies when the governed input is ${label}`, () => {
       const decision = call(inputs);
       expect(decision.effect).toBe("deny");
-      expect(decision.rule_id).toBe("rule.clearance");
+      expect(decision.rule_id).toBe(rule_id);
       expect(decision.reason).toMatch(tells);
     });
   }
+
+  it("lists every missing catalogued argument at once, and names the tool to retry", () => {
+    const { reason, effect } = call({});
+    expect(effect).toBe("deny");
+    expect(reason).toContain('"widget_id", "quantity"');
+    expect(reason).toMatch(/Retry Widgets\.update_widget with/);
+  });
+
+  it("denies a call missing a catalogued argument even when no rule reads it", () => {
+    // READ has no rule at all; its catalogued argument is still required.
+    const decision = evaluatePermission({ subject: director, tool: READ, inputs: {}, policy: compiled });
+    expect(decision).toMatchObject({ effect: "deny", rule_id: null });
+    expect(decision.reason).toMatch(/"widget_id".*not provided/);
+  });
+
+  it("does not require catalogued arguments at /access, which carries no inputs", () => {
+    expect(hiddenTools(director, [READ, WRITE], compiled)).toEqual([]);
+  });
 
   it("names the tool to retry and the input to fix", () => {
     const { reason } = call({ widget_id: "WID-1" });
@@ -348,7 +379,8 @@ describe("evaluatePermission: who is calling", () => {
       }),
     ]);
     const call = (subject: Subject) =>
-      evaluatePermission({ subject, tool: WRITE, inputs: {}, policy: compiledBand }).effect;
+      evaluatePermission({ subject, tool: WRITE, inputs: fullInputs(WRITE), policy: compiledBand })
+        .effect;
     expect(call(operator)).toBe("allow"); // 0 < 50
     expect(call(supervisor)).toBe("deny"); // 50 >= 50 and < 500
     expect(call(director)).toBe("allow"); // 500 is not below 500
@@ -434,12 +466,12 @@ describe("evaluatePermission: which tool is being called", () => {
       }),
     ]);
     for (const tool of [READ, WRITE, ESCALATE]) {
+      const inputs = fullInputs(tool);
       expect(
-        evaluatePermission({ subject: operator, tool, inputs: {}, policy: compiledWild }).effect,
+        evaluatePermission({ subject: operator, tool, inputs, policy: compiledWild }).effect,
       ).toBe("deny");
       expect(
-        evaluatePermission({ subject: supervisor, tool, inputs: {}, policy: compiledWild })
-          .effect,
+        evaluatePermission({ subject: supervisor, tool, inputs, policy: compiledWild }).effect,
       ).toBe("allow");
     }
   });
@@ -514,8 +546,15 @@ describe("evaluatePermission: condition operators", () => {
         priority: 1,
       }),
     ]);
+  // The catalogued arguments are always supplied; each case adds the input
+  // its condition is about.
   const call = (conditions: PolicyRuleInput["conditions"], inputs: Record<string, unknown>) =>
-    evaluatePermission({ subject: director, tool: WRITE, inputs, policy: deny(conditions) });
+    evaluatePermission({
+      subject: director,
+      tool: WRITE,
+      inputs: { ...fullInputs(WRITE), ...inputs },
+      policy: deny(conditions),
+    });
 
   const cases: ReadonlyArray<
     readonly [
@@ -617,7 +656,12 @@ describe("evaluatePermission: several rules", () => {
     ]) {
       const compiled = policy(rules);
       const call = (quantity: number) =>
-        evaluatePermission({ subject: director, tool: WRITE, inputs: { quantity }, policy: compiled });
+        evaluatePermission({
+          subject: director,
+          tool: WRITE,
+          inputs: { widget_id: "WID-1", quantity },
+          policy: compiled,
+        });
       expect(call(3)).toMatchObject({ effect: "allow", rule_id: "rule.allow-small" });
       expect(call(30)).toMatchObject({ effect: "deny", rule_id: "rule.deny-all" });
     }
@@ -684,6 +728,8 @@ describe("compilePolicy refuses a policy that cannot mean what it says", () => {
     priority: 1,
   });
   const withRules = (...rules: PolicyRule[]): Policy => ({ catalogue: CATALOGUE, rules });
+  /** A reason with no placeholders and no remediation tool: valid anywhere. */
+  const STOP = `Frozen. ${NO_REMEDIATION}.`;
 
   const cases: ReadonlyArray<readonly [label: string, policy: Policy, tells: RegExp]> = [
     [
@@ -756,7 +802,7 @@ describe("compilePolicy refuses a policy that cannot mean what it says", () => {
     [
       "a pre denial naming an argument the remediation tool does not accept",
       withRules(rule({ ...base(), reason: "Call Approvals.request_approval with banana=1." })),
-      /argument\(s\) "banana", which "Approvals\.request_approval" does not accept/,
+      /gives "Approvals\.request_approval" argument\(s\) "banana", which it does not accept/,
     ],
     [
       "a pre denial whose one argument is a value placeholder with no argument name",
@@ -814,8 +860,64 @@ describe("compilePolicy refuses a policy that cannot mean what it says", () => {
     ],
     [
       "a reason placeholder rooted somewhere the engine cannot read",
-      withRules(rule({ ...base(), reason: "Ask {{approver.name}}." })),
-      /placeholder "\{\{approver\.name\}\}"/,
+      withRules(rule({ ...base(), reason: `Ask {{approver.name}}. ${NO_REMEDIATION}.` })),
+      /placeholder "\{\{approver\.name\}\}" must start with inputs, subject or tool/,
+    ],
+    [
+      "a reason placeholder for an input the matched tool is not catalogued to carry",
+      withRules(
+        rule({
+          ...base(),
+          reason:
+            "Call Approvals.request_approval with resource_id={{inputs.missing_id}}, " +
+            "quantity={{inputs.missing_quantity}}, justification={{inputs.missing_reason}}.",
+        }),
+      ),
+      /"\{\{inputs\.missing_id\}\}" names an input that is not a catalogued argument/,
+    ],
+    [
+      "a reason placeholder for an input not common to every tool a wildcard rule matches",
+      withRules(
+        rule({
+          ...base(),
+          match: { toolkit: "*", tool: "*" },
+          reason: `{{inputs.widget_id}} is frozen. ${NO_REMEDIATION}.`,
+        }),
+      ),
+      /"\{\{inputs\.widget_id\}\}" names an input that is not a catalogued argument of every tool/,
+    ],
+    [
+      "a reason placeholder into subject.attributes, which nothing guarantees",
+      withRules(rule({ ...base(), reason: `Ask {{subject.attributes.manager}}. ${NO_REMEDIATION}.` })),
+      /"\{\{subject\.attributes\.manager\}\}" must be exactly/,
+    ],
+    [
+      "a reason placeholder for a subject field that does not exist",
+      withRules(rule({ ...base(), reason: `Hi {{subject.email}}. ${NO_REMEDIATION}.` })),
+      /"\{\{subject\.email\}\}" must name one of user_id, display_name, role, clearance/,
+    ],
+    [
+      "a remediation whose arguments come before the tool they belong to",
+      withRules(
+        rule({
+          ...base(),
+          reason:
+            "With resource_id=1, quantity=2, justification=x, call Approvals.request_approval.",
+        }),
+      ),
+      /before naming the tool they belong to/,
+    ],
+    [
+      "a remediation naming two tools with their argument lists swapped",
+      withRules(
+        rule({
+          ...base(),
+          reason:
+            "Call Approvals.request_approval with request_id=<id>, decision=approve; then " +
+            "Approvals.decide with resource_id=1, quantity=2, justification=x.",
+        }),
+      ),
+      /"Approvals\.request_approval" but not the argument\(s\) it needs: "resource_id", "quantity", "justification"/,
     ],
   ];
 
@@ -831,8 +933,8 @@ describe("compilePolicy refuses a policy that cannot mean what it says", () => {
     try {
       compilePolicy(
         withRules(
-          rule({ ...base(), id: "rule.one", match: { toolkit: "Nope", tool: "*" } }),
-          rule({ ...base(), id: "rule.two", effect: "modify" }),
+          rule({ ...base(), id: "rule.one", match: { toolkit: "Nope", tool: "*" }, reason: STOP }),
+          rule({ ...base(), id: "rule.two", effect: "modify", reason: STOP }),
         ),
       );
     } catch (error) {
@@ -846,13 +948,11 @@ describe("compilePolicy refuses a policy that cannot mean what it says", () => {
   });
 
   it("accepts a wildcard on either or both segments", () => {
-    expect(() => policy([rule({ ...base(), match: { toolkit: "*", tool: "*" } })])).not.toThrow();
-    expect(() =>
-      policy([rule({ ...base(), match: { toolkit: "*", tool: SAMPLE_WRITE_TOOL } })]),
-    ).not.toThrow();
-    expect(() =>
-      policy([rule({ ...base(), match: { toolkit: SAMPLE_TOOLKIT, tool: "*" } })]),
-    ).not.toThrow();
+    const wild = (toolkit: string, tool: string) =>
+      rule({ ...base(), match: { toolkit, tool }, reason: STOP });
+    expect(() => policy([wild("*", "*")])).not.toThrow();
+    expect(() => policy([wild("*", SAMPLE_WRITE_TOOL)])).not.toThrow();
+    expect(() => policy([wild(SAMPLE_TOOLKIT, "*")])).not.toThrow();
   });
 
   it("accepts a pre denial that tells the model to stop instead of naming a tool", () => {
@@ -886,6 +986,19 @@ describe("compilePolicy refuses a policy that cannot mean what it says", () => {
         policy([rule({ ...base(), reason: `Call Approvals.request_approval with ${args}.` })]),
       ).not.toThrow();
     }
+  });
+
+  it("accepts a placeholder for an input common to every tool a wildcard rule matches", () => {
+    // Both Widgets tools carry widget_id, so a Widgets.* rule may print it.
+    expect(() =>
+      policy([
+        rule({
+          ...base(),
+          match: { toolkit: SAMPLE_TOOLKIT, tool: "*" },
+          reason: `{{inputs.widget_id}} is frozen. ${NO_REMEDIATION}.`,
+        }),
+      ]),
+    ).not.toThrow();
   });
 
   it("checks each remediation tool named, when a reason names more than one", () => {
