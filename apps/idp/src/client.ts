@@ -125,12 +125,51 @@ export async function ensureOAuthClient(
   return { clientId, clientSecret, redirectUris, created: true };
 }
 
+/**
+ * The one rule of this function: **never mint credentials while any client
+ * row exists.** Arcade holds whatever was issued first; a second issuance is a
+ * silent rotation, and it fails at the authorize step where no hook fires.
+ *
+ * So the lookup is by the fixed id first, then by name — a row written before
+ * the id was fixed is adopted and re-keyed, not replaced — and if rows exist
+ * that are neither, the boot fails loudly rather than serve credentials
+ * Arcade does not have. A dead service is a thing a human can act on.
+ */
 async function findStoredClient(auth: Auth): Promise<StoredClient | null> {
   const ctx = await auth.$context;
-  return ctx.adapter.findOne<StoredClient>({
+
+  const byId = await ctx.adapter.findOne<StoredClient>({
     model: "oauthClient",
     where: [{ field: "id", value: OAUTH_CLIENT_ROW_ID }],
   });
+  if (byId) return byId;
+
+  const byName = await ctx.adapter.findMany<StoredClient>({
+    model: "oauthClient",
+    where: [{ field: "name", value: OAUTH_CLIENT_NAME }],
+    limit: 2,
+  });
+  if (byName.length === 1) {
+    const legacy = byName[0]!;
+    await ctx.adapter.update({
+      model: "oauthClient",
+      where: [{ field: "id", value: legacy.id }],
+      update: { id: OAUTH_CLIENT_ROW_ID },
+    });
+    return { ...legacy, id: OAUTH_CLIENT_ROW_ID };
+  }
+
+  const total = await ctx.adapter.count({ model: "oauthClient" });
+  if (total > 0) {
+    throw new Error(
+      `idp.db holds ${total} OAuth client row(s) this service did not write ` +
+        `(none with id "${OAUTH_CLIENT_ROW_ID}", ${byName.length} named "${OAUTH_CLIENT_NAME}"). ` +
+        `Refusing to create another: the credentials registered in Arcade may be one of these. ` +
+        `Inspect the oauthClient table and re-key the right row to id "${OAUTH_CLIENT_ROW_ID}".`,
+    );
+  }
+
+  return null;
 }
 
 /** Looks the client up by `client_id`, for the consent page's "X wants access" line. */

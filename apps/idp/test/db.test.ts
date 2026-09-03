@@ -156,6 +156,56 @@ describe("resetPeople", () => {
   });
 });
 
+describe("ensureOAuthClient never rotates", () => {
+  const redirectUris = ["http://127.0.0.1:9/callback"];
+
+  /** A client row as an earlier build wrote it: generated id, found by name. */
+  function insertLegacyRow(db: Database, name: string, clientId: string): void {
+    db.query(
+      `INSERT INTO "oauthClient" ("id", "clientId", "clientSecret", "name", "redirectUris", "createdAt", "updatedAt")
+       VALUES ($id, $clientId, 'ciphertext', $name, '["http://127.0.0.1:9/callback"]', $now, $now)`,
+    ).run({ $id: crypto.randomUUID(), $clientId: clientId, $name: name, $now: new Date().toISOString() });
+  }
+
+  test("adopts a row written under a generated id instead of minting a second client", async () => {
+    const db = await openPeople(":memory:");
+    const auth = createAuth({ db, baseURL: "http://localhost:1", secret: SECRET });
+    // Written by a real bootstrap, then re-keyed to look like the earlier build's row.
+    const original = await ensureOAuthClient(auth, { redirectUris, secret: SECRET });
+    db.exec(`UPDATE "oauthClient" SET "id" = '${crypto.randomUUID()}'`);
+
+    const adopted = await ensureOAuthClient(auth, { redirectUris, secret: SECRET });
+
+    expect(adopted.created).toBe(false);
+    expect(adopted.clientId).toBe(original.clientId);
+    expect(adopted.clientSecret).toBe(original.clientSecret);
+    expect(db.query('SELECT "id" FROM "oauthClient"').all()).toEqual([{ id: "arcade" }]);
+  });
+
+  test("refuses to boot when client rows exist that it cannot recognise", async () => {
+    const db = await openPeople(":memory:");
+    const auth = createAuth({ db, baseURL: "http://localhost:1", secret: SECRET });
+    insertLegacyRow(db, "Something Else", "client-arcade-may-hold");
+
+    await expect(ensureOAuthClient(auth, { redirectUris, secret: SECRET })).rejects.toThrow(
+      /Refusing to create another/,
+    );
+    expect(db.query('SELECT COUNT(*) AS n FROM "oauthClient"').get()).toEqual({ n: 1 });
+  });
+
+  test("refuses when two legacy rows share the name, rather than guess", async () => {
+    const db = await openPeople(":memory:");
+    const auth = createAuth({ db, baseURL: "http://localhost:1", secret: SECRET });
+    insertLegacyRow(db, "Arcade", "first");
+    insertLegacyRow(db, "Arcade", "second");
+
+    await expect(ensureOAuthClient(auth, { redirectUris, secret: SECRET })).rejects.toThrow(
+      /2 named "Arcade"/,
+    );
+    expect(db.query('SELECT COUNT(*) AS n FROM "oauthClient"').get()).toEqual({ n: 2 });
+  });
+});
+
 describe("ensureOAuthClient", () => {
   test("two bootstraps at once still leave exactly one client", async () => {
     // The service booting on a fresh disk while someone runs `oauth-client`
