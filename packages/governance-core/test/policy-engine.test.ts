@@ -734,6 +734,26 @@ describe("compilePolicy refuses a policy that cannot mean what it says", () => {
       /"Approvals\.request_approval" but not the argument\(s\) it needs: "justification"/,
     ],
     [
+      "a pre denial naming every argument but giving none of them a value",
+      withRules(
+        rule({
+          ...base(),
+          reason: "Call Approvals.request_approval with resource_id=, quantity=, justification=.",
+        }),
+      ),
+      /no value for argument\(s\) "resource_id", "quantity", "justification"/,
+    ],
+    [
+      "a pre denial giving a value to some arguments but not others",
+      withRules(
+        rule({
+          ...base(),
+          reason: "Call Approvals.request_approval with resource_id=1, quantity= and justification=x.",
+        }),
+      ),
+      /no value for argument\(s\) "quantity"/,
+    ],
+    [
       "a pre denial naming an argument the remediation tool does not accept",
       withRules(rule({ ...base(), reason: "Call Approvals.request_approval with banana=1." })),
       /argument\(s\) "banana", which "Approvals\.request_approval" does not accept/,
@@ -852,6 +872,20 @@ describe("compilePolicy refuses a policy that cannot mean what it says", () => {
         }),
       ]),
     ).not.toThrow();
+  });
+
+  it("accepts a value in any of the forms a model can act on", () => {
+    const forms = [
+      'resource_id={{inputs.widget_id}}, quantity={{inputs.quantity}}, justification="why"',
+      "resource_id=<the widget id>, quantity=<the quantity requested>, justification=<why>",
+      "resource_id=WID-1, quantity=95, justification=needed",
+      "resource_id='WID-1', quantity=(95), justification=x",
+    ];
+    for (const args of forms) {
+      expect(() =>
+        policy([rule({ ...base(), reason: `Call Approvals.request_approval with ${args}.` })]),
+      ).not.toThrow();
+    }
   });
 
   it("checks each remediation tool named, when a reason names more than one", () => {

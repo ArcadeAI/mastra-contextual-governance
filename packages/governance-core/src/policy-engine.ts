@@ -165,8 +165,15 @@ const PLACEHOLDER = /\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g;
 
 /** A `Toolkit.tool` reference inside prose. */
 const TOOL_REFERENCE = /\b([A-Za-z][A-Za-z0-9_-]*)\.([A-Za-z_][A-Za-z0-9_]*)\b/g;
-/** An argument named for the model to supply: `name=`. */
-const ARGUMENT_MENTION = /\b([A-Za-z_][A-Za-z0-9_]*)=/g;
+/**
+ * An argument spelled out for the model: `name=value`. The value is a
+ * `{{…}}` placeholder, a `<…>` instruction telling the model what to supply,
+ * a quoted string, or a bare token; it is captured so that `name=` followed by
+ * nothing can be refused — a name without a value is not something a model
+ * with no other context can act on.
+ */
+const ARGUMENT_MENTION =
+  /\b([A-Za-z_][A-Za-z0-9_]*)=(\{\{[^}]*\}\}|<[^>]+>|"[^"]*"|'[^']*'|[^\s,.;)]+)?/g;
 /**
  * The one sentence that exempts a `pre` denial from naming a remediation tool:
  * it tells the model, in so many words, that nothing it can call will help.
@@ -307,8 +314,20 @@ function checkRemediation(reason: string, catalogue: CompiledCatalogue): string[
     ];
   }
 
-  const mentioned = new Set([...reason.matchAll(ARGUMENT_MENTION)].map((m) => m[1] as string));
   const problems: string[] = [];
+  const mentioned = new Set<string>();
+  const valueless: string[] = [];
+  for (const [, name, value] of reason.matchAll(ARGUMENT_MENTION)) {
+    if (value === undefined) valueless.push(name as string);
+    else mentioned.add(name as string);
+  }
+  if (valueless.length > 0) {
+    problems.push(
+      `a pre denial's reason gives no value for argument(s) ` +
+        `${valueless.map((a) => `"${a}"`).join(", ")}. Write "name=value": a {{inputs.…}} ` +
+        `placeholder, a <what to supply> instruction, or a literal`,
+    );
+  }
   const accepted = new Set<string>();
 
   for (const [reference, args] of named) {

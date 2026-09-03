@@ -75,10 +75,12 @@ Placeholders: `{{inputs.<dot.path>}}`, `{{subject.<field>}}`, `{{tool.toolkit}}`
 
 **This is enforced, not advised.** A `pre` rule with `effect: deny` fails to compile unless
 its `reason` either contains the words `Do not retry`, which tells the model to stop rather
-than guess, or names a catalogued tool as `Toolkit.tool` *and* spells out, as `name=…`,
-every argument the catalogue lists for that tool. An argument the tool does not accept is
-refused too. So `"Insufficient authority."` is an apology and is refused; so is
-`"Call Approvals.request_approval with banana=1."`. Access denials are exempt: they hide
+than guess, or names a catalogued tool as `Toolkit.tool` *and* spells out, as `name=value`,
+every argument the catalogue lists for that tool. The value is a `{{inputs.…}}` placeholder,
+a `<what to supply>` instruction to the model, a quoted string or a literal; `name=` with
+nothing after it is refused, and so is an argument the tool does not accept. So
+`"Insufficient authority."` is refused as an apology, `"…with banana=1."` for the unknown
+argument, and `"…with resource_id=, quantity=, justification=."` for the missing values. Access denials are exempt: they hide
 the tool, and the model never reads them.
 
 Engine-authored reasons (the fail-closed rows above) follow the same standard: they name the
