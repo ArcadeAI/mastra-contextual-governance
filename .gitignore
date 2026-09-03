@@ -14,7 +14,7 @@ build/
 .env.local
 .env.*.local
 
-# data — seeded from fixtures on boot, never committed
+# data — bootstrapped from checked-in fixtures, never committed
 *.db
 *.db-journal
 *.sqlite

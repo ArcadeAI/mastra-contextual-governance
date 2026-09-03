@@ -9,8 +9,12 @@
     "typecheck": "tsc --noEmit",
     "build": "echo 'no build step — Bun runs TypeScript directly'"
   },
+  "//": "`governed: true` marks this as the business system under governance: the part a forker throws away and replaces with their own domain. It must declare no @cg/* dependency, which `test/knows-nothing-about-governance.test.ts` enforces, and `packages/policy-schema`'s every-workspace sweep reads the same flag to exempt it. See #33.",
+  "cg": {
+    "governed": true
+  },
   "dependencies": {
-    "@cg/policy-schema": "workspace:*",
+    "@modelcontextprotocol/sdk": "1.30.0",
     "zod": "3.25.76"
   },
   "devDependencies": {

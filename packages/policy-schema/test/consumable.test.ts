@@ -18,6 +18,25 @@ interface Manifest {
   exports?: Record<string, string>;
   dependencies?: Record<string, string>;
   overrides?: Record<string, string>;
+  /** See `isGoverned`. */
+  cg?: { governed?: boolean };
+}
+
+/**
+ * The business system under governance opts out of this package entirely.
+ *
+ * It is the one workspace that must *not* be able to import the governance
+ * vocabulary: `DESIGN.md` promises that forking means replacing the governed
+ * app and "touching nothing under `packages/`", and that only holds if the
+ * dependency does not run the other way. `apps/loan-mcp` enforces its own half
+ * in `test/knows-nothing-about-governance.test.ts`.
+ *
+ * Read off a flag rather than matched on a name on purpose — `packages/`
+ * carries no business-domain vocabulary, and a forker marking their own app
+ * `"cg": { "governed": true }` inherits both halves of the boundary.
+ */
+function isGoverned(manifest: Manifest): boolean {
+  return manifest.cg?.governed === true;
 }
 
 function readJson(path: string): Manifest {
@@ -86,7 +105,7 @@ describe("consumable without a build step", () => {
     expect(existsSync(join(PACKAGE_ROOT, entry as string))).toBe(true);
   });
 
-  it("is declared by every other workspace, with the workspace protocol", () => {
+  it("is declared by every workspace that may consume it", () => {
     // "Consumable from every workspace" is the acceptance criterion, and a
     // workspace that does not declare the dependency cannot import it —
     // `bun -e 'import ... from "@cg/policy-schema"'` exits 1 there. Checking
@@ -95,10 +114,35 @@ describe("consumable without a build step", () => {
     // A version range rather than `workspace:*` would resolve against the
     // registry, where this private package does not exist, and would fail only
     // at install time in CI.
-    for (const { dir, manifest } of workspaces()) {
-      if (manifest.name === PACKAGE_NAME) continue;
+    //
+    // Governed apps are exempt, and that is the point rather than a hole: see
+    // `isGoverned`. This sweep originally covered them too, which put a
+    // governance dependency inside the business system the demo claims cannot
+    // influence its own governance. #33.
+    const consumers = workspaces().filter(
+      ({ manifest }) => manifest.name !== PACKAGE_NAME && !isGoverned(manifest),
+    );
+
+    expect(consumers.length).toBeGreaterThan(0);
+
+    for (const { dir, manifest } of consumers) {
       expect(`${dir}: ${manifest.dependencies?.[PACKAGE_NAME]}`).toBe(
         `${dir}: workspace:*`,
+      );
+    }
+  });
+
+  it("is not declared by the governed app, whatever it is called", () => {
+    const governed = workspaces().filter(({ manifest }) => isGoverned(manifest));
+
+    // If this is empty the exemption above has gone vacuous — a renamed or
+    // un-flagged app would silently rejoin the sweep and reacquire the
+    // dependency the boundary forbids.
+    expect(governed.length).toBeGreaterThan(0);
+
+    for (const { dir, manifest } of governed) {
+      expect(`${dir}: ${manifest.dependencies?.[PACKAGE_NAME]}`).toBe(
+        `${dir}: undefined`,
       );
     }
   });
