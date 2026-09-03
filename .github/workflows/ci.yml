@@ -28,6 +28,12 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
+      # The hook contract is generated from a vendored copy of Arcade's OpenAPI
+      # document. `bun test` catches a stale committed file too, but this step
+      # names the cause and the fix instead of failing as an opaque string diff.
+      - name: Hook contract is regenerated from the vendored spec
+        run: bun run --cwd packages/policy-schema generate:check
+
       - name: Test
         run: bun test
 
