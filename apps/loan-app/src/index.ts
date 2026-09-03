@@ -67,11 +67,18 @@ async function readJson(request: Request): Promise<unknown> {
 }
 
 async function handleLoans(request: Request, url: URL): Promise<Response> {
+  // Resolve the route and check the method before asking who is calling, so
+  // that a wrong verb is a 405 whether or not a token came with it.
+  const match = url.pathname === "/loans" ? null : LOAN_PATH.exec(url.pathname);
+  if (url.pathname !== "/loans" && match === null) return error(404, "Not found");
+
+  const action = match?.[2];
+  const expected = action === undefined ? "GET" : "POST";
+  if (request.method !== expected) return error(405, "Method not allowed");
+
   const actor = await actorFromRequest(request, idpHost);
 
-  if (url.pathname === "/loans") {
-    if (request.method !== "GET") return error(405, "Method not allowed");
-
+  if (match === null) {
     const query = searchQuery.safeParse(Object.fromEntries(url.searchParams));
     if (!query.success) return error(400, "Invalid query", query.error.issues);
 
@@ -84,19 +91,12 @@ async function handleLoans(request: Request, url: URL): Promise<Response> {
     return Response.json({ count: results.length, loans: results });
   }
 
-  const match = LOAN_PATH.exec(url.pathname);
-  if (match === null) return error(404, "Not found");
-
   const loanId = decodeURIComponent(match[1]!);
-  const action = match[2];
 
   if (action === undefined) {
-    if (request.method !== "GET") return error(405, "Method not allowed");
     const loan = getLoan(db, loanId);
     return loan === null ? noSuchLoan(loanId) : Response.json(loan);
   }
-
-  if (request.method !== "POST") return error(405, "Method not allowed");
 
   const raw = await readJson(request);
   if (action === "approve") {

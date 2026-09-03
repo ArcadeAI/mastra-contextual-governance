@@ -11,6 +11,7 @@
     "build": "bun run --filter '*' build",
     "dev:hooks": "bun run --cwd apps/hooks dev",
     "dev:loan-app": "bun run --cwd apps/loan-app dev",
+    "dev:idp": "bun run --cwd apps/loan-app dev:idp",
     "dev:web": "bun run --cwd apps/web dev"
   },
   "devDependencies": {

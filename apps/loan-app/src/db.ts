@@ -138,8 +138,36 @@ export function openLoanBook(path: string): Database {
   db.exec("PRAGMA foreign_keys = ON");
 
   if (!hasSchema(db)) seed(db, fixtureSchema.parse(fixture).loans);
+  else upgradeSchema(db);
 
   return db;
+}
+
+/**
+ * Brings a database created by an earlier schema up to the current one,
+ * keeping every row. `hasSchema` only asks whether the `loans` table exists,
+ * which is the right question for "is this seeded?" and the wrong one for "is
+ * this current?": a `loans.db` on a persistent disk predates every column
+ * added after it, and without this it would open green and fail on the first
+ * query that named the new column.
+ *
+ * Every step here must be additive and idempotent — an `ALTER TABLE ... ADD
+ * COLUMN` guarded by a `PRAGMA table_info` check. A change that cannot be
+ * expressed that way is a reset, and resets are explicit (#23), never a side
+ * effect of booting.
+ */
+function upgradeSchema(db: Database): void {
+  // Added on #34: who recorded the decision, read off the caller's token.
+  if (!hasColumn(db, "loan_decisions", "decided_by")) {
+    db.exec("ALTER TABLE loan_decisions ADD COLUMN decided_by TEXT");
+  }
+}
+
+function hasColumn(db: Database, table: string, column: string): boolean {
+  return db
+    .query<{ name: string }, []>(`PRAGMA table_info(${table})`)
+    .all()
+    .some((row) => row.name === column);
 }
 
 function hasSchema(db: Database): boolean {

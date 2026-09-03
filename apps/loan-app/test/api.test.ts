@@ -105,6 +105,12 @@ describe("identity", () => {
     expect((await fetch(`${baseUrl}/loans/LN-2291/approve`, { method: "POST" })).status).toBe(401);
   });
 
+  test("a wrong verb is a 405 before anyone asks for a token", async () => {
+    expect((await fetch(`${baseUrl}/loans/LN-2291`, { method: "DELETE" })).status).toBe(405);
+    expect((await fetch(`${baseUrl}/loans`, { method: "POST" })).status).toBe(405);
+    expect((await fetch(`${baseUrl}/loans/LN-2291/approve`)).status).toBe(405);
+  });
+
   test("a token the identity provider does not recognise is refused", async () => {
     const response = await fetch(`${baseUrl}/loans`, as("tok-forged"));
 

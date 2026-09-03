@@ -64,7 +64,15 @@ Run a service:
 ```sh
 bun run dev:hooks        # :8081
 bun run dev:loan-app     # :8082, the loan API
+bun run dev:idp          # :8083, a dev-only stand-in for apps/idp — tokens are `dev:<email>`
 bun run dev:web          # :3000
+```
+
+Every `/loans` call needs a bearer token, and the API asks the identity provider who it
+belongs to. Until `apps/idp` (#36) is running locally, `dev:idp` serves that one endpoint:
+
+```sh
+curl -H 'Authorization: Bearer dev:dana@example.test' localhost:8082/loans/LN-2291
 ```
 
 Each service answers `GET /health`:

@@ -63,7 +63,7 @@ jobs:
 
       - name: Test
         working-directory: tools/loan
-        run: uv run --extra dev pytest
+        run: uv run --frozen --extra dev pytest
 
   images:
     name: build ${{ matrix.service }} image

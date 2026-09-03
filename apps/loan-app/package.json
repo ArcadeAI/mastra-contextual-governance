@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "bun --watch src/index.ts",
+    "dev:idp": "bun scripts/dev-idp.ts",
     "start": "bun src/index.ts",
     "typecheck": "tsc --noEmit",
     "build": "echo 'no build step — Bun runs TypeScript directly'"

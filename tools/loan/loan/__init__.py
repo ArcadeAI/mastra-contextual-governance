@@ -20,6 +20,7 @@ import httpx
 from arcade_core.errors import ToolExecutionError
 from arcade_mcp_server import Context, MCPApp
 from arcade_mcp_server.auth import OAuth2
+from arcade_mcp_server.metadata import Behavior, Operation, ToolMetadata
 
 __all__ = [
     "IDP_PROVIDER_ID",
@@ -62,6 +63,29 @@ LOAN_APP_HOST_SECRET = "LOAN_APP_PUBLIC_HOST"
 
 _requires_auth = OAuth2(id=IDP_PROVIDER_ID, scopes=IDP_SCOPES)
 _requires_secrets = [LOAN_APP_HOST_SECRET]
+
+# The previous MCP surface carried `readOnlyHint`, `destructiveHint`,
+# `idempotentHint` and `openWorldHint` on each tool. `arcade-mcp`'s
+# `Behavior` is the equivalent, so they come across too: reads are read-only
+# and closed-world; writes are neither destructive (nothing is deleted or
+# overwritten — a decision is appended) nor idempotent (approving twice is two
+# rows, on purpose). MCP `title` has no equivalent and is dropped. No
+# `Classification`: its service domains describe third-party SaaS, and the
+# bank's own loan book is not one (`arcade-mcp` rejects a domain on a
+# closed-world tool). Note that spike #2 measured this metadata does not reach
+# hook payloads; it is for clients, not for policy.
+_read = ToolMetadata(
+    behavior=Behavior(
+        operations=[Operation.READ], read_only=True, destructive=False, idempotent=True,
+        open_world=False,
+    ),
+)
+_write = ToolMetadata(
+    behavior=Behavior(
+        operations=[Operation.CREATE], read_only=False, destructive=False, idempotent=False,
+        open_world=False,
+    ),
+)
 
 
 class LoanStatus(str, Enum):
@@ -114,7 +138,7 @@ LoanId = Annotated[
 ]
 
 
-@app.tool(requires_auth=_requires_auth, requires_secrets=_requires_secrets)
+@app.tool(requires_auth=_requires_auth, requires_secrets=_requires_secrets, metadata=_read)
 async def search_loans(
     context: Context,
     status: Annotated[
@@ -140,7 +164,7 @@ async def search_loans(
     return await _call(context, "GET", "/loans", params=params)
 
 
-@app.tool(requires_auth=_requires_auth, requires_secrets=_requires_secrets)
+@app.tool(requires_auth=_requires_auth, requires_secrets=_requires_secrets, metadata=_read)
 async def get_loan(
     context: Context,
     loan_id: LoanId,
@@ -149,7 +173,7 @@ async def get_loan(
     return await _call(context, "GET", f"/loans/{loan_id}")
 
 
-@app.tool(requires_auth=_requires_auth, requires_secrets=_requires_secrets)
+@app.tool(requires_auth=_requires_auth, requires_secrets=_requires_secrets, metadata=_write)
 async def approve_loan(
     context: Context,
     loan_id: LoanId,
@@ -163,7 +187,7 @@ async def approve_loan(
     return await _call(context, "POST", f"/loans/{loan_id}/approve", json={"amount": amount})
 
 
-@app.tool(requires_auth=_requires_auth, requires_secrets=_requires_secrets)
+@app.tool(requires_auth=_requires_auth, requires_secrets=_requires_secrets, metadata=_write)
 async def deny_loan(
     context: Context,
     loan_id: LoanId,

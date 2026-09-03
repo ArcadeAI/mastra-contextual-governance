@@ -15,9 +15,18 @@ import { z } from "zod";
 
 const userinfoSchema = z.object({ email: z.string().email() }).passthrough();
 
-/** A request that could not be attributed to anyone. Always a 401. */
+/**
+ * A request that could not be attributed to anyone. 401 when the token is the
+ * problem; 503 when the identity provider is, so that an outage upstream
+ * reads as an outage and not as every caller's credentials failing at once.
+ */
 export class ActorError extends Error {
-  readonly status = 401;
+  constructor(
+    message: string,
+    readonly status: 401 | 503 = 401,
+  ) {
+    super(message);
+  }
 }
 
 /** Hosts are HOST-form (see `.env.example`); the consumer adds the scheme. */
@@ -36,7 +45,7 @@ export async function actorFromRequest(request: Request, idpHost: string): Promi
       headers: { authorization: `Bearer ${match[1]}` },
     });
   } catch {
-    throw new ActorError("The identity provider could not be reached.");
+    throw new ActorError("The identity provider could not be reached.", 503);
   }
 
   if (!response.ok) throw new ActorError("The identity provider rejected the token.");
