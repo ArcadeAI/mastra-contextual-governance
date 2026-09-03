@@ -40,6 +40,7 @@ Arcade provides three such points per tool call: **access**, **pre-execution**,
 | Determinism | The **hook** writes the remediation instruction, not the system prompt |
 | Redaction | Declarative per-tool field rules + regex over free text |
 | Database | `bun:sqlite`, two files: `loans.db` (domain), `governance.db` (policy + audit) |
+| Durability | Data persists; resetting is something you deliberately run. Both databases sit on Render disks and seed from their fixture only when empty. Reset is a script (#23), never a redeploy. Decided on #29 |
 | Visualization | Hook server → SSE → live three-lane Access/Pre/Post panel |
 | Design | Left half deliberately boring enterprise app; right half Arcade-branded control plane |
 | Hosting | Render (`render.yaml` blueprint) for web, hooks, loan-mcp; `arcade deploy` for approvals |
