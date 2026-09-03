@@ -1,0 +1,113 @@
+# One blueprint provisions every service Render is responsible for: `web`,
+# `hooks`, and `loan-mcp`. `tools/approvals` is deliberately absent — it is
+# Python and ships via `arcade deploy`.
+#
+# Every service uses runtime: docker. Render does not detect Bun, so the
+# runtime is declared explicitly rather than left to detection.
+#
+# No disks, and both database paths point at /tmp. The seed-on-boot model that
+# makes this survivable is the PRD's decision (issue #1, "Identity, data,
+# platform"), not DESIGN.md's — DESIGN.md's Database row only assigns
+# ownership. Neither database survives a restart or redeploy, which is in
+# tension with DESIGN.md's "Policy DB owned by the hook server. Editable live
+# on stage": a rule edited mid-demo is lost if cg-hooks restarts. Tracked in
+# #29 — a DESIGN.md-level call, not a scaffold one.
+#
+# Cross-service addresses are host-form, derived with `fromService`. Never
+# hardcode an onrender.com URL here: those subdomains are global, so a taken
+# service name gets silently suffixed and the hardcoded value would then
+# address somebody else's service. Confirmed the hard way — `cg-web` was
+# already taken on the first sync of this blueprint.
+#
+# Secrets are `sync: false`, so a blueprint sync prompts for them instead of
+# putting them in git. See `.env.example` for where to obtain each one.
+
+services:
+  # The governed business system. Registered in Arcade as a Remote MCP server.
+  - type: web
+    name: cg-loan-mcp
+    runtime: docker
+    plan: starter
+    region: oregon
+    dockerfilePath: ./apps/loan-mcp/Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    envVars:
+      - key: PORT
+        value: 8080
+      - key: LOANS_DB_PATH
+        value: /tmp/loans.db
+
+  # The control plane. Serves /access, /pre and /post to Arcade Cloud, owns the
+  # policy and audit database, and fans decisions out to the UI over SSE.
+  - type: web
+    name: cg-hooks
+    runtime: docker
+    plan: starter
+    region: oregon
+    dockerfilePath: ./apps/hooks/Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    envVars:
+      - key: PORT
+        value: 8080
+      - key: GOVERNANCE_DB_PATH
+        value: /tmp/governance.db
+      - key: ARCADE_HOOK_SIGNING_SECRET
+        sync: false
+      - key: ARCADE_LOAN_TOOLKIT
+        sync: false
+      # `fromService` emits a bare host, never a scheme, and blueprints have
+      # no string interpolation — so the contract for cross-service addresses
+      # is host-form and the consumer adds the scheme. Deriving it beats
+      # writing the hostname out: onrender.com subdomains are global, so a
+      # taken name gets silently suffixed and a hardcoded URL would then
+      # point at a stranger's service.
+      - key: LOAN_MCP_PUBLIC_HOST
+        fromService:
+          name: cg-loan-mcp
+          type: web
+          property: host
+
+  # Next.js: chat, persona switcher, approval page, control-plane panel. The
+  # Mastra agent runs in this service's route handlers.
+  - type: web
+    name: cg-web
+    runtime: docker
+    plan: starter
+    region: oregon
+    dockerfilePath: ./apps/web/Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    envVars:
+      - key: PORT
+        value: 8080
+      - key: MODEL_ID
+        value: claude-sonnet-5
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: ARCADE_API_KEY
+        sync: false
+      - key: ARCADE_GATEWAY_ID
+        sync: false
+      - key: PERSONA_DANA_EMAIL
+        sync: false
+      - key: PERSONA_SAM_EMAIL
+        sync: false
+      - key: PERSONA_RILEY_EMAIL
+        sync: false
+      - key: PERSONA_MORGAN_EMAIL
+        sync: false
+      # Server-side only, and no NEXT_PUBLIC_ twin on purpose. `next build`
+      # inlines NEXT_PUBLIC_* into the client bundle, but Render supplies
+      # service env vars at runtime — the value would be empty at build time
+      # and the browser would get `undefined`. The control-plane panel gets
+      # this host from a server component as a prop instead (#21).
+      - key: HOOKS_PUBLIC_HOST
+        fromService:
+          name: cg-hooks
+          type: web
+          property: host
