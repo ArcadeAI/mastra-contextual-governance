@@ -46,7 +46,7 @@ stage a beat we want to *show* as a layer-2 refusal. See open risk 2.
 | **Tool layer** | **Both toolkits are Python `arcade-mcp`, shipped with `arcade deploy` into one Arcade project and exposed through one gateway. `arcade-mcp` is the tool-authoring framework; it is Python-only, which is why the TS-everywhere rule does not reach the toolkits. Decided on #32, confirmed in session.** |
 | **Business system** | **`apps/loan-app` is a plain HTTP API — the bank's system of record. It is not an MCP server and knows nothing about Arcade. `tools/loan` is a stateless client of it. Decided on #32; splitting them is what makes "governance is outside the business system" literal rather than asserted.** |
 | **Identity** | **Every persona is a real Arcade account with a real email. The persona switcher selects which Arcade user the agent acts as. `context.user_id` on every hook payload is that email.** |
-| **Authorization** | **The loan tools require OAuth against our own provider, so they call `apps/loan-app` on behalf of the user rather than as a service account. The API derives the actor from the token, never from a parameter. OAuth carries *identity*; hooks carry *authority*. Proposed provider: Better Auth (TypeScript, ships an OAuth 2.1 / OIDC provider plugin). Placement open — see below.** |
+| **Authorization** | **The loan tools require OAuth against our own provider, so they call `apps/loan-app` on behalf of the user rather than as a service account. The API derives the actor from the token, never from a parameter. OAuth carries *identity*; hooks carry *authority*. Provider is Better Auth in its own service, `apps/idp` (#36).** |
 | **One identity, not two** | **The Arcade `user_id`, the OAuth subject, and the actor `apps/loan-app` records are the same person, joined on email. If these ever diverge, `governance.db` and `loans.db` describe different people and the audit trail is fiction.** |
 | Policy source | Policy DB owned by the hook server. Editable live on stage. |
 | HITL | Custom `request_approval` tool posts Block Kit to Slack; approval link carries **no authority** |
@@ -55,11 +55,11 @@ stage a beat we want to *show* as a layer-2 refusal. See open risk 2.
 | The wait | Agent ends its turn; SSE `approval.granted` event auto-resumes it |
 | Determinism | The **hook** writes the remediation instruction, not the system prompt |
 | Redaction | Declarative per-tool field rules + regex over free text |
-| Database | `bun:sqlite`, two files: `loans.db` (domain), `governance.db` (policy + audit) |
+| Database | `bun:sqlite`, three files: `loans.db` (domain), `governance.db` (policy + audit), `idp.db` (people) |
 | Durability | Data persists; resetting is something you deliberately run. Both databases sit on Render disks and seed from their fixture only when empty. Reset is a script (#23), never a redeploy. Decided on #29 |
 | Visualization | Hook server → SSE → live three-lane Access/Pre/Post panel |
 | Design | Left half deliberately boring enterprise app; right half Arcade-branded control plane |
-| **Hosting** | **Render (`render.yaml` blueprint) for `web`, `hooks`, `loan-app`. `arcade deploy` for `tools/loan` and `tools/approvals`.** |
+| **Hosting** | **Render (`render.yaml` blueprint) for `web`, `hooks`, `loan-app`, `idp`. `arcade deploy` for `tools/loan` and `tools/approvals`.** |
 | **Languages** | **TypeScript for the three Render services and everything under `packages/`. Python for both `arcade-mcp` toolkits. The boundary is *tool authoring*, not *domain*.** |
 
 ## Services
@@ -69,6 +69,8 @@ stage a beat we want to *show* as a layer-2 refusal. See open risk 2.
     apps/hooks       Bun — /access /pre /post, policy engine, audit, SSE. Owns governance.db. → Render
     apps/loan-app    Bun — plain HTTP API, the bank's system of record. Owns loans.db.
                      No MCP, no Arcade, no governance. → Render
+    apps/idp         Bun — Better Auth OAuth 2.1 provider, login and consent pages.
+                     Owns idp.db. Stands in for the enterprise IdP. → Render
 
     tools/loan       Python arcade-mcp — search_loans, get_loan, approve_loan, deny_loan.
                      Stateless client of apps/loan-app. → arcade deploy
@@ -110,14 +112,28 @@ Three rules this has to hold to:
 3. **Email is the join key.** Arcade `user_id`, OAuth subject, and `loans.db`'s actor
    column are the same string.
 
-**Open: where Better Auth runs.** It is an authorization server, and it has to live
-somewhere with a browser-facing login. `apps/web` is its natural home — the personas
-already log in there and Next.js is Better Auth's canonical deployment — but that makes
-the demo's own UI the bank's IdP, which is not the shape a forker would have. Putting it
-in `apps/loan-app` instead collides with the boundary test, which greps that service's
-source for `role`, `permission`, `authority` and `limit`; Better Auth's own vocabulary
-would trip it, and loosening that test to accommodate auth is exactly the erosion the test
-exists to prevent. A fourth Render service is the third option. Not yet decided.
+**The provider is its own service: `apps/idp` (#36).** Better Auth
+(`@better-auth/oauth-provider`) on Bun, owning `idp.db`, serving a login page and a consent
+page. It is a demo fixture standing in for the enterprise's real IdP — the same category of
+thing as the persona switcher — and a forker deletes it and points at their Okta.
+
+Folding it into `apps/web` was cheaper but would make our own demo UI the bank's IdP and
+the agent's host the token issuer; an enterprise audience asks whether `apps/web` could
+just mint itself a token, and the answer would be yes. Folding it into `apps/loan-app` was
+ruled out: the boundary test greps that service's source for `role`, `permission`,
+`authority` and `limit`, Better Auth's own vocabulary trips it, and loosening that test to
+fit auth is the erosion it exists to prevent.
+
+Arcade is an OAuth *client* here: it needs a client id and secret, an authorize URL, a
+token URL, and its own generated redirect URI allowlisted on our side. It does not consume
+OIDC discovery — endpoints are configured explicitly. It extracts the user's identity from
+`/oauth2/userinfo` via a JSONPath expression, **which is what turns rule 3 from a
+convention into a mechanism**.
+
+⚠️ **Resetting `idp.db` rotates the OAuth client credentials and silently breaks the
+registration held in Arcade** — and it breaks it at the authorize step, which fires no hook,
+so the panel stays dark and nothing on screen explains why. The reset must leave the OAuth
+client alone. Owned by #36, stated in #23's runbook.
 
 ## Tool surface
 
@@ -179,10 +195,11 @@ Seed loan `LN-2291`, Northwind Bakery LLC, $95,000. Carries `bank_account_number
 
 3. **Toolkit names are unmeasured.** See **Tool surface**. Tracked on #35, blocks #7.
 
-4. **Identity could silently split.** Arcade `user_id` and the OAuth subject are joined by
-   convention, not by a mechanism. If a persona's Arcade email and provider email drift,
-   the pre-hook governs one person and the loan book records another, and every test still
-   passes. Whoever builds the auth slice should assert the join, not assume it.
+4. **Identity could silently split.** Arcade `user_id` and the OAuth subject must be the
+   same email. Arcade's JSONPath extraction from `/oauth2/userinfo` gives this a mechanism
+   (#36, configured on #13) — but nothing verifies that a persona's Arcade account and their
+   `idp.db` row were created with the same address. If they drift, the pre-hook governs one
+   person while the loan book records another, and every test still passes.
 
 5. ~~**Does Arcade's stock Slack provider grant a user token with `chat:write`?**~~
    *Answered: yes — `docs/spikes/03-slack-scopes.md` (#3). Act 2 posts as the requester.
@@ -199,6 +216,7 @@ Seed loan `LN-2291`, Northwind Bakery LLC, $95,000. Carries `bank_account_number
 1. Spikes 1–3. **Done.**
 2. Scaffold, policy schema, loan book. **Done** (#4, #5, #11).
 3. Split into `apps/loan-app` + `tools/loan`; measure the toolkit names (#34, #35).
+   In parallel: `apps/idp` (#36).
 4. Arcade wiring: gateway, hook extension, OAuth provider (#13).
 5. Thinnest vertical slice, end to end and ugly: agent → gateway → tool → API, one denying
    pre-hook (#14).
