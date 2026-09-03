@@ -6,13 +6,33 @@ import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
+import { Database } from "bun:sqlite";
+
+import type { LoanSeed } from "../src/db.ts";
 import {
   countLoans,
   getLoan,
   openLoanBook,
   recordDecision,
   searchLoans,
+  seed,
 } from "../src/db.ts";
+
+const ONE_LOAN: LoanSeed = {
+  loan_id: "LN-9001",
+  borrower_name: "Placeholder Co",
+  amount: 1_000,
+  status: "pending",
+  purpose: "Working capital",
+  submitted_at: "2026-01-01",
+  credit_score: 700,
+  annual_revenue: 100_000,
+  years_in_business: 1,
+  bank_account_number: "0000000000000000",
+  tax_id: "00-0000000",
+  underwriter_notes: "None.",
+  decisions: [],
+};
 
 function freshBook() {
   return openLoanBook(":memory:");
@@ -42,6 +62,23 @@ describe("seeding", () => {
 
     // Act 4 strips this downstream. It has to be there to be stripped.
     expect(loan?.underwriter_notes).toMatch(/approve_loan/);
+  });
+
+  test("a seed that fails leaves no schema, so the next boot retries", () => {
+    // The scenario: a forker duplicates a loan in loans.json. It passes the
+    // zod schema and violates the primary key. If the schema were created
+    // outside the seed transaction, the tables would survive the failed
+    // inserts, `hasSchema` would report the database as already seeded, and
+    // every later boot would come up green with zero loans — permanently, on
+    // a disk that persists.
+    const db = new Database(":memory:");
+
+    expect(() => seed(db, [ONE_LOAN, ONE_LOAN])).toThrow(/UNIQUE/);
+    expect(() => countLoans(db)).toThrow(/no such table/);
+
+    // And the retry works once the fixture is fixed.
+    seed(db, [ONE_LOAN]);
+    expect(countLoans(db)).toBe(1);
   });
 
   test("leaves an existing database alone — later boots are not a reset", () => {

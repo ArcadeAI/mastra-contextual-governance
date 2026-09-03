@@ -188,5 +188,14 @@ export function createLoanServer(db: Database): McpServer {
     },
   );
 
+  // `registerTool` claims `tools.listChanged: true` on our behalf, and it
+  // merges over anything passed to the constructor, so this has to come after
+  // the tools and before `connect`. The claim is false here: the transport is
+  // stateless, so each server is closed with its response and there is never a
+  // channel to send `notifications/tools/list_changed` on. Harmless in
+  // practice — Arcade discovers tools by asking — but a server should not
+  // advertise a capability it cannot honour.
+  server.server.registerCapabilities({ tools: { listChanged: false } });
+
   return server;
 }

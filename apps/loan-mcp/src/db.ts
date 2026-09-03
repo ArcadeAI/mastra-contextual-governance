@@ -129,7 +129,7 @@ export function openLoanBook(path: string): Database {
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
 
-  if (!hasSchema(db)) seed(db);
+  if (!hasSchema(db)) seed(db, fixtureSchema.parse(fixture).loans);
 
   return db;
 }
@@ -155,36 +155,59 @@ function bind(row: NamedBindings): NamedBindings {
   return Object.fromEntries(Object.entries(row).map(([key, value]) => [`$${key}`, value]));
 }
 
-function seed(db: Database): void {
-  const { loans } = fixtureSchema.parse(fixture);
+/** One loan as it appears in the fixture. */
+export type LoanSeed = z.infer<typeof loanFixtureSchema>;
 
-  db.exec(SCHEMA);
-
-  const insertLoan = db.prepare<unknown, NamedBindings>(`
-    INSERT INTO loans (
-      loan_id, borrower_name, amount, status, purpose, submitted_at,
-      credit_score, annual_revenue, years_in_business,
-      bank_account_number, tax_id, underwriter_notes
-    ) VALUES (
-      $loan_id, $borrower_name, $amount, $status, $purpose, $submitted_at,
-      $credit_score, $annual_revenue, $years_in_business,
-      $bank_account_number, $tax_id, $underwriter_notes
-    )
-  `);
-
-  const insertDecision = db.prepare<unknown, NamedBindings>(`
-    INSERT INTO loan_decisions (loan_id, decision, amount, reason, decided_at)
-    VALUES ($loan_id, $decision, $amount, $reason, $decided_at)
-  `);
-
+/**
+ * Creates the schema and inserts the seed rows in **one** transaction.
+ *
+ * The schema has to be inside the transaction, not just the inserts. SQLite
+ * DDL is transactional, so a seed that throws halfway leaves no tables at all
+ * and the next boot tries again with a clear error. Creating the tables first
+ * and wrapping only the inserts produces the one failure that cannot recover
+ * on its own: a database holding a schema and no rows, which `hasSchema`
+ * reads as already seeded. The service then comes up green and empty — and on
+ * a disk that persists, it stays that way. A forker who duplicates a loan_id
+ * in the fixture is one boot away from that.
+ *
+ * Exported for the test that holds this line.
+ */
+export function seed(db: Database, loans: LoanSeed[]): void {
   db.transaction(() => {
-    for (const loan of loans) {
-      const { decisions, ...columns } = loan;
-      insertLoan.run(bind(columns));
+    db.exec(SCHEMA);
 
-      for (const decision of decisions) {
-        insertDecision.run(bind({ loan_id: loan.loan_id, ...decision }));
+    // Prepared after the DDL, because the tables have to exist to compile
+    // against, and finalized before the transaction commits so a rollback is
+    // not fighting open statements over tables it is about to drop.
+    const insertLoan = db.prepare<unknown, NamedBindings>(`
+      INSERT INTO loans (
+        loan_id, borrower_name, amount, status, purpose, submitted_at,
+        credit_score, annual_revenue, years_in_business,
+        bank_account_number, tax_id, underwriter_notes
+      ) VALUES (
+        $loan_id, $borrower_name, $amount, $status, $purpose, $submitted_at,
+        $credit_score, $annual_revenue, $years_in_business,
+        $bank_account_number, $tax_id, $underwriter_notes
+      )
+    `);
+
+    const insertDecision = db.prepare<unknown, NamedBindings>(`
+      INSERT INTO loan_decisions (loan_id, decision, amount, reason, decided_at)
+      VALUES ($loan_id, $decision, $amount, $reason, $decided_at)
+    `);
+
+    try {
+      for (const loan of loans) {
+        const { decisions, ...columns } = loan;
+        insertLoan.run(bind(columns));
+
+        for (const decision of decisions) {
+          insertDecision.run(bind({ loan_id: loan.loan_id, ...decision }));
+        }
       }
+    } finally {
+      insertLoan.finalize();
+      insertDecision.finalize();
     }
   })();
 }

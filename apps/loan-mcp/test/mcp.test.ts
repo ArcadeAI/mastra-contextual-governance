@@ -89,6 +89,18 @@ describe("initialize", () => {
     expect(info).toMatchObject({ name: "loan-app", version: "1.0.0" });
   });
 
+  test("claims no capability it cannot honour", async () => {
+    const client = await connect();
+    const capabilities = client.getServerCapabilities();
+    await client.close();
+
+    // Stateless: each server is closed with its response, so there is never a
+    // channel to send `notifications/tools/list_changed` on.
+    expect(capabilities?.tools).toEqual({ listChanged: false });
+    expect(capabilities?.resources).toBeUndefined();
+    expect(capabilities?.prompts).toBeUndefined();
+  });
+
   test("the reported name survives Arcade's normalisation as LoanApp", () => {
     // Lowercase, strip every `mcp` and `server` substring, split on
     // non-alphanumerics, PascalCase — measured in
