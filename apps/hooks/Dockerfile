@@ -8,7 +8,7 @@ WORKDIR /app
 # Manifests first, so a source-only change reuses the install layer.
 COPY package.json bun.lock ./
 COPY apps/hooks/package.json ./apps/hooks/
-COPY apps/loan-mcp/package.json ./apps/loan-mcp/
+COPY apps/loan-app/package.json ./apps/loan-app/
 COPY apps/web/package.json ./apps/web/
 COPY packages/governance-core/package.json ./packages/governance-core/
 COPY packages/policy-schema/package.json ./packages/policy-schema/

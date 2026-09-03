@@ -44,13 +44,34 @@ jobs:
         env:
           NEXT_TELEMETRY_DISABLED: "1"
 
+  toolkits:
+    name: test tools/loan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      # The toolkit's tests boot the real `apps/loan-app` as a subprocess and
+      # drive the four tools through it, so Bun is needed here too.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      - name: Test
+        working-directory: tools/loan
+        run: uv run --frozen --extra dev pytest
+
   images:
     name: build ${{ matrix.service }} image
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        service: [hooks, loan-mcp, web]
+        service: [hooks, loan-app, web]
     steps:
       - uses: actions/checkout@v4
 
@@ -67,5 +88,22 @@ jobs:
           context: .
           file: ./apps/${{ matrix.service }}/Dockerfile
           push: false
+          load: true
+          tags: cg-${{ matrix.service }}:ci
           cache-from: type=gha,scope=${{ matrix.service }}
           cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+      # A Dockerfile that builds is not an image that serves. A `COPY` narrowed
+      # to the wrong set of files builds green and dies on boot, so boot it and
+      # ask the same question Render's health check asks. No database, no
+      # network beyond localhost: every service seeds or stubs on its own.
+      - name: Boot and check /health
+        run: |
+          docker run -d --name svc -p 8080:8080 -e PORT=8080 cg-${{ matrix.service }}:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8080/health; then echo; exit 0; fi
+            sleep 1
+          done
+          echo "::error::${{ matrix.service }} did not answer /health"
+          docker logs svc
+          exit 1
