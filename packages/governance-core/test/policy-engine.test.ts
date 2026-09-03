@@ -42,7 +42,11 @@ import {
 const READ: ToolRef = { toolkit: SAMPLE_TOOLKIT, name: SAMPLE_READ_TOOL };
 const WRITE: ToolRef = { toolkit: SAMPLE_TOOLKIT, name: SAMPLE_WRITE_TOOL };
 const ESCALATE: ToolRef = { toolkit: "Approvals", name: "request_approval" };
-const TOOLKITS = [SAMPLE_TOOLKIT, "Approvals"];
+/** What the gateway serves, keyed by the toolkit names config carries. */
+const CATALOGUE = {
+  [SAMPLE_TOOLKIT]: [SAMPLE_READ_TOOL, SAMPLE_WRITE_TOOL],
+  Approvals: ["request_approval", "decide"],
+};
 
 const operator: Subject = aSubject({
   user_id: SAMPLE_SUBJECT_IDS.operator,
@@ -80,8 +84,13 @@ const hideWriteFromOperators = aPolicyRule({
   priority: 10,
 });
 
+/** A reason that passes the remediation check without saying anything specific. */
+const ESCALATE_FIRST =
+  "Blocked. To proceed, call Approvals.request_approval with resource_id={{inputs.widget_id}} " +
+  "and a justification, then retry.";
+
 function policy(rules: PolicyRule[], overrides: Partial<Policy> = {}) {
-  return compilePolicy({ toolkits: TOOLKITS, rules, ...overrides });
+  return compilePolicy({ catalogue: CATALOGUE, rules, ...overrides });
 }
 
 /** A rule written from scratch — no fixture defaults merged in. */
@@ -131,6 +140,14 @@ describe("resolveVisibility", () => {
     expect(result.every(({ decision }) => decision.rule_id === null)).toBe(true);
     expect(result[0]?.decision.reason).toMatch(/no registered subject/i);
     expect(result[0]?.decision.reason).toMatch(/administrator/i);
+  });
+
+  it("hides a tool the catalogue does not list, inside a governed toolkit", () => {
+    const stranger: ToolRef = { toolkit: SAMPLE_TOOLKIT, name: "delete_everything" };
+    const [decision] = resolveVisibility(director, [stranger], compiled).map((v) => v.decision);
+    expect(decision?.effect).toBe("deny");
+    expect(decision?.rule_id).toBeNull();
+    expect(decision?.reason).toContain('"delete_everything"');
   });
 
   it("hides a tool from a toolkit the configuration does not know", () => {
@@ -285,7 +302,7 @@ describe("evaluatePermission: who is calling", () => {
 
   it("applies a rule scoped by role only to that role", () => {
     const compiledScoped = policy([
-      aPolicyRule({ subjects: { roles: ["supervisor"] }, reason: "Supervisors need approval." }),
+      aPolicyRule({ subjects: { roles: ["supervisor"] }, reason: ESCALATE_FIRST }),
     ]);
     const call = (subject: Subject) =>
       evaluatePermission({
@@ -300,7 +317,7 @@ describe("evaluatePermission: who is calling", () => {
 
   it("applies a rule scoped by user_id only to that user", () => {
     const compiledScoped = policy([
-      aPolicyRule({ subjects: { user_ids: [SAMPLE_SUBJECT_IDS.director] } }),
+      aPolicyRule({ subjects: { user_ids: [SAMPLE_SUBJECT_IDS.director] }, reason: ESCALATE_FIRST }),
     ]);
     const call = (subject: Subject) =>
       evaluatePermission({
@@ -318,7 +335,7 @@ describe("evaluatePermission: who is calling", () => {
       aPolicyRule({
         subjects: { clearance_at_least: 50, clearance_below: 500 },
         conditions: [],
-        reason: "Mid-tier subjects are blocked.",
+        reason: ESCALATE_FIRST,
       }),
     ]);
     const call = (subject: Subject) =>
@@ -356,20 +373,41 @@ describe("evaluatePermission: which tool is being called", () => {
     expect(decision.reason).toMatch(/do not retry/i);
   });
 
-  it("matches toolkit and tool names exactly, not by case or prefix", () => {
+  it("denies a tool the catalogue does not list, even inside a governed toolkit", () => {
+    const decision = evaluatePermission({
+      subject: director,
+      tool: { toolkit: SAMPLE_TOOLKIT, name: "delete_everything" },
+      inputs: {},
+      policy: compiled,
+    });
+    expect(decision.effect).toBe("deny");
+    expect(decision.rule_id).toBeNull();
+    expect(decision.reason).toContain('"delete_everything"');
+    expect(decision.reason).toContain(`"${SAMPLE_WRITE_TOOL}"`);
+    expect(decision.reason).toMatch(/do not retry/i);
+  });
+
+  it("does not match a governed tool by case or prefix — those are unknown tools, denied", () => {
     const call = (tool: ToolRef) =>
       evaluatePermission({
-        subject: supervisor,
+        subject: director, // clearance high enough that the clearance rule would allow
         tool,
         inputs: { widget_id: "WID-1", quantity: 95 },
         policy: compiled,
       });
-    expect(call({ toolkit: SAMPLE_TOOLKIT, name: SAMPLE_WRITE_TOOL }).effect).toBe("deny");
-    expect(call({ toolkit: SAMPLE_TOOLKIT, name: SAMPLE_WRITE_TOOL.toUpperCase() }).effect).toBe(
-      "allow",
+    expect(call({ toolkit: SAMPLE_TOOLKIT, name: SAMPLE_WRITE_TOOL })).toMatchObject({
+      effect: "allow",
+      rule_id: null,
+    });
+    expect(call({ toolkit: SAMPLE_TOOLKIT, name: SAMPLE_WRITE_TOOL.toUpperCase() })).toMatchObject(
+      { effect: "deny", rule_id: null },
     );
-    expect(call({ toolkit: SAMPLE_TOOLKIT, name: `${SAMPLE_WRITE_TOOL}_v2` }).effect).toBe(
-      "allow",
+    expect(call({ toolkit: SAMPLE_TOOLKIT, name: `${SAMPLE_WRITE_TOOL}_v2` })).toMatchObject({
+      effect: "deny",
+      rule_id: null,
+    });
+    expect(call({ toolkit: SAMPLE_TOOLKIT.toLowerCase(), name: SAMPLE_WRITE_TOOL })).toMatchObject(
+      { effect: "deny", rule_id: null },
     );
   });
 
@@ -382,7 +420,7 @@ describe("evaluatePermission: which tool is being called", () => {
         match: { toolkit: "*", tool: "*" },
         subjects: { roles: ["operator"] },
         effect: "deny",
-        reason: "Operators may not call anything right now.",
+        reason: "Operators may not call anything right now. Do not retry.",
         priority: 1,
       }),
     ]);
@@ -463,7 +501,7 @@ describe("evaluatePermission: condition operators", () => {
         match: { toolkit: SAMPLE_TOOLKIT, tool: SAMPLE_WRITE_TOOL },
         conditions,
         effect: "deny",
-        reason: "Blocked by condition.",
+        reason: ESCALATE_FIRST,
         priority: 1,
       }),
     ]);
@@ -561,7 +599,7 @@ describe("evaluatePermission: several rules", () => {
       hook: "pre",
       match: { toolkit: SAMPLE_TOOLKIT, tool: SAMPLE_WRITE_TOOL },
       effect: "deny",
-      reason: "Writes are frozen.",
+      reason: "Writes are frozen. Do not retry.",
       priority: 50,
     });
     for (const rules of [
@@ -577,8 +615,8 @@ describe("evaluatePermission: several rules", () => {
   });
 
   it("equal priorities resolve the same way regardless of input order", () => {
-    const a = aPolicyRule({ id: "rule.a", priority: 10, reason: "A" });
-    const b = aPolicyRule({ id: "rule.b", priority: 10, reason: "B" });
+    const a = aPolicyRule({ id: "rule.a", priority: 10, reason: `A. ${ESCALATE_FIRST}` });
+    const b = aPolicyRule({ id: "rule.b", priority: 10, reason: `B. ${ESCALATE_FIRST}` });
     const inputs = { widget_id: "WID-1", quantity: 95 };
     const one = evaluatePermission({ subject: supervisor, tool: WRITE, inputs, policy: policy([a, b]) });
     const two = evaluatePermission({ subject: supervisor, tool: WRITE, inputs, policy: policy([b, a]) });
@@ -586,7 +624,7 @@ describe("evaluatePermission: several rules", () => {
   });
 
   it("a disabled rule has no effect", () => {
-    const compiled = policy([aPolicyRule({ enabled: false })]);
+    const compiled = policy([aPolicyRule({ enabled: false, reason: ESCALATE_FIRST })]);
     const decision = evaluatePermission({
       subject: supervisor,
       tool: WRITE,
@@ -633,81 +671,102 @@ describe("compilePolicy refuses a policy that cannot mean what it says", () => {
     hook: "pre",
     match: { toolkit: SAMPLE_TOOLKIT, tool: SAMPLE_WRITE_TOOL },
     effect: "deny",
-    reason: "Denied.",
+    reason: ESCALATE_FIRST,
     priority: 1,
   });
+  const withRules = (...rules: PolicyRule[]): Policy => ({ catalogue: CATALOGUE, rules });
 
   const cases: ReadonlyArray<readonly [label: string, policy: Policy, tells: RegExp]> = [
     [
       "a rule naming a toolkit that is not configured",
-      { toolkits: TOOLKITS, rules: [rule({ ...base(), match: { toolkit: "Widgetz", tool: "*" } })] },
+      withRules(rule({ ...base(), match: { toolkit: "Widgetz", tool: "*" } })),
       /"Widgetz".*not configured.*"Widgets".*matching nothing/s,
     ],
     [
-      "a rule naming a tool the catalogue says the toolkit does not serve",
-      {
-        toolkits: TOOLKITS,
-        catalogue: { [SAMPLE_TOOLKIT]: [SAMPLE_READ_TOOL, SAMPLE_WRITE_TOOL] },
-        rules: [rule({ ...base(), match: { toolkit: SAMPLE_TOOLKIT, tool: "approve_widget" } })],
-      },
-      /"approve_widget".*does not serve/,
+      "a rule naming a tool its toolkit does not serve — a typo would otherwise permit",
+      withRules(rule({ ...base(), match: { toolkit: SAMPLE_TOOLKIT, tool: "udpate_widget" } })),
+      /"udpate_widget".*does not serve.*"update_widget".*matching nothing/s,
     ],
     [
-      "no governed toolkits at all",
-      { toolkits: [], rules: [] },
-      /toolkits is empty/,
+      "a wildcard-toolkit rule naming a tool no toolkit serves",
+      withRules(rule({ ...base(), match: { toolkit: "*", tool: "approve_widget" } })),
+      /"approve_widget".*no configured toolkit serves/,
+    ],
+    [
+      "an empty catalogue",
+      { catalogue: {}, rules: [] },
+      /catalogue is empty/,
+    ],
+    [
+      "a toolkit that lists no tools",
+      { catalogue: { ...CATALOGUE, Empty: [] }, rules: [] },
+      /"Empty" lists no tools/,
+    ],
+    [
+      "a pre denial whose reason is an apology, not an instruction",
+      withRules(rule({ ...base(), reason: "Insufficient authority." })),
+      /must tell the model what to do next.*"Insufficient authority\."/,
+    ],
+    [
+      "a pre denial naming a remediation tool the catalogue does not list",
+      withRules(rule({ ...base(), reason: "Call Approvals.escalate with resource_id=1." })),
+      /must tell the model what to do next/,
+    ],
+    [
+      "a pre denial naming a remediation tool but none of its arguments",
+      withRules(rule({ ...base(), reason: "Call Approvals.request_approval first." })),
+      /"Approvals\.request_approval" but no arguments/,
     ],
     [
       "an access rule with conditions, which /access could never evaluate",
-      {
-        toolkits: TOOLKITS,
-        rules: [rule({ ...base(), hook: "access", conditions: [{ input: "quantity", operator: "exists" }] })],
-      },
+      withRules(
+        rule({ ...base(), hook: "access", conditions: [{ input: "quantity", operator: "exists" }] }),
+      ),
       /access rule cannot have conditions/,
     ],
     [
       "a modify effect, which a PolicyRule has no override to carry",
-      { toolkits: TOOLKITS, rules: [rule({ ...base(), effect: "modify" })] },
+      withRules(rule({ ...base(), effect: "modify" })),
       /"modify"/,
     ],
     [
       "two rules with the same id",
-      { toolkits: TOOLKITS, rules: [rule(base()), rule({ ...base(), priority: 2 })] },
+      withRules(rule(base()), rule({ ...base(), priority: 2 })),
       /duplicate id/,
     ],
     [
       "gt with a non-numeric value",
-      { toolkits: TOOLKITS, rules: [rule({ ...base(), conditions: [{ input: "q", operator: "gt", value: "10" }] })] },
+      withRules(rule({ ...base(), conditions: [{ input: "q", operator: "gt", value: "10" }] })),
       /"gt" with a non-numeric value/,
     ],
     [
       "in with a value that is not an array",
-      { toolkits: TOOLKITS, rules: [rule({ ...base(), conditions: [{ input: "q", operator: "in", value: "eu" }] })] },
+      withRules(rule({ ...base(), conditions: [{ input: "q", operator: "in", value: "eu" }] })),
       /"in" with a value that is not an array/,
     ],
     [
       "matches with an invalid regular expression",
-      { toolkits: TOOLKITS, rules: [rule({ ...base(), conditions: [{ input: "q", operator: "matches", value: "(" }] })] },
+      withRules(rule({ ...base(), conditions: [{ input: "q", operator: "matches", value: "(" }] })),
       /invalid regular expression/,
     ],
     [
       "matches with a non-string value",
-      { toolkits: TOOLKITS, rules: [rule({ ...base(), conditions: [{ input: "q", operator: "matches", value: 1 }] })] },
+      withRules(rule({ ...base(), conditions: [{ input: "q", operator: "matches", value: 1 }] })),
       /"matches" with a value that is not a string/,
     ],
     [
       "eq with nothing to compare against",
-      { toolkits: TOOLKITS, rules: [rule({ ...base(), conditions: [{ input: "q", operator: "eq" }] })] },
+      withRules(rule({ ...base(), conditions: [{ input: "q", operator: "eq" }] })),
       /"eq" with no value/,
     ],
     [
       "exceeds_clearance given a value it would ignore",
-      { toolkits: TOOLKITS, rules: [rule({ ...base(), conditions: [{ input: "q", operator: "exceeds_clearance", value: 5 }] })] },
+      withRules(rule({ ...base(), conditions: [{ input: "q", operator: "exceeds_clearance", value: 5 }] })),
       /takes no value/,
     ],
     [
       "a reason placeholder rooted somewhere the engine cannot read",
-      { toolkits: TOOLKITS, rules: [rule({ ...base(), reason: "Ask {{approver.name}}." })] },
+      withRules(rule({ ...base(), reason: "Ask {{approver.name}}." })),
       /placeholder "\{\{approver\.name\}\}"/,
     ],
   ];
@@ -722,13 +781,12 @@ describe("compilePolicy refuses a policy that cannot mean what it says", () => {
   it("reports every problem at once, naming the rule each belongs to", () => {
     let caught: unknown;
     try {
-      compilePolicy({
-        toolkits: TOOLKITS,
-        rules: [
+      compilePolicy(
+        withRules(
           rule({ ...base(), id: "rule.one", match: { toolkit: "Nope", tool: "*" } }),
           rule({ ...base(), id: "rule.two", effect: "modify" }),
-        ],
-      });
+        ),
+      );
     } catch (error) {
       caught = error;
     }
@@ -739,14 +797,37 @@ describe("compilePolicy refuses a policy that cannot mean what it says", () => {
     expect(problems[1]).toContain('rule "rule.two"');
   });
 
-  it("accepts a wildcard toolkit without a catalogue entry for it", () => {
+  it("accepts a wildcard on either or both segments", () => {
+    expect(() => policy([rule({ ...base(), match: { toolkit: "*", tool: "*" } })])).not.toThrow();
     expect(() =>
-      compilePolicy({
-        toolkits: TOOLKITS,
-        catalogue: { [SAMPLE_TOOLKIT]: [SAMPLE_WRITE_TOOL] },
-        rules: [rule({ ...base(), match: { toolkit: "*", tool: "*" } })],
-      }),
+      policy([rule({ ...base(), match: { toolkit: "*", tool: SAMPLE_WRITE_TOOL } })]),
     ).not.toThrow();
+    expect(() =>
+      policy([rule({ ...base(), match: { toolkit: SAMPLE_TOOLKIT, tool: "*" } })]),
+    ).not.toThrow();
+  });
+
+  it("accepts a pre denial that tells the model to stop instead of naming a tool", () => {
+    expect(() =>
+      policy([rule({ ...base(), reason: "Writes are frozen for this role. Do not retry." })]),
+    ).not.toThrow();
+  });
+
+  it("accepts a pre denial whose arguments are named as placeholders", () => {
+    expect(() =>
+      policy([
+        rule({
+          ...base(),
+          reason: "Call Approvals.request_approval for {{inputs.widget_id}}, then retry.",
+        }),
+      ]),
+    ).not.toThrow();
+  });
+
+  it("does not hold access denials or allows to the remediation standard", () => {
+    // An access denial hides the tool; the model never reads its reason.
+    expect(() => policy([hideWriteFromOperators])).not.toThrow();
+    expect(() => policy([rule({ ...base(), effect: "allow", reason: "Fine." })])).not.toThrow();
   });
 
   it("accepts the sample policy", () => {

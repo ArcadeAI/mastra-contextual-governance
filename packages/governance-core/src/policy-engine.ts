@@ -30,22 +30,22 @@
  * ## Fail-closed defaults
  *
  * Anything the engine cannot decide *from the policy* is a denial with
- * `rule_id: null`: an unregistered subject, a toolkit the configuration does
- * not know, a rule whose condition cannot be evaluated because the input is
- * missing or malformed. A call that no rule speaks about is allowed with
- * `rule_id: null`, because a policy that says nothing about a tool has
- * permitted it — and `compilePolicy` exists to make sure that silence is
- * deliberate rather than a typo.
+ * `rule_id: null`: an unregistered subject, a tool or toolkit the catalogue
+ * does not list, a rule whose condition cannot be evaluated because the input
+ * is missing or malformed. A *catalogued* call that no rule speaks about is
+ * allowed with `rule_id: null`, because a policy that lists a tool and says
+ * nothing more about it has permitted it — and `compilePolicy` exists to make
+ * sure that silence is deliberate rather than a typo.
  *
  * ## Loudness
  *
  * A rule that matches nothing is indistinguishable, at runtime, from a rule
  * that permits. So `compilePolicy` refuses, up front and with the offending
- * rule ids, any rule that references a toolkit the configuration does not
- * list, a tool the catalogue (when one is given) does not contain, a
- * condition whose operator and value make no sense together, or a combination
- * the hook point cannot honour. The toolkit list is data — read from config —
- * and never hardcoded here.
+ * rule ids, any rule that references a toolkit or tool the catalogue does not
+ * list, a condition whose operator and value make no sense together, a
+ * combination the hook point cannot honour, or a `pre` denial whose reason
+ * does not tell the model what to do next. The catalogue is data — read from
+ * config and the observed gateway — and never hardcoded here.
  *
  * ## Grants
  *
@@ -80,23 +80,22 @@ export type ToolRef = {
 /**
  * The policy as loaded from the policy table plus configuration.
  *
- * `toolkits` is the set of toolkit names the deployment governs, read from
- * config (`ARCADE_*_TOOLKIT`). It is what lets a misspelled toolkit in a rule
- * be a compile error instead of a rule that silently matches nothing.
- *
- * `catalogue`, when given, maps each toolkit to the tool names it serves and
- * tightens the same check to the tool segment. Optional because the catalogue
- * is only known once the gateway has been observed; `toolkits` is not optional.
+ * `catalogue` maps every governed toolkit — the `ARCADE_*_TOOLKIT` values from
+ * config, never hardcoded — to the tool names it serves. It is required, and
+ * it is what lets a misspelled toolkit *or tool* in a rule be a compile error
+ * instead of a rule that silently matches nothing. It is also the fail-closed
+ * boundary at runtime: a call to anything the catalogue does not list is
+ * denied, so a tool the policy has never heard of cannot slip through on the
+ * "no rule matched" default.
  */
 export type Policy = {
-  readonly toolkits: readonly string[];
+  readonly catalogue: Readonly<Record<string, readonly string[]>>;
   readonly rules: readonly PolicyRule[];
-  readonly catalogue?: Readonly<Record<string, readonly string[]>>;
 };
 
 /** A `Policy` that `compilePolicy` has validated, sorted and prepared. */
 export type CompiledPolicy = {
-  readonly toolkits: ReadonlySet<string>;
+  readonly catalogue: ReadonlyMap<string, ReadonlySet<string>>;
   readonly rules: readonly CompiledRule[];
   /** Brand: only `compilePolicy` produces one of these. */
   readonly [COMPILED]: true;
@@ -155,6 +154,16 @@ type CompiledRule = Omit<PolicyRule, "conditions"> & {
 const REASON_ROOTS = new Set(["inputs", "subject", "tool"]);
 const PLACEHOLDER = /\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g;
 
+/** A `Toolkit.tool` reference inside prose. */
+const TOOL_REFERENCE = /\b([A-Za-z][A-Za-z0-9_-]*)\.([A-Za-z_][A-Za-z0-9_]*)\b/g;
+/** An argument mention: `name=` or a `{{inputs.…}}` placeholder. */
+const ARGUMENT_MENTION = /\b[A-Za-z_][A-Za-z0-9_]*=|\{\{\s*inputs\./;
+/**
+ * The one sentence that exempts a `pre` denial from naming a remediation tool:
+ * it tells the model, in so many words, that nothing it can call will help.
+ */
+export const NO_REMEDIATION = "Do not retry";
+
 /**
  * Validates a policy against its configuration and prepares it for
  * evaluation. Throws `PolicyCompileError` listing *every* problem, so a seed
@@ -166,13 +175,20 @@ const PLACEHOLDER = /\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g;
  */
 export function compilePolicy(policy: Policy): CompiledPolicy {
   const problems: string[] = [];
-  const toolkits = new Set(policy.toolkits);
+  const catalogue = new Map<string, ReadonlySet<string>>();
 
-  if (toolkits.size === 0) {
+  for (const [toolkit, tools] of Object.entries(policy.catalogue)) {
+    if (tools.length === 0) {
+      problems.push(`catalogue: toolkit "${toolkit}" lists no tools, so nothing in it can be governed`);
+    }
+    catalogue.set(toolkit, new Set(tools));
+  }
+  if (catalogue.size === 0) {
     problems.push(
-      "policy.toolkits is empty: no toolkit is governed, so every rule would match nothing",
+      "catalogue is empty: no toolkit is governed, so every rule would match nothing",
     );
   }
+  const toolkits = new Set(catalogue.keys());
 
   const seen = new Set<string>();
   const compiled: CompiledRule[] = [];
@@ -191,12 +207,21 @@ export function compilePolicy(policy: Policy): CompiledPolicy {
       );
     }
 
-    const known = policy.catalogue?.[rule.match.toolkit];
-    if (known && rule.match.tool !== WILDCARD && !known.includes(rule.match.tool)) {
+    const known = catalogue.get(rule.match.toolkit);
+    if (known && rule.match.tool !== WILDCARD && !known.has(rule.match.tool)) {
       problems.push(
         `${at}: references tool "${rule.match.tool}", which toolkit "${rule.match.toolkit}" ` +
-          `does not serve (serves: ${known.map((t) => `"${t}"`).join(", ") || "nothing"})`,
+          `does not serve (serves: ${[...known].map((t) => `"${t}"`).join(", ")}). ` +
+          `A rule matching nothing is indistinguishable from a rule that permits.`,
       );
+    }
+    if (rule.match.toolkit === WILDCARD && rule.match.tool !== WILDCARD) {
+      const served = [...catalogue.values()].some((tools) => tools.has(rule.match.tool));
+      if (!served) {
+        problems.push(
+          `${at}: references tool "${rule.match.tool}", which no configured toolkit serves`,
+        );
+      }
     }
 
     if (rule.effect === "modify") {
@@ -207,6 +232,11 @@ export function compilePolicy(policy: Policy): CompiledPolicy {
       problems.push(
         `${at}: an access rule cannot have conditions; /access carries no inputs to evaluate`,
       );
+    }
+
+    if (rule.hook === "pre" && rule.effect === "deny") {
+      const problem = checkRemediation(rule.reason, catalogue);
+      if (problem) problems.push(`${at}: ${problem}`);
     }
 
     for (const placeholder of rule.reason.matchAll(PLACEHOLDER)) {
@@ -239,7 +269,39 @@ export function compilePolicy(policy: Policy): CompiledPolicy {
 
   compiled.sort((a, b) => a.priority - b.priority || a.id.localeCompare(b.id));
 
-  return { toolkits, rules: compiled, [COMPILED]: true };
+  return { catalogue, rules: compiled, [COMPILED]: true };
+}
+
+/**
+ * A `pre` denial's `reason` is the only thing the model will read. It must
+ * either name a next tool to call — a `Toolkit.tool` the catalogue lists —
+ * together with at least one argument (`name=` or an `{{inputs.…}}`
+ * placeholder), or say `Do not retry` so the model stops rather than guesses.
+ * Anything else is an apology, and the compiler refuses it.
+ */
+function checkRemediation(
+  reason: string,
+  catalogue: ReadonlyMap<string, ReadonlySet<string>>,
+): string | null {
+  if (reason.includes(NO_REMEDIATION)) return null;
+
+  const named = [...reason.matchAll(TOOL_REFERENCE)].filter(([, toolkit, tool]) =>
+    catalogue.get(toolkit as string)?.has(tool as string),
+  );
+  if (named.length === 0) {
+    return (
+      `a pre denial's reason must tell the model what to do next: name a catalogued ` +
+      `remediation tool as "Toolkit.tool" with its arguments, or say "${NO_REMEDIATION}". ` +
+      `Got: "${reason}"`
+    );
+  }
+  if (!ARGUMENT_MENTION.test(reason)) {
+    return (
+      `a pre denial's reason names ${named.map((m) => `"${m[0]}"`).join(", ")} but no ` +
+      `arguments for it; mention them as "name=…" or with {{inputs.…}} placeholders`
+    );
+  }
+  return null;
 }
 
 /** Returns a description of what is wrong with the condition, or `null`. */
@@ -354,12 +416,20 @@ function decide(ev: Evaluation): Decision {
     );
   }
 
-  if (!policy.toolkits.has(tool.toolkit)) {
+  const served = policy.catalogue.get(tool.toolkit);
+  if (!served) {
     return failClosed(
       `DENIED: toolkit "${tool.toolkit}" is not governed by this control plane ` +
-        `(governed: ${[...policy.toolkits].map((t) => `"${t}"`).join(", ")}). ` +
-        `This is a configuration error, not something a retry can fix. Do not retry ${qualified}; ` +
+        `(governed: ${[...policy.catalogue.keys()].map((t) => `"${t}"`).join(", ")}). ` +
+        `This is a configuration error, not something a retry can fix. ${NO_REMEDIATION} ${qualified}; ` +
         `report that the toolkit name in the policy configuration does not match the deployed one.`,
+    );
+  }
+  if (!served.has(tool.name)) {
+    return failClosed(
+      `DENIED: "${tool.name}" is not a tool the control plane governs in toolkit ` +
+        `"${tool.toolkit}" (governed: ${[...served].map((t) => `"${t}"`).join(", ")}). ` +
+        `${NO_REMEDIATION} ${qualified}. If you meant one of the governed tools, call that one instead.`,
     );
   }
 

@@ -12,9 +12,11 @@ Pure. No I/O, no clock, no randomness. Two questions:
 import { compilePolicy, resolveVisibility, evaluatePermission } from "@cg/governance-core";
 
 const policy = compilePolicy({
-  toolkits: [...],             // the ARCADE_*_TOOLKIT values from config, never hardcoded
-  rules,                       // PolicyRule[] from governance.db
-  catalogue: { ... },          // optional: toolkit → tool names, once observed
+  // Every governed toolkit (the ARCADE_*_TOOLKIT values from config, never
+  // hardcoded) and the tool names it serves. Required: it is both the typo
+  // check at compile time and the fail-closed boundary at runtime.
+  catalogue: { [toolkitName]: ["get_widget", "update_widget"], Approvals: ["request_approval"] },
+  rules,   // PolicyRule[] from governance.db
 });
 
 // /access — which tools may this subject see at all
@@ -34,9 +36,10 @@ the engine only checks that one applies to this subject and tool.
 |---|---|---|
 | A rule matched | the rule's | the rule's id |
 | A `pre` rule would deny, but an applicable grant is present | `allow` | the rule the grant lifted |
-| No rule speaks about the call | `allow` | `null` |
+| A catalogued tool that no rule speaks about | `allow` | `null` |
 | Unknown subject | `deny` | `null` |
-| Toolkit not in `policy.toolkits` | `deny` | `null` |
+| Toolkit not in the catalogue | `deny` | `null` |
+| Tool not in its toolkit's catalogue entry (typo, case, prefix, or a tool the policy never heard of) | `deny` | `null` |
 | A rule's condition reads an input that is missing or of the wrong type | `deny` | that rule's id |
 
 Rules are evaluated in ascending `priority`, ties broken by `id`; first match wins.
@@ -45,11 +48,11 @@ Disabled rules never fire.
 ### Why `compilePolicy` throws
 
 A rule that matches nothing is indistinguishable at runtime from a rule that permits. So
-compilation is loud: it refuses, with every problem listed, a rule whose toolkit is not
-configured, whose tool the catalogue does not list, whose condition value makes no sense for
-its operator (`gt "10"`, `in "eu"`, an invalid regex), an `access` rule with conditions
-(there are no inputs at `/access`), a `modify` effect, a duplicate id, or a `reason`
-placeholder rooted outside `inputs`, `subject` or `tool`.
+compilation is loud: it refuses, with every problem listed, a rule whose toolkit or tool the
+catalogue does not list, whose condition value makes no sense for its operator (`gt "10"`,
+`in "eu"`, an invalid regex), an `access` rule with conditions (there are no inputs at
+`/access`), a `modify` effect, a duplicate id, a `reason` placeholder rooted outside
+`inputs`, `subject` or `tool` — and a `pre` denial whose reason is not actionable (below).
 
 ### Denial reasons
 
@@ -65,6 +68,13 @@ quantity={{inputs.quantity}} and a justification, then retry this call unchanged
 
 Placeholders: `{{inputs.<dot.path>}}`, `{{subject.<field>}}`, `{{tool.toolkit}}`,
 `{{tool.name}}`. An absent value renders as `(not provided)`.
+
+**This is enforced, not advised.** A `pre` rule with `effect: deny` fails to compile unless
+its `reason` either names a catalogued tool as `Toolkit.tool` *and* mentions at least one
+argument (`name=…` or an `{{inputs.…}}` placeholder), or contains the words `Do not retry`,
+which tells the model to stop rather than guess. `"Insufficient authority."` is an apology
+and is refused. Access denials are exempt: they hide the tool, and the model never reads
+them.
 
 Engine-authored reasons (the fail-closed rows above) follow the same standard: they name the
 tool and input, and say whether a retry can fix it.
