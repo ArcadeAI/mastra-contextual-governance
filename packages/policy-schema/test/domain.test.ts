@@ -19,6 +19,7 @@ import {
   OutputRule,
   PolicyRule,
   Subject,
+  Timestamp,
 } from "../src/domain.ts";
 
 describe("enumerations", () => {
@@ -179,13 +180,36 @@ describe("Grant", () => {
     request_id: "req_1",
     match: { toolkit: "Widgets", tool: "update_widget" },
     resource_id: null,
-    inputs: {},
+    pinned_inputs: {},
     issued_at: "2026-01-01T00:00:00.000Z",
     expires_at: "2026-01-01T00:15:00.000Z",
   };
 
   it("defaults to a single use, so a grant is not a standing permission", () => {
     expect(Grant.parse(minimal).uses_remaining).toBe(1);
+  });
+
+  it("carries an upper bound, not an equality, on the one numeric input", () => {
+    // #10 has to accept a retry at or below the approved value and reject a
+    // replay above it. An exact-match input map cannot express that, so the
+    // bound is its own field and names which input carries it.
+    const grant = Grant.parse({
+      ...minimal,
+      pinned_inputs: { widget_id: "WID-1" },
+      ceiling: { input: "quantity", max: 95 },
+    });
+    expect(grant.ceiling).toEqual({ input: "quantity", max: 95 });
+    expect(grant.pinned_inputs).toEqual({ widget_id: "WID-1" });
+  });
+
+  it("has no ceiling by default, for a grant with no numeric dimension", () => {
+    expect(Grant.parse(minimal).ceiling).toBeNull();
+  });
+
+  it("rejects a ceiling that names no input", () => {
+    expect(() =>
+      Grant.parse({ ...minimal, ceiling: { input: "", max: 95 } }),
+    ).toThrow();
   });
 
   it("allows unlimited uses within the expiry window, spelled null", () => {
@@ -286,5 +310,107 @@ describe("GovernanceEvent", () => {
   it("survives a JSON round-trip, which is how it reaches the panel", () => {
     const event = GovernanceEvent.parse(minimal);
     expect(GovernanceEvent.parse(JSON.parse(JSON.stringify(event)))).toEqual(event);
+  });
+});
+
+describe("subject matching", () => {
+  const rule = {
+    id: "rule.redact",
+    description: "",
+    match: { toolkit: "Widgets", tool: "get_widget" },
+    reason: "Redacted.",
+    priority: 10,
+  };
+
+  it("can be conditioned on clearance, not just on role", () => {
+    // #8: "rules can be conditioned on the subject's role or clearance" — a
+    // redaction that applies to junior subjects and not to senior ones.
+    const parsed = OutputRule.parse({
+      ...rule,
+      subjects: { clearance_below: 50 },
+    });
+    expect(parsed.subjects).toEqual({
+      user_ids: null,
+      roles: null,
+      clearance_below: 50,
+      clearance_at_least: null,
+    });
+  });
+
+  it("expresses a band with both bounds", () => {
+    const parsed = OutputRule.parse({
+      ...rule,
+      subjects: { clearance_at_least: 10, clearance_below: 50 },
+    });
+    expect(parsed.subjects?.clearance_at_least).toBe(10);
+    expect(parsed.subjects?.clearance_below).toBe(50);
+  });
+
+  it("narrows on nothing by default, which is a blanket rule", () => {
+    expect(OutputRule.parse({ ...rule, subjects: {} })).toMatchObject({
+      subjects: {
+        user_ids: null,
+        roles: null,
+        clearance_below: null,
+        clearance_at_least: null,
+      },
+    });
+  });
+
+  it("rejects a predicate it does not recognise instead of dropping it", () => {
+    // The failure this prevents: Zod 3 strips unknown keys by default, so a
+    // typo would leave a matcher that narrows on nothing — a rule meant for one
+    // role silently governing everybody.
+    expect(() =>
+      OutputRule.parse({ ...rule, subjects: { clearance_under: 50 } }),
+    ).toThrow();
+  });
+});
+
+describe("strictness", () => {
+  it("rejects an unknown key on every hand-written schema", () => {
+    const valid = {
+      Subject: {
+        user_id: "a@example.com",
+        display_name: "A",
+        role: "operator",
+        clearance: 0,
+      },
+      Decision: { effect: "allow", reason: "", rule_id: null },
+      GovernanceEvent: {
+        id: "evt_1",
+        ts: "2026-01-01T00:00:00.000Z",
+        execution_id: "",
+        hook: "pre",
+        user_id: "a@example.com",
+        tool: "Widgets.update_widget",
+        decision: "allow",
+        reason: "",
+        rule_id: null,
+      },
+    } as const;
+
+    const schemas = { Subject, Decision, GovernanceEvent };
+    for (const [name, schema] of Object.entries(schemas)) {
+      const input = valid[name as keyof typeof valid];
+      expect(schema.parse(input)).toBeDefined();
+      expect(() => schema.parse({ ...input, surprise: 1 })).toThrow();
+    }
+  });
+});
+
+describe("Timestamp", () => {
+  const at = (ts: string) => () => Timestamp.parse(ts);
+
+  it("accepts a Z-suffixed UTC instant", () => {
+    expect(at("2026-01-01T00:00:00.000Z")()).toBe("2026-01-01T00:00:00.000Z");
+  });
+
+  it("rejects an offset and SQLite's own datetime format", () => {
+    // Pinned because it constrains #11 and #12: rows must be stamped with
+    // `new Date().toISOString()`. Letting SQLite's `datetime('now')` supply the
+    // value would make every read back through these schemas fail.
+    expect(at("2026-01-01T00:00:00+00:00")).toThrow();
+    expect(at("2026-01-01 00:00:00")).toThrow();
   });
 });

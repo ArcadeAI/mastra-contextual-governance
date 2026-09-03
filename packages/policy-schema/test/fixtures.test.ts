@@ -94,6 +94,29 @@ describe("overrides", () => {
     expect(rule.match).toEqual({ toolkit: SAMPLE_TOOLKIT, tool: "delete_widget" });
   });
 
+  it("replaces a free-form payload wholesale rather than merging into it", () => {
+    // `output` holds caller-supplied data, not a record with fields. Merging it
+    // would leave the default's sensitive identifier and injected note sitting
+    // underneath a payload the caller wrote to be clean — a fixture that
+    // contradicts its own description, and a UI snapshot that bakes it in.
+    const request = aPostHookRequest({ output: { widget_id: "WID-1", status: "ok" } });
+    expect(request.output).toEqual({ widget_id: "WID-1", status: "ok" });
+  });
+
+  it("replaces inputs wholesale too, so a fixture cannot smuggle a stale argument", () => {
+    expect(aPreHookRequest({ inputs: { widget_id: "WID-2" } }).inputs).toEqual({
+      widget_id: "WID-2",
+    });
+  });
+
+  it("still merges a record, so a matcher override need not restate its siblings", () => {
+    expect(aPostHookRequest({ tool: { name: "delete_widget" } }).tool).toEqual({
+      name: "delete_widget",
+      toolkit: SAMPLE_TOOLKIT,
+      version: "1.0.0",
+    });
+  });
+
   it("replaces an array wholesale rather than appending to it", () => {
     // "These conditions", never "these as well as the defaults" — a fixture
     // that quietly kept a default condition would make a policy test lie.
@@ -154,6 +177,13 @@ describe("aGovernanceEventSequence", () => {
 describe("aHookExchange", () => {
   const exchange = aHookExchange();
 
+  it("describes one clean allowed call, with nothing to redact in its output", () => {
+    // The regression this pins: `output` used to deep-merge, so the "allowed
+    // call" exchange silently carried the read fixture's sensitive identifier
+    // and injected note.
+    expect(exchange.post.output).toEqual({ widget_id: "WID-1", status: "updated" });
+  });
+
   it("correlates /pre and /post on one execution id", () => {
     // Arcade sends the same id on both, which is the only exact join the
     // control plane gets.
@@ -165,6 +195,19 @@ describe("aHookExchange", () => {
     expect(exchange.pre.tool.name).toBe(SAMPLE_WRITE_TOOL);
     expect(exchange.post.tool.name).toBe(exchange.pre.tool.name);
     expect(Object.keys(exchange.access.toolkits)).toContain(SAMPLE_TOOLKIT);
+  });
+});
+
+describe("aGrant", () => {
+  it("carries a ceiling the GrantChecker can compare against", () => {
+    const grant = aGrant();
+    expect(grant.ceiling).toEqual({ input: "quantity", max: 95 });
+    expect(grant.pinned_inputs).toEqual({ widget_id: "WID-1" });
+  });
+
+  it("names two different parties, so separation of duties has something to check", () => {
+    const grant = aGrant();
+    expect(grant.granted_by).not.toBe(grant.subject_id);
   });
 });
 

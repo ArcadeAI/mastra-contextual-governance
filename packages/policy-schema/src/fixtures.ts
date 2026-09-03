@@ -57,15 +57,45 @@ type DeepPartial<T> = T extends readonly unknown[]
 export type Overrides<S extends z.ZodTypeAny> = DeepPartial<z.input<S>>;
 
 /**
- * Merges plain objects recursively; arrays and everything else replace
- * wholesale. Replacing arrays is the useful behaviour: an override of
- * `conditions` means "these conditions", never "these as well as the default".
+ * Keys whose value is a caller-supplied *payload* rather than a record with
+ * fields. An override of one of these replaces it outright.
+ *
+ * Merging is right for a record — `{ match: { tool: "x" } }` should mean "the
+ * default matcher, but this tool". It is wrong for a payload: overriding a
+ * `/post` fixture's `output` with a clean object and silently retaining the
+ * default's `identifier` and injected `notes` underneath produces a fixture
+ * that contradicts its own description, and a UI snapshot taken against it
+ * bakes the contradiction in. These keys are all `z.record(z.unknown())` or
+ * `z.unknown()` in the schemas — free-form by construction, so there is no
+ * field structure to merge into.
+ */
+const REPLACED_WHOLESALE = new Set([
+  "inputs",
+  "pinned_inputs",
+  "output",
+  "override",
+  "before",
+  "after",
+  "attributes",
+  "metadata",
+  "toolkits",
+  "only",
+  "deny",
+  "extras",
+]);
+
+/**
+ * Merges plain objects recursively. Arrays, payload keys (above) and everything
+ * that is not a plain object replace wholesale. Replacing arrays is the useful
+ * behaviour: an override of `conditions` means "these conditions", never "these
+ * as well as the default".
  */
 function merge(base: unknown, override: unknown): unknown {
   if (!isPlainObject(base) || !isPlainObject(override)) return override;
   const result: Record<string, unknown> = { ...base };
   for (const [key, value] of Object.entries(override)) {
-    result[key] = key in base ? merge(base[key], value) : value;
+    result[key] =
+      key in base && !REPLACED_WHOLESALE.has(key) ? merge(base[key], value) : value;
   }
   return result;
 }
@@ -223,7 +253,8 @@ export const aGrant = builder(Grant, {
   request_id: "req_0001",
   match: { toolkit: SAMPLE_TOOLKIT, tool: SAMPLE_WRITE_TOOL },
   resource_id: "WID-1",
-  inputs: { widget_id: "WID-1", quantity: 95 },
+  pinned_inputs: { widget_id: "WID-1" },
+  ceiling: { input: "quantity", max: 95 },
   issued_at: FIXED_TS,
   expires_at: EXPIRY_TS,
   uses_remaining: 1,

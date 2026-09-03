@@ -14,6 +14,7 @@ const REPO_ROOT = join(PACKAGE_ROOT, "..", "..");
 const PACKAGE_NAME = "@cg/policy-schema";
 
 interface Manifest {
+  name?: string;
   exports?: Record<string, string>;
   dependencies?: Record<string, string>;
   overrides?: Record<string, string>;
@@ -85,16 +86,20 @@ describe("consumable without a build step", () => {
     expect(existsSync(join(PACKAGE_ROOT, entry as string))).toBe(true);
   });
 
-  it("is declared with the workspace protocol wherever it is depended on", () => {
-    // A version range here would resolve against the registry, where this
-    // private package does not exist — and only at install time in CI.
-    const declarations = workspaces()
-      .map(({ dir, manifest }) => [dir, manifest.dependencies?.[PACKAGE_NAME]] as const)
-      .filter(([, range]) => range !== undefined);
-
-    expect(declarations.length).toBeGreaterThan(0);
-    for (const [dir, range] of declarations) {
-      expect(`${dir}: ${range}`).toBe(`${dir}: workspace:*`);
+  it("is declared by every other workspace, with the workspace protocol", () => {
+    // "Consumable from every workspace" is the acceptance criterion, and a
+    // workspace that does not declare the dependency cannot import it —
+    // `bun -e 'import ... from "@cg/policy-schema"'` exits 1 there. Checking
+    // only the workspaces that already declare it would make this vacuous.
+    //
+    // A version range rather than `workspace:*` would resolve against the
+    // registry, where this private package does not exist, and would fail only
+    // at install time in CI.
+    for (const { dir, manifest } of workspaces()) {
+      if (manifest.name === PACKAGE_NAME) continue;
+      expect(`${dir}: ${manifest.dependencies?.[PACKAGE_NAME]}`).toBe(
+        `${dir}: workspace:*`,
+      );
     }
   });
 });

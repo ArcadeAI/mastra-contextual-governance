@@ -7,9 +7,10 @@
     "dev": "bun --watch src/index.ts",
     "start": "bun src/index.ts",
     "typecheck": "tsc --noEmit",
-    "build": "echo 'no build step — Bun runs TypeScript directly'"
+    "build": "echo 'no build step \u2014 Bun runs TypeScript directly'"
   },
   "dependencies": {
+    "@cg/policy-schema": "workspace:*",
     "zod": "3.25.76"
   },
   "devDependencies": {

@@ -12,6 +12,22 @@
  * through `bun:sqlite` and across SSE, and `undefined` does not survive
  * `JSON.stringify` — an absent key and a key set to `undefined` serialise
  * identically, so a field that is *meaningfully* empty says so with `null`.
+ *
+ * Every object here is `.strict()` — the opposite of the generated hook
+ * contract next door, and for the opposite reason. Those payloads are Arcade's
+ * and may grow; these are ours and may not. Zod 3 strips unknown keys by
+ * default, so a misspelled field in a policy row would parse cleanly and
+ * evaluate as though it had never been written: a rule narrower than intended
+ * becomes a blanket rule, and a constraint someone thought they had applied is
+ * simply absent. That is a silent fail-open in the policy table of a demo whose
+ * whole thesis is that controls must not fail silently. Strict makes it a parse
+ * error at seed time instead.
+ *
+ * `Timestamp` is `z.string().datetime()`, which accepts only `Z`-suffixed UTC
+ * instants: `2026-01-01T00:00:00.000Z`. It rejects a `+00:00` offset and it
+ * rejects SQLite's own `datetime('now')` format. Anything writing these rows
+ * must stamp them with `new Date().toISOString()` and never let SQLite supply
+ * the value, or every row fails on the way back out.
  */
 import { z } from "zod";
 
@@ -45,10 +61,12 @@ export type Inputs = z.infer<typeof Inputs>;
  * matches nothing, which is indistinguishable from a rule that permits.
  * Classification lives in our own rules, keyed on the name.
  */
-export const ToolMatcher = z.object({
-  toolkit: z.string().min(1),
-  tool: z.string().min(1),
-});
+export const ToolMatcher = z
+  .object({
+    toolkit: z.string().min(1),
+    tool: z.string().min(1),
+  })
+  .strict();
 export type ToolMatcher = z.infer<typeof ToolMatcher>;
 
 // ---------------------------------------------------------------------------
@@ -63,30 +81,51 @@ export type ToolMatcher = z.infer<typeof ToolMatcher>;
  * ceiling: the routing and limit rules compare numbers and never learn what
  * the number counts.
  */
-export const Subject = z.object({
-  user_id: z.string().min(1),
-  display_name: z.string(),
-  /** Opaque role key. Policy rules match on it; nothing interprets it. */
-  role: z.string().min(1),
-  /**
-   * Upper bound on the numeric inputs this subject may pass, compared by the
-   * `exceeds_clearance` condition. `0` means "no numeric authority at all".
-   */
-  clearance: z.number().nonnegative(),
-  /** Extension point for forkers: any additional attributes rules can match on. */
-  attributes: z.record(z.unknown()).default({}),
-});
+export const Subject = z
+  .object({
+    user_id: z.string().min(1),
+    display_name: z.string(),
+    /** Opaque role key. Policy rules match on it; nothing interprets it. */
+    role: z.string().min(1),
+    /**
+     * Upper bound on the numeric inputs this subject may pass, compared by the
+     * `exceeds_clearance` condition. `0` means "no numeric authority at all".
+     */
+    clearance: z.number().nonnegative(),
+    /** Extension point for forkers: any additional attributes rules can match on. */
+    attributes: z.record(z.unknown()).default({}),
+  })
+  .strict();
 export type Subject = z.infer<typeof Subject>;
 
 /**
- * Which subjects a rule applies to. Every field is a narrowing filter, and an
- * empty matcher matches everyone — so a rule with no `subjects` is a blanket
- * rule, which is the common case.
+ * Which subjects a rule applies to. Every field is a narrowing filter, `null`
+ * means "do not narrow on this", and a matcher that narrows on nothing matches
+ * everyone — so a rule with no `subjects` is a blanket rule, which is the
+ * common case.
+ *
+ * The two clearance bounds are what let a redaction rule apply to junior
+ * subjects and not to senior ones (#8: "rules can be conditioned on the
+ * subject's role or clearance") without the rule knowing what clearance
+ * measures. Both bounds together express a band.
+ *
+ * `.strict()`, and this is the important part. An unrecognised key here — a
+ * typo, or a predicate someone assumed existed — would otherwise be stripped
+ * silently, leaving `{ user_ids: null, roles: null, ... }`: a matcher that
+ * narrows on nothing and therefore applies to everyone. A rule intended for
+ * one role would quietly govern the whole roster. Strict turns that into a
+ * parse error at seed time.
  */
-export const SubjectMatcher = z.object({
-  user_ids: z.array(z.string()).nullable().default(null),
-  roles: z.array(z.string()).nullable().default(null),
-});
+export const SubjectMatcher = z
+  .object({
+    user_ids: z.array(z.string()).nullable().default(null),
+    roles: z.array(z.string()).nullable().default(null),
+    /** Applies only to subjects whose clearance is strictly below this. */
+    clearance_below: z.number().nullable().default(null),
+    /** Applies only to subjects whose clearance is greater than or equal to this. */
+    clearance_at_least: z.number().nullable().default(null),
+  })
+  .strict();
 export type SubjectMatcher = z.infer<typeof SubjectMatcher>;
 
 // ---------------------------------------------------------------------------
@@ -123,11 +162,13 @@ export type ConditionOperator = z.infer<typeof ConditionOperator>;
  * string. Evaluation is #7's job — this type only says what can be written
  * down, and #7 owns rejecting the combinations that make no sense.
  */
-export const Condition = z.object({
-  input: z.string().min(1),
-  operator: ConditionOperator,
-  value: z.unknown().nullable().default(null),
-});
+export const Condition = z
+  .object({
+    input: z.string().min(1),
+    operator: ConditionOperator,
+    value: z.unknown().nullable().default(null),
+  })
+  .strict();
 export type Condition = z.infer<typeof Condition>;
 
 // ---------------------------------------------------------------------------
@@ -146,20 +187,22 @@ export type Condition = z.infer<typeof Condition>;
  * resolved by `id` so evaluation is deterministic whatever order the database
  * returns rows in.
  */
-export const PolicyRule = z.object({
-  id: z.string().min(1),
-  description: z.string(),
-  /** `access` hides the tool during discovery; `pre` blocks the call. */
-  hook: z.enum(["access", "pre"]),
-  match: ToolMatcher,
-  subjects: SubjectMatcher.nullable().default(null),
-  /** All conditions must hold for the rule to fire. Empty means "always". */
-  conditions: z.array(Condition).default([]),
-  effect: Effect,
-  reason: z.string(),
-  priority: z.number().int(),
-  enabled: z.boolean().default(true),
-});
+export const PolicyRule = z
+  .object({
+    id: z.string().min(1),
+    description: z.string(),
+    /** `access` hides the tool during discovery; `pre` blocks the call. */
+    hook: z.enum(["access", "pre"]),
+    match: ToolMatcher,
+    subjects: SubjectMatcher.nullable().default(null),
+    /** All conditions must hold for the rule to fire. Empty means "always". */
+    conditions: z.array(Condition).default([]),
+    effect: Effect,
+    reason: z.string(),
+    priority: z.number().int(),
+    enabled: z.boolean().default(true),
+  })
+  .strict();
 export type PolicyRule = z.infer<typeof PolicyRule>;
 
 // ---------------------------------------------------------------------------
@@ -171,12 +214,14 @@ export const RedactionStrategy = z.enum(["mask", "remove", "replace"]);
 export type RedactionStrategy = z.infer<typeof RedactionStrategy>;
 
 /** Redact a known field, addressed by dot path into the tool's output. */
-export const FieldRedaction = z.object({
-  path: z.string().min(1),
-  strategy: RedactionStrategy,
-  /** Used by `mask` and `replace`; ignored by `remove`. */
-  replacement: z.string().default("[REDACTED]"),
-});
+export const FieldRedaction = z
+  .object({
+    path: z.string().min(1),
+    strategy: RedactionStrategy,
+    /** Used by `mask` and `replace`; ignored by `remove`. */
+    replacement: z.string().default("[REDACTED]"),
+  })
+  .strict();
 export type FieldRedaction = z.infer<typeof FieldRedaction>;
 
 /**
@@ -184,15 +229,17 @@ export type FieldRedaction = z.infer<typeof FieldRedaction>;
  * not — free text a tool returns, including text that arrived from somewhere
  * untrusted and is trying to address the model.
  */
-export const PatternRedaction = z.object({
-  id: z.string().min(1),
-  /** Regular-expression source. Stored as a string so the policy table is data. */
-  regex: z.string().min(1),
-  /** Regex flags. `g` is implied by the engine; declare only the rest. */
-  flags: z.string().default("i"),
-  strategy: RedactionStrategy,
-  replacement: z.string().default("[REDACTED]"),
-});
+export const PatternRedaction = z
+  .object({
+    id: z.string().min(1),
+    /** Regular-expression source. Stored as a string so the policy table is data. */
+    regex: z.string().min(1),
+    /** Regex flags. `g` is implied by the engine; declare only the rest. */
+    flags: z.string().default("i"),
+    strategy: RedactionStrategy,
+    replacement: z.string().default("[REDACTED]"),
+  })
+  .strict();
 export type PatternRedaction = z.infer<typeof PatternRedaction>;
 
 /**
@@ -203,18 +250,20 @@ export type PatternRedaction = z.infer<typeof PatternRedaction>;
  * both: pull the fields you can name, then sweep what is left for the shapes
  * you can recognise.
  */
-export const OutputRule = z.object({
-  id: z.string().min(1),
-  description: z.string(),
-  match: ToolMatcher,
-  subjects: SubjectMatcher.nullable().default(null),
-  fields: z.array(FieldRedaction).default([]),
-  patterns: z.array(PatternRedaction).default([]),
-  /** Recorded on the resulting event, and shown on the control-plane panel. */
-  reason: z.string(),
-  priority: z.number().int(),
-  enabled: z.boolean().default(true),
-});
+export const OutputRule = z
+  .object({
+    id: z.string().min(1),
+    description: z.string(),
+    match: ToolMatcher,
+    subjects: SubjectMatcher.nullable().default(null),
+    fields: z.array(FieldRedaction).default([]),
+    patterns: z.array(PatternRedaction).default([]),
+    /** Recorded on the resulting event, and shown on the control-plane panel. */
+    reason: z.string(),
+    priority: z.number().int(),
+    enabled: z.boolean().default(true),
+  })
+  .strict();
 export type OutputRule = z.infer<typeof OutputRule>;
 
 // ---------------------------------------------------------------------------
@@ -232,13 +281,15 @@ export type OutputRule = z.infer<typeof OutputRule>;
  * would push a discriminated union into every consumer that only wants to log
  * the effect.
  */
-export const Decision = z.object({
-  effect: Effect,
-  reason: z.string(),
-  /** The rule that decided, or `null` for a default (no rule matched, or fail-closed). */
-  rule_id: z.string().nullable(),
-  override: z.unknown().optional(),
-});
+export const Decision = z
+  .object({
+    effect: Effect,
+    reason: z.string(),
+    /** The rule that decided, or `null` for a default (no rule matched, or fail-closed). */
+    rule_id: z.string().nullable(),
+    override: z.unknown().optional(),
+  })
+  .strict();
 export type Decision = z.infer<typeof Decision>;
 
 // ---------------------------------------------------------------------------
@@ -259,61 +310,83 @@ export type ApprovalStatus = z.infer<typeof ApprovalStatus>;
  * `required_clearance` is the numeric bar the approver had to clear, in the
  * same unit-free scale as `Subject.clearance`.
  */
-export const ApprovalRequest = z.object({
-  id: z.string().min(1),
-  requester_id: z.string().min(1),
-  approver_id: z.string().nullable(),
-  candidate_approver_ids: z.array(z.string()).default([]),
-  /** The call being escalated. */
-  match: ToolMatcher,
-  /** Opaque identifier of the thing being acted on, if the action names one. */
-  resource_id: z.string().nullable(),
-  /** The inputs as submitted. A grant is issued against exactly these. */
-  inputs: Inputs,
-  justification: z.string(),
-  required_clearance: z.number().nonnegative().nullable(),
-  status: ApprovalStatus,
-  /** The approver's note, once they have decided. */
-  note: z.string().nullable().default(null),
-  /** Correlates back to the `/pre` payload that triggered the escalation. */
-  execution_id: z.string().nullable().default(null),
-  created_at: Timestamp,
-  decided_at: Timestamp.nullable().default(null),
-});
+export const ApprovalRequest = z
+  .object({
+    id: z.string().min(1),
+    requester_id: z.string().min(1),
+    approver_id: z.string().nullable(),
+    candidate_approver_ids: z.array(z.string()).default([]),
+    /** The call being escalated. */
+    match: ToolMatcher,
+    /** Opaque identifier of the thing being acted on, if the action names one. */
+    resource_id: z.string().nullable(),
+    /** The inputs as submitted. A grant is issued against exactly these. */
+    inputs: Inputs,
+    justification: z.string(),
+    required_clearance: z.number().nonnegative().nullable(),
+    status: ApprovalStatus,
+    /** The approver's note, once they have decided. */
+    note: z.string().nullable().default(null),
+    /** Correlates back to the `/pre` payload that triggered the escalation. */
+    execution_id: z.string().nullable().default(null),
+    created_at: Timestamp,
+    decided_at: Timestamp.nullable().default(null),
+  })
+  .strict();
 export type ApprovalRequest = z.infer<typeof ApprovalRequest>;
 
 /**
  * A narrow, expiring permission produced by an approval — the thing the pre-hook
  * looks for on the retry.
  *
- * Deliberately not a role change. It is scoped to one tool, pinned to the
- * inputs that were approved, limited in uses and time-boxed, so replaying it
- * against different arguments fails. `granted_by` is stored rather than
+ * Deliberately not a role change. It is scoped to one tool and one resource,
+ * pinned to the inputs that were approved, bounded above on the one input that
+ * carries a numeric bound, limited in uses and time-boxed — so replaying it
+ * against a larger value, a different resource, or next week all fail. `granted_by` is stored rather than
  * derived because separation of duties (#10) is checked against it: a grant
  * whose `granted_by` equals its `subject_id` is invalid no matter what the
  * approval record says.
  */
-export const Grant = z.object({
-  id: z.string().min(1),
-  /** Who the grant empowers. */
-  subject_id: z.string().min(1),
-  /** Who approved it. Must differ from `subject_id`. */
-  granted_by: z.string().min(1),
-  /** The approval this grant came from. */
-  request_id: z.string().min(1),
-  match: ToolMatcher,
-  resource_id: z.string().nullable(),
-  /**
-   * The inputs the grant is pinned to. A retry must present these values for
-   * the grant to apply; anything else is a different call.
-   */
-  inputs: Inputs,
-  issued_at: Timestamp,
-  expires_at: Timestamp,
-  /** `null` means unlimited within the expiry window. */
-  uses_remaining: z.number().int().nonnegative().nullable().default(1),
-  revoked_at: Timestamp.nullable().default(null),
-});
+export const Grant = z
+  .object({
+    id: z.string().min(1),
+    /** Who the grant empowers. */
+    subject_id: z.string().min(1),
+    /** Who approved it. Must differ from `subject_id`. */
+    granted_by: z.string().min(1),
+    /** The approval this grant came from. */
+    request_id: z.string().min(1),
+    match: ToolMatcher,
+    resource_id: z.string().nullable(),
+    /**
+     * Inputs the retry must present *exactly*. Anything not named here is
+     * unconstrained except by `ceiling`, and the input `ceiling` names is not
+     * matched here — a ceiling is an upper bound, not an equality.
+     */
+    pinned_inputs: Inputs,
+    /**
+     * The numeric ceiling this grant authorises, if it authorises one.
+     *
+     * #10 has to reject a replay at a higher value while accepting a retry at or
+     * below the approved one, so an exact-match input map cannot express it:
+     * `{ input: "quantity", max: 95 }` means the named input must be present, be
+     * a number, and be no greater than 95. Which input carries the bound is data,
+     * so nothing here learns what the number counts.
+     *
+     * `null` for a grant with no numeric dimension at all.
+     */
+    ceiling: z
+      .object({ input: z.string().min(1), max: z.number() })
+      .strict()
+      .nullable()
+      .default(null),
+    issued_at: Timestamp,
+    expires_at: Timestamp,
+    /** `null` means unlimited within the expiry window. */
+    uses_remaining: z.number().int().nonnegative().nullable().default(1),
+    revoked_at: Timestamp.nullable().default(null),
+  })
+  .strict();
 export type Grant = z.infer<typeof Grant>;
 
 // ---------------------------------------------------------------------------
@@ -334,18 +407,20 @@ export type Grant = z.infer<typeof Grant>;
  * never reaches an MCP client — so the panel joins on it server-side and cannot
  * expect the browser to supply it.
  */
-export const GovernanceEvent = z.object({
-  id: z.string().min(1),
-  ts: Timestamp,
-  execution_id: z.string(),
-  hook: HookPoint,
-  user_id: z.string(),
-  /** Fully-qualified `Toolkit.tool_name`, as the panel displays it. */
-  tool: z.string(),
-  decision: Effect,
-  reason: z.string(),
-  rule_id: z.string().nullable(),
-  before: z.unknown().optional(),
-  after: z.unknown().optional(),
-});
+export const GovernanceEvent = z
+  .object({
+    id: z.string().min(1),
+    ts: Timestamp,
+    execution_id: z.string(),
+    hook: HookPoint,
+    user_id: z.string(),
+    /** Fully-qualified `Toolkit.tool_name`, as the panel displays it. */
+    tool: z.string(),
+    decision: Effect,
+    reason: z.string(),
+    rule_id: z.string().nullable(),
+    before: z.unknown().optional(),
+    after: z.unknown().optional(),
+  })
+  .strict();
 export type GovernanceEvent = z.infer<typeof GovernanceEvent>;

@@ -26,6 +26,7 @@
       "name": "@cg/loan-mcp",
       "version": "0.0.0",
       "dependencies": {
+        "@cg/policy-schema": "workspace:*",
         "zod": "3.25.76",
       },
       "devDependencies": {

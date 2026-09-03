@@ -45,15 +45,30 @@ understand, producing a validator that accepts everything and a test suite that 
 
 See `vendor/README.md` for the pin and how to move it.
 
-## Two choices worth knowing about
+## Four choices worth knowing about
 
-**Every generated object is `.passthrough()`.** This is a beta contract Arcade extends
-without notice, and Zod 3 strips unknown keys by default — a new field would vanish between
-`parse()` and the audit log, invisibly. Required fields are still required.
+**Generated objects are `.passthrough()`; ours are `.strict()`.** Opposite settings, opposite
+reasons. Arcade's payloads may grow, and Zod 3 strips unknown keys by default — a new field
+would vanish between `parse()` and the audit log, invisibly. Our policy rows may not grow: a
+misspelled field there would parse cleanly and evaluate as though it had never been written,
+turning a rule narrower than intended into a blanket rule. Strict makes that a parse error at
+seed time.
 
 **Nullable rather than optional, nearly everywhere.** These records round-trip through
 `bun:sqlite` and across SSE. An absent key and a key set to `undefined` serialise
 identically, so a field that is meaningfully empty says so with `null`.
+
+**`Timestamp` accepts only `Z`-suffixed UTC instants** — `2026-01-01T00:00:00.000Z`. It
+rejects a `+00:00` offset, and it rejects SQLite's own `datetime('now')` format
+(`2026-01-01 00:00:00`). Anything writing these rows must stamp them with
+`new Date().toISOString()` and never let SQLite supply the value, or every row fails on the
+way back out. Pinned by a test.
+
+**A `Grant` bounds, it does not pin, its one numeric input.** `pinned_inputs` must match
+exactly; `ceiling` is `{ input, max }` and the input it names must be present, numeric, and
+no greater than `max`. That is what lets #10 accept a retry at or below the approved value
+and reject a replay above it — an exact-match input map cannot express the difference. Which
+input carries the bound is data, so nothing here learns what the number counts.
 
 ## Writing policy
 
@@ -79,6 +94,12 @@ const seed: PolicyRuleInput[] = [
 
 const rules = seed.map((rule) => PolicyRule.parse(rule));
 ```
+
+A rule can be conditioned on the subject: `subjects` takes `user_ids`, `roles`,
+`clearance_below` and `clearance_at_least`, so a redaction can apply to junior subjects and
+not to senior ones without knowing what clearance measures. Every field is a narrowing
+filter; `null` means "do not narrow on this", and a matcher that narrows on nothing applies
+to everyone.
 
 `reason` is load-bearing. Over MCP a denial reaches the model as
 `"Tool execution was denied by an extension policy: " + reason` and nothing else, so this
