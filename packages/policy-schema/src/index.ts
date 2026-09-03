@@ -1,31 +1,97 @@
 /**
- * Shared contracts for the governance layer.
+ * The frozen contract every other slice builds against.
  *
- * Real hook payload types land in #5, generated from the OpenAPI spec in
- * `ArcadeAI/schemas`. This slice defines only the governance event, because
- * the scaffold needs something to typecheck and every service already agrees
- * on this shape (DESIGN.md, "Event contract").
+ * Two sources, kept apart on purpose:
+ *
+ * - `./generated/hook-contract.ts` — Arcade's webhook payloads, generated from
+ *   the OpenAPI document in `ArcadeAI/schemas`. Not hand-written, so our idea
+ *   of the contract cannot drift from the real one. Regenerate with
+ *   `bun run --cwd packages/policy-schema generate`.
+ * - `./domain.ts` — our own governance vocabulary. Hand-written, and
+ *   domain-agnostic: subjects, rules, decisions, grants, events. Nothing in
+ *   here knows what the governed system does.
+ *
+ * `./fixtures.ts` builds valid instances of both, for tests and for the UI lane
+ * working against a control plane that is not running yet.
+ *
+ * Zod 3, pinned at the repo root. Zod 4 changes internals the Arcade/Mastra
+ * path does not support yet.
  */
-import { z } from "zod";
+import type { z } from "zod";
 
-export const HookPoint = z.enum(["access", "pre", "post"]);
-export type HookPoint = z.infer<typeof HookPoint>;
+import type {
+  ApprovalRequest as ApprovalRequestSchema,
+  Grant as GrantSchema,
+  OutputRule as OutputRuleSchema,
+  PolicyRule as PolicyRuleSchema,
+  Subject as SubjectSchema,
+} from "./domain.ts";
 
-export const Effect = z.enum(["allow", "deny", "modify"]);
-export type Effect = z.infer<typeof Effect>;
+export {
+  ApprovalRequest,
+  ApprovalStatus,
+  Condition,
+  ConditionOperator,
+  Decision,
+  Effect,
+  FieldRedaction,
+  GovernanceEvent,
+  Grant,
+  HookPoint,
+  Inputs,
+  OutputRule,
+  PatternRedaction,
+  PolicyRule,
+  RedactionStrategy,
+  Subject,
+  SubjectMatcher,
+  Timestamp,
+  ToolMatcher,
+} from "./domain.ts";
 
-/** One decision by one hook, as streamed to the control-plane panel. */
-export const GovernanceEvent = z.object({
-  id: z.string(),
-  ts: z.string().datetime(),
-  execution_id: z.string(),
-  hook: HookPoint,
-  user_id: z.string(),
-  tool: z.string(),
-  decision: Effect,
-  reason: z.string(),
-  rule_id: z.string().nullable(),
-  before: z.unknown().optional(),
-  after: z.unknown().optional(),
-});
-export type GovernanceEvent = z.infer<typeof GovernanceEvent>;
+export {
+  AccessHookRequest,
+  AccessHookResult,
+  Authorization,
+  ErrorResponse,
+  HealthResponse,
+  HOOK_CONTRACT_VERSION,
+  HOOK_ENDPOINT_PATHS,
+  OAuth2Details,
+  PostHookOverride,
+  PostHookRequest,
+  PostHookResult,
+  PreHookOverride,
+  PreHookRequest,
+  PreHookResult,
+  ResponseCode,
+  SecretRequirement,
+  ToolAuthRequirements,
+  ToolBehavior,
+  ToolClassification,
+  ToolContext,
+  ToolInfo,
+  ToolkitInfo,
+  ToolkitRequirements,
+  Toolkits,
+  ToolVersionInfo,
+  ToolVersionInfoMetadata,
+} from "./generated/hook-contract.ts";
+
+export * from "./fixtures.ts";
+
+/**
+ * Author-facing shapes: what you write in a seed file or a policy editor,
+ * before Zod fills in the defaults.
+ *
+ * `z.infer` gives the *output* type, where `enabled`, `priority`, `conditions`
+ * and friends are all present because `parse()` supplied them. Seed data should
+ * not have to spell those out, so anything that authors policy — the seeder,
+ * the live rule editor — types its literals as these and lets `parse()` do the
+ * rest.
+ */
+export type SubjectInput = z.input<typeof SubjectSchema>;
+export type PolicyRuleInput = z.input<typeof PolicyRuleSchema>;
+export type OutputRuleInput = z.input<typeof OutputRuleSchema>;
+export type GrantInput = z.input<typeof GrantSchema>;
+export type ApprovalRequestInput = z.input<typeof ApprovalRequestSchema>;

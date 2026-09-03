@@ -2,7 +2,7 @@
  * The forkability boundary, enforced rather than documented.
  *
  * `packages/governance-core` must never reach into an app. If it does, a forker
- * cannot replace `apps/loan-mcp` with their own business system without
+ * cannot replace the governed app with their own business system without
  * rewriting the governance layer — which is the whole promise of the template.
  *
  * Two layers here. `importedSpecifiers` is pure and has its own coverage table,
@@ -70,7 +70,9 @@ function sourceFiles(dir: string): string[] {
 }
 
 describe("importedSpecifiers recognises every form that creates a dependency", () => {
-  const APP = "@cg/loan-mcp";
+  // A stand-in app name. Deliberately not a real one: `packages/` carries no
+  // business-domain vocabulary, and #24 greps for it.
+  const APP = "@cg/governed-app";
 
   const cases: ReadonlyArray<readonly [label: string, source: string]> = [
     ["static import", `import { x } from "${APP}";`],
@@ -93,7 +95,7 @@ describe("importedSpecifiers recognises every form that creates a dependency", (
   }
 
   it("catches a relative path that climbs into apps/", () => {
-    const source = `import { x } from "../../../apps/loan-mcp/src/index.ts";`;
+    const source = `import { x } from "../../../apps/governed-app/src/index.ts";`;
     const [specifier] = importedSpecifiers(source);
     expect(specifier).toBeDefined();
     expect(addressesApp(specifier as string, [APP])).toBe(true);

@@ -37,6 +37,7 @@
       "name": "@cg/web",
       "version": "0.0.0",
       "dependencies": {
+        "@cg/policy-schema": "workspace:*",
         "next": "^15.5.4",
         "react": "^19.1.1",
         "react-dom": "^19.1.1",
@@ -68,6 +69,7 @@
         "zod": "3.25.76",
       },
       "devDependencies": {
+        "@types/bun": "^1.3.0",
         "typescript": "^5.9.2",
       },
     },
