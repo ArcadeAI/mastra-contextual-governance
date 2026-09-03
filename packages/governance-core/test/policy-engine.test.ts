@@ -763,9 +763,66 @@ describe("compilePolicy refuses a policy that cannot mean what it says", () => {
       /must tell the model what to do next.*"Insufficient authority\."/,
     ],
     [
-      "a pre denial naming a remediation tool the catalogue does not list",
+      "a pre denial naming a tool that a catalogued toolkit does not serve",
       withRules(rule({ ...base(), reason: "Call Approvals.escalate with resource_id=1." })),
-      /must tell the model what to do next/,
+      /names "Approvals\.escalate", which toolkit "Approvals" does not serve.*must tell the model what to do next/s,
+    ],
+    [
+      "a pre denial whose argument values are empty placeholders",
+      withRules(
+        rule({
+          ...base(),
+          reason: "Call Approvals.request_approval with resource_id={{}}, quantity={{}}, justification={{}}.",
+        }),
+      ),
+      /does not form a placeholder.*no value for argument\(s\) "resource_id", "quantity", "justification"/s,
+    ],
+    [
+      "a pre denial whose argument values are empty quotes",
+      withRules(
+        rule({
+          ...base(),
+          reason: `Call Approvals.request_approval with resource_id="", quantity='', justification=<>.`,
+        }),
+      ),
+      /no value for argument\(s\) "resource_id", "quantity", "justification"/,
+    ],
+    [
+      "a reason with an unterminated placeholder",
+      withRules(rule({ ...base(), reason: `{{inputs.quantity is too much. ${NO_REMEDIATION}.` })),
+      /"\{\{" that does not form a placeholder/,
+    ],
+    [
+      "a reason with a stray closing brace pair",
+      withRules(rule({ ...base(), reason: `Too much }}. ${NO_REMEDIATION}.` })),
+      /"\}\}" that does not form a placeholder/,
+    ],
+    [
+      "a pre denial that says Do not retry and then instructs a call anyway",
+      withRules(
+        rule({
+          ...base(),
+          reason: `${NO_REMEDIATION}. Instead call Bogus.escalate with ticket=1.`,
+        }),
+      ),
+      /says "Do not retry" but also instructs a call \("Bogus\.escalate"\)/,
+    ],
+    [
+      "a pre denial that says Do not retry and then names a catalogued tool",
+      withRules(rule({ ...base(), reason: `${NO_REMEDIATION}; Approvals.request_approval is closed.` })),
+      /says "Do not retry" but also instructs a call \("Approvals\.request_approval"\)/,
+    ],
+    [
+      "a pre denial whose arguments follow an uncatalogued tool reference",
+      withRules(
+        rule({
+          ...base(),
+          reason:
+            "Call Approvals.request_approval; then Bogus.do_thing with resource_id=WID-1, " +
+            "quantity=95, justification=needed.",
+        }),
+      ),
+      /"Approvals\.request_approval" but not the argument\(s\) it needs.*gives argument\(s\) "resource_id", "quantity", "justification" to "Bogus\.do_thing", which is not a catalogued tool/s,
     ],
     [
       "a pre denial naming a remediation tool but none of its arguments",
@@ -979,13 +1036,41 @@ describe("compilePolicy refuses a policy that cannot mean what it says", () => {
       'resource_id={{inputs.widget_id}}, quantity={{inputs.quantity}}, justification="why"',
       "resource_id=<the widget id>, quantity=<the quantity requested>, justification=<why>",
       "resource_id=WID-1, quantity=95, justification=needed",
-      "resource_id='WID-1', quantity=(95), justification=x",
+      "resource_id='WID-1', quantity=95.5, justification=x",
     ];
     for (const args of forms) {
       expect(() =>
         policy([rule({ ...base(), reason: `Call Approvals.request_approval with ${args}.` })]),
       ).not.toThrow();
     }
+  });
+
+  it("does not mistake a placeholder's dotted path for a tool reference", () => {
+    // `{{inputs.widget_id}}` must not open an invocation that swallows the
+    // arguments after it.
+    expect(() =>
+      policy([
+        rule({
+          ...base(),
+          reason:
+            "Call Approvals.request_approval with resource_id={{inputs.widget_id}}, " +
+            "quantity={{inputs.quantity}}, justification=<why>.",
+        }),
+      ]),
+    ).not.toThrow();
+  });
+
+  it("does not mistake ordinary abbreviations for tool references", () => {
+    expect(() =>
+      policy([
+        rule({
+          ...base(),
+          reason:
+            "Call Approvals.request_approval with resource_id={{inputs.widget_id}}, " +
+            "quantity={{inputs.quantity}}, justification=<e.g. why the customer needs it>.",
+        }),
+      ]),
+    ).not.toThrow();
   });
 
   it("accepts a placeholder for an input common to every tool a wildcard rule matches", () => {

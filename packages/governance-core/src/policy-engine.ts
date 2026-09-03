@@ -170,17 +170,31 @@ const PLACEHOLDER = /\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g;
 const SUBJECT_FIELDS = new Set(["user_id", "display_name", "role", "clearance"]);
 const TOOL_FIELDS = new Set(["toolkit", "name"]);
 
-/** A `Toolkit.tool` reference inside prose. */
-const TOOL_REFERENCE = /\b([A-Za-z][A-Za-z0-9_-]*)\.([A-Za-z_][A-Za-z0-9_]*)\b/g;
 /**
- * An argument spelled out for the model: `name=value`. The value is a
- * `{{…}}` placeholder, a `<…>` instruction telling the model what to supply,
- * a quoted string, or a bare token; it is captured so that `name=` followed by
- * nothing can be refused — a name without a value is not something a model
- * with no other context can act on.
+ * The grammar of a reason, as one left-to-right scan. Every `{{`, every
+ * `name=value` and every `Toolkit.tool` is classified exactly once, at the
+ * earliest position it occurs, so nothing can be a value to one check and
+ * invisible to another. Alternatives, in order:
+ *
+ * - a well-formed placeholder `{{path}}`;
+ * - an argument `name=value`, whose value is a well-formed placeholder, a
+ *   `<what to supply>` instruction, a non-empty quoted string, or a bare
+ *   token that contains no brace, angle or quote character (so an empty
+ *   `{{}}`, `""` or `<>` cannot pass as a literal) — captured so that `name=`
+ *   followed by nothing can be refused;
+ * - a `Toolkit.tool` reference;
+ * - a stray `{{` or `}}`: a placeholder that did not parse, refused outright.
  */
-const ARGUMENT_MENTION =
-  /\b([A-Za-z_][A-Za-z0-9_]*)=(\{\{[^}]*\}\}|<[^>]+>|"[^"]*"|'[^']*'|[^\s,.;)]+)?/g;
+const PLACEHOLDER_SOURCE = String.raw`\{\{\s*[A-Za-z0-9_.-]+\s*\}\}`;
+const REASON_TOKEN = new RegExp(
+  [
+    String.raw`(?<placeholder>${PLACEHOLDER_SOURCE})`,
+    String.raw`\b(?<arg>[A-Za-z_][A-Za-z0-9_]*)=(?<value>${PLACEHOLDER_SOURCE}|<[^<>]+>|"[^"]+"|'[^']+'|[^\s,.;(){}<>"']+)?`,
+    String.raw`\b(?<toolkit>[A-Za-z][A-Za-z0-9_-]*)\.(?<tool>[A-Za-z_][A-Za-z0-9_]*)\b`,
+    String.raw`(?<stray>\{\{|\}\})`,
+  ].join("|"),
+  "g",
+);
 /**
  * The one sentence that exempts a `pre` denial from naming a remediation tool:
  * it tells the model, in so many words, that nothing it can call will help.
@@ -258,15 +272,7 @@ export function compilePolicy(policy: Policy): CompiledPolicy {
       );
     }
 
-    if (rule.hook === "pre" && rule.effect === "deny") {
-      for (const problem of checkRemediation(rule.reason, catalogue)) {
-        problems.push(`${at}: ${problem}`);
-      }
-    }
-
-    for (const problem of checkPlaceholders(rule.reason, matchedArguments(rule.match, catalogue))) {
-      problems.push(`${at}: ${problem}`);
-    }
+    for (const problem of checkReason(rule, catalogue)) problems.push(`${at}: ${problem}`);
 
     const conditions: CompiledCondition[] = [];
     for (const condition of rule.conditions) {
@@ -307,87 +313,120 @@ function matchedArguments(
 }
 
 /**
- * Every placeholder must be one the engine can prove it will fill.
- * `{{inputs.x}}` is allowed only when `x` is a catalogued argument of every
- * tool the rule can match, because those are the inputs the engine requires
- * the call to carry (see `decide`). Anything else could render as absent, and
- * an instruction with a hole in it is not an instruction.
+ * Everything that can be wrong with a rule's `reason`, found in one scan.
+ *
+ * Placeholders, for every rule: each must be one the engine can prove it will
+ * fill. `{{inputs.x}}` is allowed only when `x` is a catalogued argument of
+ * every tool the rule can match, because those are the inputs the engine
+ * requires the call to carry (see `decide`). `{{subject.*}}` and `{{tool.*}}`
+ * name fixed fields. A `{{` that does not form a placeholder is refused.
+ *
+ * Remediation, for a `pre` denial: the `reason` is the only thing the model
+ * will read. It must either say `Do not retry`, so the model stops rather than
+ * guesses — and then instruct no call at all — or name a next tool to call — a catalogued `Toolkit.tool` — and,
+ * *following that name*, spell out as `name=value` every argument the
+ * catalogue says that tool needs. Arguments belong to the reference they
+ * follow, and *any* `Toolkit.tool`-shaped reference closes the previous
+ * invocation, catalogued or not, so arguments cannot drift onto a tool that
+ * was not named for them. Arguments given to an uncatalogued reference, to a
+ * tool a catalogued toolkit does not serve, before any tool, without a value,
+ * or that the tool does not accept, are each refused. Anything less is an
+ * apology, and the compiler refuses it.
  */
-function checkPlaceholders(reason: string, matched: ReadonlyArray<readonly string[]>): string[] {
+function checkReason(rule: PolicyRule, catalogue: CompiledCatalogue): string[] {
+  const { reason } = rule;
   const problems: string[] = [];
-  for (const [whole, path] of reason.matchAll(PLACEHOLDER)) {
-    const [root, field, ...rest] = (path as string).split(".");
-    const bad = (why: string) => problems.push(`reason placeholder "${whole}" ${why}`);
+  const quote = (names: readonly string[]) => names.map((n) => `"${n}"`).join(", ");
+  const matched = matchedArguments(rule.match, catalogue);
 
-    if (field === undefined || rest.length > 0) {
-      bad(`must be exactly "inputs.<argument>", "subject.<field>" or "tool.<field>"`);
-    } else if (root === "inputs") {
-      if (matched.length === 0 || !matched.every((args) => args.includes(field))) {
-        bad(
-          `names an input that is not a catalogued argument of every tool this rule matches, ` +
-            `so it could be absent when the reason is rendered`,
+  type Invocation = {
+    reference: string;
+    /** `null` when the reference is not a catalogued tool. */
+    args: readonly string[] | null;
+    given: string[];
+    valueless: string[];
+  };
+  const invocations: Invocation[] = [];
+  const preamble: string[] = [];
+  let current: Invocation | null = null;
+
+  for (const token of reason.matchAll(REASON_TOKEN)) {
+    const g = token.groups ?? {};
+    if (g.stray !== undefined) {
+      problems.push(
+        `reason contains "${g.stray}" that does not form a placeholder; write {{inputs.<argument>}}, ` +
+          `{{subject.<field>}} or {{tool.<field>}}`,
+      );
+    } else if (g.placeholder !== undefined) {
+      const problem = checkPlaceholder(g.placeholder, matched);
+      if (problem) problems.push(problem);
+    } else if (g.arg !== undefined) {
+      if (g.value !== undefined && g.value.startsWith("{{")) {
+        const problem = checkPlaceholder(g.value, matched);
+        if (problem) problems.push(problem);
+      }
+      if (current === null) preamble.push(g.arg);
+      else if (g.value === undefined) current.valueless.push(g.arg);
+      else current.given.push(g.arg);
+    } else if (g.toolkit !== undefined && g.tool !== undefined) {
+      const toolkit = catalogue.get(g.toolkit);
+      const reference = token[0];
+      if (toolkit && !toolkit.has(g.tool)) {
+        problems.push(
+          `reason names "${reference}", which toolkit "${g.toolkit}" does not serve ` +
+            `(serves: ${quote([...toolkit.keys()])})`,
         );
       }
-    } else if (root === "subject") {
-      if (!SUBJECT_FIELDS.has(field)) bad(`must name one of ${[...SUBJECT_FIELDS].join(", ")}`);
-    } else if (root === "tool") {
-      if (!TOOL_FIELDS.has(field)) bad(`must name one of ${[...TOOL_FIELDS].join(", ")}`);
-    } else {
-      bad(`must start with inputs, subject or tool`);
+      current = { reference, args: toolkit?.get(g.tool) ?? null, given: [], valueless: [] };
+      invocations.push(current);
     }
   }
-  return problems;
-}
 
-/**
- * A `pre` denial's `reason` is the only thing the model will read. It must
- * either say `${NO_REMEDIATION}` so the model stops rather than guesses, or
- * name a next tool to call — a `Toolkit.tool` the catalogue lists — and,
- * *following that name*, spell out as `name=value` every argument the
- * catalogue says that tool needs. Arguments are attributed to the tool
- * reference they follow, so a reason naming two tools is checked as two
- * invocations, each against its own argument list. An argument the tool does
- * not accept, or a name with no value, is refused: the model would try it and
- * fail. Anything less is an apology, and the compiler refuses it.
- */
-function checkRemediation(reason: string, catalogue: CompiledCatalogue): string[] {
-  if (reason.includes(NO_REMEDIATION)) return [];
+  if (!(rule.hook === "pre" && rule.effect === "deny")) return problems;
 
-  type Invocation = { reference: string; args: readonly string[]; start: number; end: number };
-  const invocations: Invocation[] = [];
-  for (const m of reason.matchAll(TOOL_REFERENCE)) {
-    const [reference, toolkit, tool] = m;
-    const args = catalogue.get(toolkit as string)?.get(tool as string);
-    if (!args) continue;
-    const start = m.index + reference.length;
-    if (invocations.length > 0) (invocations[invocations.length - 1] as Invocation).end = m.index;
-    invocations.push({ reference, args, start, end: reason.length });
+  if (reason.includes(NO_REMEDIATION)) {
+    // The escape hatch means "nothing you can call will help". A reason that
+    // says so and then instructs a call anyway is contradicting itself.
+    const instructs = invocations.filter(
+      (i) => i.args !== null || i.given.length > 0 || i.valueless.length > 0,
+    );
+    if (preamble.length > 0 || instructs.length > 0) {
+      problems.push(
+        `a pre denial's reason says "${NO_REMEDIATION}" but also instructs a call ` +
+          `(${quote(instructs.map((i) => i.reference))}${preamble.length > 0 ? `; arguments ${quote(preamble)}` : ""}); ` +
+          `either name the remediation tool with its arguments, or tell the model to stop, not both`,
+      );
+    }
+    return problems;
   }
-  if (invocations.length === 0) {
-    return [
+
+  const catalogued = invocations.filter((i) => i.args !== null);
+  if (catalogued.length === 0) {
+    problems.push(
       `a pre denial's reason must tell the model what to do next: name a catalogued ` +
         `remediation tool as "Toolkit.tool" with its arguments, or say "${NO_REMEDIATION}". ` +
         `Got: "${reason}"`,
-    ];
+    );
+    return problems;
   }
 
-  const problems: string[] = [];
-  const quote = (names: readonly string[]) => names.map((n) => `"${n}"`).join(", ");
-
-  const preamble = [...reason.slice(0, (invocations[0] as Invocation).start).matchAll(ARGUMENT_MENTION)];
   if (preamble.length > 0) {
     problems.push(
-      `a pre denial's reason gives argument(s) ${quote(preamble.map((m) => m[1] as string))} ` +
-        `before naming the tool they belong to; write the tool first, then its arguments`,
+      `a pre denial's reason gives argument(s) ${quote(preamble)} before naming the tool they ` +
+        `belong to; write the tool first, then its arguments`,
     );
   }
 
-  for (const { reference, args, start, end } of invocations) {
-    const given = new Set<string>();
-    const valueless: string[] = [];
-    for (const [, name, value] of reason.slice(start, end).matchAll(ARGUMENT_MENTION)) {
-      if (value === undefined) valueless.push(name as string);
-      else given.add(name as string);
+  for (const { reference, args, given, valueless } of invocations) {
+    if (args === null) {
+      const stranded = [...given, ...valueless];
+      if (stranded.length > 0) {
+        problems.push(
+          `a pre denial's reason gives argument(s) ${quote(stranded)} to "${reference}", which ` +
+            `is not a catalogued tool; the model would call something that does not exist`,
+        );
+      }
+      continue;
     }
     if (valueless.length > 0) {
       problems.push(
@@ -396,14 +435,14 @@ function checkRemediation(reason: string, catalogue: CompiledCatalogue): string[
           `instruction, or a literal`,
       );
     }
-    const missing = args.filter((arg) => !given.has(arg));
+    const missing = args.filter((arg) => !given.includes(arg));
     if (missing.length > 0) {
       problems.push(
         `a pre denial's reason names "${reference}" but not the argument(s) it needs: ` +
           `${quote(missing)}. Spell each out as "name=value" after the tool name`,
       );
     }
-    const unknown = [...given].filter((arg) => !args.includes(arg));
+    const unknown = given.filter((arg) => !args.includes(arg));
     if (unknown.length > 0) {
       problems.push(
         `a pre denial's reason gives "${reference}" argument(s) ${quote(unknown)}, which it ` +
@@ -412,6 +451,32 @@ function checkRemediation(reason: string, catalogue: CompiledCatalogue): string[
     }
   }
   return problems;
+}
+
+/** What is wrong with one `{{…}}` placeholder, or `null`. */
+function checkPlaceholder(whole: string, matched: ReadonlyArray<readonly string[]>): string | null {
+  const path = whole.slice(2, -2).trim();
+  const [root, field, ...rest] = path.split(".");
+  const bad = (why: string) => `reason placeholder "${whole}" ${why}`;
+
+  if (field === undefined || rest.length > 0) {
+    return bad(`must be exactly "inputs.<argument>", "subject.<field>" or "tool.<field>"`);
+  }
+  if (root === "inputs") {
+    return matched.length > 0 && matched.every((args) => args.includes(field))
+      ? null
+      : bad(
+          `names an input that is not a catalogued argument of every tool this rule matches, ` +
+            `so it could be absent when the reason is rendered`,
+        );
+  }
+  if (root === "subject") {
+    return SUBJECT_FIELDS.has(field) ? null : bad(`must name one of ${[...SUBJECT_FIELDS].join(", ")}`);
+  }
+  if (root === "tool") {
+    return TOOL_FIELDS.has(field) ? null : bad(`must name one of ${[...TOOL_FIELDS].join(", ")}`);
+  }
+  return bad(`must start with inputs, subject or tool`);
 }
 
 /** Returns a description of what is wrong with the condition, or `null`. */
