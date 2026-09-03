@@ -9,12 +9,32 @@
  * the UI and this package all agree on one definition. Re-exported here for
  * convenience; `@cg/policy-schema` remains the single source.
  *
- * The four pure modules arrive in #7 (PolicyEngine), #8 (RedactionEngine),
- * #9 (ApproverRouter) and #10 (GrantChecker).
+ * The four pure modules: #7 (PolicyEngine, `./policy-engine.ts`), #8
+ * (RedactionEngine), #9 (ApproverRouter, `./approver-router.ts`) and #10
+ * (GrantChecker).
  */
 import { type Decision } from "@cg/policy-schema";
 
 export { Decision, Effect, GovernanceEvent, HookPoint } from "@cg/policy-schema";
+
+export {
+  attestGrantValidated,
+  compilePolicy,
+  evaluatePermission,
+  hiddenTools,
+  NO_REMEDIATION,
+  PolicyCompileError,
+  renderReason,
+  resolveVisibility,
+  type CompiledPolicy,
+  type PermissionInput,
+  type Policy,
+  type SubjectOrUnknown,
+  type ToolCatalogue,
+  type ToolRef,
+  type ValidatedGrant,
+  type VisibilityDecision,
+} from "./policy-engine.ts";
 
 export { routeApproval, type RoutingResult } from "./approver-router.ts";
 
