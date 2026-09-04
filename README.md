@@ -14,8 +14,10 @@ Python `arcade-mcp` toolkits, which is what the agent's tools are authored in.
 
 `apps/loan-app` is real: the bank's system of record, a plain HTTP API over `loans.db`
 with the seed data the demo runs on. `tools/loan` is real: the four loan tools, each a
-stateless client of that API, shipped with `arcade deploy`. `apps/hooks` and `apps/web`
-are still stubs that serve a health endpoint and nothing else.
+stateless client of that API, shipped with `arcade deploy`. `apps/idp` is real: the
+enterprise's identity provider, Better Auth as an OAuth 2.1 server, with the four personas
+seeded and a login and consent page. `apps/hooks` and `apps/web` are still stubs that
+serve a health endpoint and nothing else.
 
 See [`DESIGN.md`](./DESIGN.md) for the architecture and the decisions behind it, and
 [issue #1](https://github.com/ArcadeAI/mastra-contextual-governance/issues/1) for the
@@ -33,6 +35,11 @@ apps/loan-app    Bun — plain HTTP API, the bank's system of record. Owns loans
 
 tools/loan       Python arcade-mcp — search_loans, get_loan, approve_loan, deny_loan.
                  Stateless client of apps/loan-app.             → arcade deploy
+
+apps/idp         Bun — Better Auth OAuth 2.1 provider, login and consent pages.
+                 Owns idp.db. A demo fixture standing in for the enterprise's
+                 real IdP; a forker deletes it and points at their Okta. Not a
+                 workspace member — has its own lockfile.              → Render
 tools/approvals  Python arcade-mcp — request_approval, decide.  → arcade deploy
 
 packages/governance-core   Hook framework, policy engine, audit, event bus.
@@ -51,7 +58,8 @@ Requires [Bun](https://bun.sh) 1.3.14.
 
 ```sh
 bun install
-cp .env.example .env     # then fill it in — every variable is documented in place
+bun install --cwd apps/idp   # not a workspace member; see apps/idp/README.md
+cp .env.example .env         # then fill it in — every variable is documented in place
 ```
 
 ```sh
@@ -64,7 +72,8 @@ Run a service:
 ```sh
 bun run dev:hooks        # :8081
 bun run dev:loan-app     # :8082, the loan API
-bun run dev:idp          # :8083, a dev-only stand-in for apps/idp — tokens are `dev:<email>`
+bun run dev:idp          # :8083, the identity provider — OAuth at /oauth2/*
+bun run dev:idp-stub     # :8083 too, a userinfo-only stand-in for apps/idp; tokens are `dev:<email>`
 bun run dev:web          # :3000
 ```
 
@@ -80,6 +89,7 @@ Each service answers `GET /health`:
 ```sh
 curl localhost:8081/health   # {"status":"ok","service":"hooks",...}
 curl localhost:8082/health   # {"status":"ok","service":"loan-app","loans":8}
+curl localhost:8083/health   # {"status":"ok","service":"idp","people":4,...}
 ```
 
 ## The loan book
@@ -126,6 +136,16 @@ and `ARCADE_LOAN_TOOLKIT` in `.env.example`. A policy rule keyed on the wrong to
 matches nothing, and a rule that matches nothing is indistinguishable from a rule that
 permits.
 
+## The identity provider
+
+`apps/idp` is what the loan tools authenticate against: Arcade is registered as an OAuth
+client of it, and the email it returns from `/oauth2/userinfo` is the identity every hook
+and every loan-book write is keyed on. It stands in for the enterprise's real IdP, and it
+has one operational rule — **resetting it must not rotate the OAuth client**, or the
+registration in the Arcade dashboard goes stale right before you present. Its reset script
+keeps the client; see [`apps/idp/README.md`](./apps/idp/README.md), including how to
+print the credentials and what to enter in Arcade.
+
 ## Two things that will bite you
 
 **Zod is pinned to 3.25.76.** Zod 4 changes internals the Arcade/Mastra path does
@@ -140,7 +160,7 @@ declares a dependency on an app package or imports from one.
 
 ## Deploying
 
-Three services deploy from [`render.yaml`](./render.yaml) as a Render blueprint.
+Four services deploy from [`render.yaml`](./render.yaml) as a Render blueprint.
 Render does not detect Bun, so each service declares `runtime: docker` and ships
 its own Dockerfile — do not rely on runtime detection.
 

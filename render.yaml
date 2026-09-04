@@ -1,6 +1,7 @@
 # One blueprint provisions every service Render is responsible for: `web`,
-# `hooks`, and `loan-app`. `tools/loan` and `tools/approvals` are deliberately
-# absent — they are Python `arcade-mcp` toolkits and ship via `arcade deploy`.
+# `hooks`, `loan-app` and `idp`. `tools/loan` and `tools/approvals` are
+# deliberately absent — they are Python `arcade-mcp` toolkits and ship via
+# `arcade deploy`.
 #
 # Every service uses runtime: docker. Render does not detect Bun, so the
 # runtime is declared explicitly rather than left to detection.
@@ -12,8 +13,8 @@
 # approved on stage are both still there after a restart. Getting back to a
 # clean state is `scripts/reset` (#23).
 #
-# cg-loan-app's disk is below. cg-hooks' lands with #12, which owns
-# governance.db's seeding.
+# cg-loan-app's and cg-idp's disks are below. cg-hooks' lands with #12, which
+# owns governance.db's seeding.
 #
 # Services with disks give up zero-downtime deploys — Render stops the old
 # instance before starting the new one. Irrelevant for a demo.
@@ -56,11 +57,13 @@ services:
       - key: LOANS_DB_PATH
         value: /data/loans.db
       # Where bearer tokens are validated: the API asks this host's
-      # /oauth2/userinfo who the caller is. `apps/idp` (#36) owns the service;
-      # once `cg-idp` is in this blueprint, #36 replaces this with a
-      # `fromService` host like the two below. Until then it is entered by hand.
+      # /oauth2/userinfo who the caller is. Derived from cg-idp the same way
+      # the other cross-service hosts are — host-form, consumer adds https.
       - key: IDP_PUBLIC_HOST
-        sync: false
+        fromService:
+          name: cg-idp
+          type: web
+          property: host
 
   # The control plane. Serves /access, /pre and /post to Arcade Cloud, owns the
   # policy and audit database, and fans decisions out to the UI over SSE.
@@ -93,6 +96,60 @@ services:
           name: cg-loan-app
           type: web
           property: host
+
+  # The enterprise's identity provider — a demo fixture standing in for the
+  # real one. Better Auth as an OAuth 2.1 authorization server, with the login
+  # and consent pages a persona sees the first time they authorize. Arcade is
+  # registered against it as an OAuth client (#13); the credentials come from
+  # `bun run oauth-client` in this service's shell, never from the logs.
+  - type: web
+    name: cg-idp
+    runtime: docker
+    plan: starter
+    region: oregon
+    dockerfilePath: ./apps/idp/Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    # Delete this block to run the identity provider ephemerally and pay
+    # nothing for storage — but know what you are giving up: the OAuth client
+    # credentials live in this database, so without the disk every restart
+    # regenerates them and the registration in the Arcade dashboard goes stale.
+    # Fine for a look at the demo, wrong for anything you would keep. 1 GB, the
+    # minimum, and it is one `disk:` key away from gone.
+    disk:
+      name: idp
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: PORT
+        value: 8080
+      # On the disk, not /tmp. The service creates the parent directory, so
+      # this also works unchanged against a bind mount or a local path.
+      - key: IDP_DB_PATH
+        value: /data/idp.db
+      # Signs sessions and encrypts the stored OAuth client secret. Generated
+      # once by Render and never shown; rotating it invalidates every session
+      # and makes the stored client secret unreadable — see .env.example.
+      - key: BETTER_AUTH_SECRET
+        generateValue: true
+      # Arcade's OAuth callback, allowlisted on the client. The default in the
+      # code is Arcade Cloud's; set this if the dashboard shows another.
+      - key: IDP_OAUTH_REDIRECT_URIS
+        sync: false
+      # The persona emails, same values as cg-web's — they are the join key
+      # across the whole system. Read only when idp.db is first seeded.
+      - key: PERSONA_DANA_EMAIL
+        sync: false
+      - key: PERSONA_SAM_EMAIL
+        sync: false
+      - key: PERSONA_RILEY_EMAIL
+        sync: false
+      - key: PERSONA_MORGAN_EMAIL
+        sync: false
+      # No IDP_PUBLIC_URL here: Render injects RENDER_EXTERNAL_URL and the
+      # service falls back to it, so the issuer is always this service's own
+      # public address, whatever suffix Render gave the name.
 
   # Next.js: chat, persona switcher, approval page, control-plane panel. The
   # Mastra agent runs in this service's route handlers.

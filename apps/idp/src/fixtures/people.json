@@ -1,0 +1,28 @@
+{
+  "people": [
+    {
+      "persona": "dana",
+      "name": "Dana Okafor",
+      "email": "dana.okafor@bank.example",
+      "password": "dana-demo-2026"
+    },
+    {
+      "persona": "sam",
+      "name": "Sam Reyes",
+      "email": "sam.reyes@bank.example",
+      "password": "sam-demo-2026"
+    },
+    {
+      "persona": "riley",
+      "name": "Riley Chen",
+      "email": "riley.chen@bank.example",
+      "password": "riley-demo-2026"
+    },
+    {
+      "persona": "morgan",
+      "name": "Morgan Ellis",
+      "email": "morgan.ellis@bank.example",
+      "password": "morgan-demo-2026"
+    }
+  ]
+}
