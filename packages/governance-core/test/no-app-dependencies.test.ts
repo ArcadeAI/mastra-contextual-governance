@@ -11,7 +11,7 @@
  * The second walks the real package.
  */
 import { describe, expect, it } from "bun:test";
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 
 const PACKAGE_ROOT = join(import.meta.dir, "..");
@@ -43,11 +43,21 @@ function readJson(path: string): Record<string, unknown> {
   return JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
 }
 
-/** Package names declared by everything under `apps/`. */
+/**
+ * Package names declared by everything under `apps/`.
+ *
+ * A directory with no `package.json` is skipped rather than thrown on. Renames
+ * leave the old directory behind holding an untracked `node_modules/` — the
+ * `apps/loan-mcp` → `apps/loan-app` rename in #34 did exactly that — and an
+ * ENOENT here reads as a broken build rather than as stale scratch. Two people
+ * lost time to it on the same day (#41). `packages/policy-schema`'s workspace
+ * sweep already guards this way.
+ */
 function appPackageNames(): string[] {
   const appsDir = join(REPO_ROOT, "apps");
   return readdirSync(appsDir)
     .filter((entry) => statSync(join(appsDir, entry)).isDirectory())
+    .filter((entry) => existsSync(join(appsDir, entry, "package.json")))
     .map((entry) => readJson(join(appsDir, entry, "package.json")).name)
     .filter((name): name is string => typeof name === "string");
 }

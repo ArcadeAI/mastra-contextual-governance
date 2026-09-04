@@ -79,6 +79,21 @@ stage a beat we want to *show* as a layer-2 refusal. See open risk 2.
     packages/governance-core    Hook framework, policy engine, audit, event bus. Zero loan references.
     packages/policy-schema      Shared zod types for policy, events, hook payloads.
 
+⚠️ **`apps/idp` is not a workspace member and needs its own install.** Better Auth 1.7
+requires zod 4; the root manifest pins every workspace to zod 3 for the Arcade/Mastra path,
+and Bun applies root overrides across the whole workspace while ignoring nested ones. So
+`apps/idp` is excluded from `workspaces`, carries its own `bun.lock`, and a fresh clone needs
+**two** installs:
+
+    bun install
+    bun install --cwd apps/idp     # or `bun test` fails with "Cannot find module better-auth"
+
+That is a happy accident as much as a workaround — the service a forker deletes is also the
+one depending on nothing in the template, and it carries `"cg": { "external": true }` so
+`policy-schema`'s workspace sweep leaves it alone. But the second install is a real trap: a
+clone-and-run comes up looking broken. It belongs in the README (#24) and in the rehearsal
+runbook (#23).
+
 `apps/hooks` and `apps/loan-app` stay separate processes on purpose: one is the governed
 system, the other is the thing governing it. Forking means replacing `apps/loan-app`,
 `tools/loan` and the seed data, and touching nothing under `packages/`.
