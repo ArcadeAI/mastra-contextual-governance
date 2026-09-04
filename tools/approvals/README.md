@@ -6,19 +6,21 @@ minimum-sufficient approver and posts Slack Block Kit as the requester;
 
 Both are stubs at this point — see #18 and #19.
 
-## Why this one is different
+## How it ships
 
-Every other service in this repo is TypeScript and deploys from
-`render.yaml`. This one is Python and deploys with:
+Like its sibling [`tools/loan`](../loan/README.md), this is a Python
+`arcade-mcp` toolkit, and it deploys with:
 
 ```sh
 uv sync
 arcade deploy
 ```
 
-That is on purpose. Arcade hosts it, so it demonstrates how a forker authors
-their own governed custom toolkit — and it keeps the Render blueprint to the
-three services Render is actually responsible for.
+`arcade-mcp` is the framework the agent's tools are built with, and it is
+Python-only — so both toolkits are Python, while everything under `apps/` and
+`packages/` is TypeScript. The boundary is tool authoring, not domain. Arcade
+hosts the toolkits, which keeps the Render blueprint to the services Render is
+actually responsible for.
 
 Slack scopes are settled: the stock provider grants a user token with
 `chat:write`, and the tool must request four scopes, not three — `users:read`

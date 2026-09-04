@@ -1,10 +1,11 @@
 {
-  "name": "@cg/loan-mcp",
+  "name": "@cg/loan-app",
   "version": "0.0.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "bun --watch src/index.ts",
+    "dev:idp": "bun scripts/dev-idp.ts",
     "start": "bun src/index.ts",
     "typecheck": "tsc --noEmit",
     "build": "echo 'no build step — Bun runs TypeScript directly'"
@@ -14,7 +15,6 @@
     "governed": true
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.30.0",
     "zod": "3.25.76"
   },
   "devDependencies": {

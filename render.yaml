@@ -1,6 +1,7 @@
 # One blueprint provisions every service Render is responsible for: `web`,
-# `hooks`, `loan-mcp` and `idp`. `tools/approvals` is deliberately absent — it
-# is Python and ships via `arcade deploy`.
+# `hooks`, `loan-app` and `idp`. `tools/loan` and `tools/approvals` are
+# deliberately absent — they are Python `arcade-mcp` toolkits and ship via
+# `arcade deploy`.
 #
 # Every service uses runtime: docker. Render does not detect Bun, so the
 # runtime is declared explicitly rather than left to detection.
@@ -12,7 +13,7 @@
 # approved on stage are both still there after a restart. Getting back to a
 # clean state is `scripts/reset` (#23).
 #
-# cg-loan-mcp's and cg-idp's disks are below. cg-hooks' lands with #12, which
+# cg-loan-app's and cg-idp's disks are below. cg-hooks' lands with #12, which
 # owns governance.db's seeding.
 #
 # Services with disks give up zero-downtime deploys — Render stops the old
@@ -28,13 +29,14 @@
 # putting them in git. See `.env.example` for where to obtain each one.
 
 services:
-  # The governed business system. Registered in Arcade as a Remote MCP server.
+  # The governed business system: the bank's system of record, a plain HTTP
+  # API. Not an MCP server and not registered in Arcade — `tools/loan` calls it.
   - type: web
-    name: cg-loan-mcp
+    name: cg-loan-app
     runtime: docker
     plan: starter
     region: oregon
-    dockerfilePath: ./apps/loan-mcp/Dockerfile
+    dockerfilePath: ./apps/loan-app/Dockerfile
     dockerContext: .
     healthCheckPath: /health
     autoDeployTrigger: commit
@@ -54,6 +56,14 @@ services:
       # this also works unchanged against a bind mount or a local path.
       - key: LOANS_DB_PATH
         value: /data/loans.db
+      # Where bearer tokens are validated: the API asks this host's
+      # /oauth2/userinfo who the caller is. Derived from cg-idp the same way
+      # the other cross-service hosts are — host-form, consumer adds https.
+      - key: IDP_PUBLIC_HOST
+        fromService:
+          name: cg-idp
+          type: web
+          property: host
 
   # The control plane. Serves /access, /pre and /post to Arcade Cloud, owns the
   # policy and audit database, and fans decisions out to the UI over SSE.
@@ -81,9 +91,9 @@ services:
       # writing the hostname out: onrender.com subdomains are global, so a
       # taken name gets silently suffixed and a hardcoded URL would then
       # point at a stranger's service.
-      - key: LOAN_MCP_PUBLIC_HOST
+      - key: LOAN_APP_PUBLIC_HOST
         fromService:
-          name: cg-loan-mcp
+          name: cg-loan-app
           type: web
           property: host
 

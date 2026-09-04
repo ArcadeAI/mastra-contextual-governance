@@ -22,6 +22,12 @@ export interface LoanDecision {
   /** Dollars, present on approvals only. */
   amount: number | null;
   reason: string | null;
+  /**
+   * Who recorded it — the email the API derived from the caller's token.
+   * `null` only for decisions that came in with the seed, which predate the
+   * system and have no actor to name.
+   */
+  decided_by: string | null;
   decided_at: string;
 }
 
@@ -57,6 +63,7 @@ const decisionFixtureSchema = z.object({
   decision: z.enum(["approved", "denied"]),
   amount: z.number().nullable(),
   reason: z.string().nullable(),
+  decided_by: z.string().nullable().default(null),
   decided_at: z.string(),
 });
 
@@ -106,6 +113,7 @@ const SCHEMA = `
     decision   TEXT    NOT NULL CHECK (decision IN ('approved', 'denied')),
     amount     INTEGER,
     reason     TEXT,
+    decided_by TEXT,
     decided_at TEXT    NOT NULL
   );
 
@@ -130,8 +138,36 @@ export function openLoanBook(path: string): Database {
   db.exec("PRAGMA foreign_keys = ON");
 
   if (!hasSchema(db)) seed(db, fixtureSchema.parse(fixture).loans);
+  else upgradeSchema(db);
 
   return db;
+}
+
+/**
+ * Brings a database created by an earlier schema up to the current one,
+ * keeping every row. `hasSchema` only asks whether the `loans` table exists,
+ * which is the right question for "is this seeded?" and the wrong one for "is
+ * this current?": a `loans.db` on a persistent disk predates every column
+ * added after it, and without this it would open green and fail on the first
+ * query that named the new column.
+ *
+ * Every step here must be additive and idempotent — an `ALTER TABLE ... ADD
+ * COLUMN` guarded by a `PRAGMA table_info` check. A change that cannot be
+ * expressed that way is a reset, and resets are explicit (#23), never a side
+ * effect of booting.
+ */
+function upgradeSchema(db: Database): void {
+  // Added on #34: who recorded the decision, read off the caller's token.
+  if (!hasColumn(db, "loan_decisions", "decided_by")) {
+    db.exec("ALTER TABLE loan_decisions ADD COLUMN decided_by TEXT");
+  }
+}
+
+function hasColumn(db: Database, table: string, column: string): boolean {
+  return db
+    .query<{ name: string }, []>(`PRAGMA table_info(${table})`)
+    .all()
+    .some((row) => row.name === column);
 }
 
 function hasSchema(db: Database): boolean {
@@ -192,8 +228,8 @@ export function seed(db: Database, loans: LoanSeed[]): void {
     `);
 
     const insertDecision = db.prepare<unknown, NamedBindings>(`
-      INSERT INTO loan_decisions (loan_id, decision, amount, reason, decided_at)
-      VALUES ($loan_id, $decision, $amount, $reason, $decided_at)
+      INSERT INTO loan_decisions (loan_id, decision, amount, reason, decided_by, decided_at)
+      VALUES ($loan_id, $decision, $amount, $reason, $decided_by, $decided_at)
     `);
 
     try {
@@ -245,7 +281,7 @@ export function getLoan(db: Database, loanId: string): LoanRecord | null {
 
   const decisions = db
     .query<LoanDecision, { $loan_id: string }>(
-      `SELECT decision, amount, reason, decided_at
+      `SELECT decision, amount, reason, decided_by, decided_at
          FROM loan_decisions
         WHERE loan_id = $loan_id
         ORDER BY id ASC`,
@@ -261,6 +297,9 @@ export function getLoan(db: Database, loanId: string): LoanRecord | null {
  * Returns the updated record, or `null` if no such loan exists. Applies the
  * decision exactly as asked: any question of whether the caller should have
  * been able to make it was settled — or not — before the call reached here.
+ *
+ * `decided_by` is who made it, as the API read it off the caller's token. It
+ * is recorded, never consulted.
  */
 export function recordDecision(
   db: Database,
@@ -269,9 +308,11 @@ export function recordDecision(
     decision: "approved" | "denied";
     amount: number | null;
     reason: string | null;
+    decided_by?: string | null;
   },
 ): LoanRecord | null {
   const decided_at = new Date().toISOString();
+  const decided_by = input.decided_by ?? null;
 
   const applied = db.transaction(() => {
     const exists = db
@@ -283,9 +324,18 @@ export function recordDecision(
     if (exists === null) return false;
 
     db.query<unknown, NamedBindings>(
-      `INSERT INTO loan_decisions (loan_id, decision, amount, reason, decided_at)
-       VALUES ($loan_id, $decision, $amount, $reason, $decided_at)`,
-    ).run(bind({ ...input, decided_at }));
+      `INSERT INTO loan_decisions (loan_id, decision, amount, reason, decided_by, decided_at)
+       VALUES ($loan_id, $decision, $amount, $reason, $decided_by, $decided_at)`,
+    ).run(
+      bind({
+        loan_id: input.loan_id,
+        decision: input.decision,
+        amount: input.amount,
+        reason: input.reason,
+        decided_by,
+        decided_at,
+      }),
+    );
 
     db.query("UPDATE loans SET status = $status WHERE loan_id = $loan_id").run({
       $status: input.decision,
