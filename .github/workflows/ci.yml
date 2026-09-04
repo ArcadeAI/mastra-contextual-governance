@@ -86,6 +86,14 @@ jobs:
       fail-fast: false
       matrix:
         service: [hooks, loan-app, web, idp]
+        include:
+          # cg-idp refuses to boot under NODE_ENV=production without a
+          # BETTER_AUTH_SECRET, on purpose: on Render the secret is generated
+          # once and encrypts the OAuth client secret at rest, and a boot that
+          # silently fell back to a known key would be worse than no boot. The
+          # smoke test hands it a throwaway one.
+          - service: idp
+            smoke_env: -e BETTER_AUTH_SECRET=ci-smoke-only-not-a-real-secret-0000
     steps:
       - uses: actions/checkout@v4
 
@@ -113,7 +121,7 @@ jobs:
       # network beyond localhost: every service seeds or stubs on its own.
       - name: Boot and check /health
         run: |
-          docker run -d --name svc -p 8080:8080 -e PORT=8080 cg-${{ matrix.service }}:ci
+          docker run -d --name svc -p 8080:8080 -e PORT=8080 ${{ matrix.smoke_env }} cg-${{ matrix.service }}:ci
           for i in $(seq 1 30); do
             if curl -fsS http://localhost:8080/health; then echo; exit 0; fi
             sleep 1
