@@ -20,6 +20,23 @@ const DANA = "dana@example.test";
 const RILEY = "riley@example.test";
 const TOKENS: Record<string, string> = { "tok-dana": DANA, "tok-riley": RILEY };
 
+/**
+ * A port the OS says is free, rather than a guess.
+ *
+ * This used to be `8000 + Math.floor(Math.random() * 1000)`. With one test run
+ * that collides rarely; with several worktrees running `bun test` at once it is
+ * a birthday problem, and it surfaces as an intermittent failure in a slice
+ * that changed nothing — the worst thing to hand a reviewer, because it makes
+ * them distrust their own verification. Bind :0, read the port back, release
+ * it. `tools/loan/tests/conftest.py::_free_port` does the same thing.
+ */
+function freePort(): number {
+  const probe = Bun.serve({ port: 0, fetch: () => new Response(null, { status: 404 }) });
+  const { port } = probe;
+  probe.stop(true);
+  return port;
+}
+
 let idp: Server<unknown>;
 let child: Subprocess;
 let baseUrl: string;
@@ -39,7 +56,7 @@ beforeAll(async () => {
     },
   });
 
-  const port = 8000 + Math.floor(Math.random() * 1000);
+  const port = freePort();
   baseUrl = `http://127.0.0.1:${port}`;
 
   child = Bun.spawn(["bun", join(import.meta.dir, "..", "src", "index.ts")], {
