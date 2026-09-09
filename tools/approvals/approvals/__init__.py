@@ -117,7 +117,8 @@ def describe_rule(
 ) -> str:
     """The policy rule that was tripped, in words the approver reads.
 
-    The control plane names it when it can. When it cannot, this says the thing
+    `rule` rides on the approval record itself, so the DM and #19's page cannot
+    answer the question differently. The control plane names it when it can. When it cannot, this says the thing
     the toolkit does know for certain from the roster it just routed against —
     the requester's authority, and that the amount exceeded it. A message that
     left this blank would be a message the approver has to go and ask about,
@@ -236,7 +237,7 @@ async def request_approval(
         resource_id=resource_id,
         amount=amount,
         justification=justification,
-        rule_tripped=describe_rule(created.get("rule"), requester, action, amount),
+        rule_tripped=describe_rule(record.get("rule"), requester, action, amount),
         approval_url=approval_url(web_host, str(request_id)),
         candidate_display_names=tuple(
             s.display_name or s.user_id for s in routed.candidates

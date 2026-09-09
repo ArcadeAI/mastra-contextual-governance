@@ -8,38 +8,29 @@ open. So the request is persisted where `DESIGN.md` says approvals live:
 `governance.db`, owned by `apps/hooks`, reached over the public internet the
 same way Arcade reaches the hooks themselves.
 
-`apps/hooks` does not serve these three endpoints yet — #12 is the service and
-#19 is the approval flow. What lands here is the client and the contract, driven
-in the tests against a stand-in server (the pattern `tools/loan/tests` uses for
-`/oauth2/userinfo`). Read the shape below as the specification the endpoint has
-to meet.
+`apps/hooks` does not serve these four endpoints yet — #12 is the service and
+#19 is the approval flow. What lands here is the client and the contract.
 
-    GET  /approvals/roster
-      -> 200 {"subjects": [{user_id, display_name, role, clearance, attributes?}, …]}
-         Everyone the control plane knows about. Routing needs the whole roster,
-         because "who was *not* asked" is as load-bearing as who was.
+**The contract is written down in Markdown, not here.** See "The approvals
+store contract" in `tools/approvals/README.md`: request and response bodies,
+the one record shape every endpoint returns, and the authorization rule. A #19
+implementer works in TypeScript and should not have to read Python to build
+against it, and one copy cannot drift from the other. `tests/conftest.py`
+implements that contract and `tests/test_store_contract.py` drives every
+endpoint of it over real HTTP, so the prose has an executable counterpart.
 
-    POST /approvals
-      <- {requester_id, action, resource_id, amount, justification,
-          approver_id, candidate_approver_ids, required_clearance}
-      -> 201 {"request": <ApprovalRequest>, "rule": {"id", "description"} | null}
-         The store mints `id` and `created_at`: a server clock and a server id.
-         The toolkit must not invent the id, because an id the model could
-         predict is an id it could ask about before anyone approved it.
-         `action` is a bare action name, not a fully-qualified tool — resolving
-         it to a `ToolMatcher` needs the catalogue, which the control plane has
-         and this toolkit deliberately does not.
-         `rule` is the policy rule the blocked call tripped, when the control
-         plane can name it; `null` when it cannot, and the message says so in
-         words the approver can still act on.
+The four endpoints, in one line each:
 
-    POST /approvals/{id}/decision
-      <- {decision: "approved"|"denied", note: string|null, decided_by}
-      -> 200 {"request": <ApprovalRequest>}
-         Recording, not deciding. Whether this caller may decide is a `/pre`
-         question about `Approvals.Decide`, answered by the hooks before this
-         request is ever made — #19 owns that, and the enforcement is the point
-         of the slice, not this write.
+    GET  /approvals/roster        every subject the control plane knows, for routing
+    POST /approvals               create; the store mints the id and the clock
+    GET  /approvals/{id}          read one by opaque id — #19's page, not this toolkit
+    POST /approvals/{id}/decision record an outcome
+
+Three of them have a client below. `GET /approvals/{id}` deliberately does not:
+nothing in this toolkit reads a request back, #19 reads it from TypeScript, and
+a Python client nobody calls is dead code in a deployed worker. It is covered
+by `test_store_contract.py` instead, which drives it with a plain HTTP client —
+the contract is exercised without inventing a caller for it.
 
 `decided_by` and `requester_id` travel in the body, and that is worth being
 explicit about because `apps/loan-app` deliberately does the opposite. There,
@@ -47,8 +38,9 @@ the actor comes from the OAuth token and never from a parameter, because the
 model chooses the arguments. Here the value is `context.user_id` — Arcade's
 identity for the caller, read server-side inside the tool, not a tool argument
 the model can write. The model cannot reach it. What stops an unrelated caller
-reaching the endpoint is `APPROVALS_STORE_TOKEN`: without it, anyone on the
-internet could manufacture the approval request a human then acts on.
+reaching the endpoints is `APPROVALS_STORE_TOKEN`, required on **all four**:
+without it, anyone on the internet could manufacture the approval request a
+human then acts on, or read one.
 """
 
 from __future__ import annotations

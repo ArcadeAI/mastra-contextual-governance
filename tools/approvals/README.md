@@ -12,7 +12,14 @@ Python while everything under `apps/` and `packages/` is TypeScript. The
 boundary is tool authoring, not domain.
 
 A forker who wants no Python deletes this directory and `tools/loan`, and
-substitutes their own tools. Nothing under `packages/` imports either one.
+substitutes their own tools. Nothing under `packages/` imports either one, and
+CI discovers the toolkits it tests rather than listing them
+(`scripts/list-toolkits.sh`), so a deleted toolkit is not a red build.
+
+`tests/test_isolation.py::TestDeletingItActuallyWorks` performs that deletion
+against a throwaway copy of the repo and checks what is left — discovery, the
+workflows, the TypeScript, and the shared routing cases that must survive it.
+Reasoning about a deletion and doing it are not the same evidence.
 
 ## The two tools
 
@@ -107,22 +114,124 @@ runs in `apps/web` and has to read the record the tool wrote. So the request is
 persisted where `DESIGN.md` says approvals live: `governance.db`, owned by
 `apps/hooks`, reached over HTTP the same way Arcade reaches the hooks.
 
-`approvals/store.py` is that client, and its module docstring is the contract:
+⚠️ **`apps/hooks` does not serve these endpoints yet, and storage-A is
+provisional — the human has not ratified it.** #12 is the service and #19 is
+the approval flow. What lands in this slice is the client and the contract
+below, implemented by a stand-in server in `tests/conftest.py` and driven over
+real HTTP by `tests/test_store_contract.py`.
 
-    GET  /approvals/roster              -> { subjects: [...] }
-    POST /approvals                     -> { request: ApprovalRequest, rule: {...}|null }
-    POST /approvals/{id}/decision       -> { request: ApprovalRequest }
+## The approvals store contract
 
-⚠️ **`apps/hooks` does not serve these three endpoints yet.** #12 is the
-service and #19 is the approval flow. What lands in this slice is the client
-and the contract, driven in the tests against a stand-in server that implements
-exactly that shape (`tests/conftest.py`), the way `tools/loan/tests` drives a
-stand-in `/oauth2/userinfo`. Read `FakeStore` as the specification the real
-endpoint has to meet.
+Four endpoints on `apps/hooks`. Written out here rather than left in a Python
+docstring, because whoever builds #19 works in TypeScript and should not have
+to read Python to build against it.
 
-The store mints the request id and the creation timestamp — a server clock and
-a server id. An id this toolkit invented would be an id the caller could
-predict.
+**Every endpoint requires `Authorization: Bearer $APPROVALS_STORE_TOKEN`**, the
+same value both sides read from the environment. A request without it, or with
+the wrong one, is `401` and does nothing. This is not ceremony: without it
+anyone on the internet could manufacture the approval request a human then acts
+on, or read one they were never sent.
+
+### The record
+
+One shape, returned by every endpoint that returns a request. `POST /approvals`,
+`GET /approvals/{id}` and `POST /approvals/{id}/decision` return the *same*
+fields — a page that can render the read is a page that can render the write.
+
+| field | type | notes |
+|---|---|---|
+| `id` | string | Opaque. Minted by the store, never by a caller. |
+| `requester_id` | string | Email. The `context.user_id` of whoever was refused. |
+| `requester_display_name` | string | From the roster, so the page need not join. |
+| `approver_id` | string | Email of the one person routing chose. |
+| `approver_display_name` | string | |
+| `candidate_approver_ids` | string[] | Everyone sufficient, lowest clearance first. `[0]` is the approver; the rest are who was deliberately not bothered. |
+| `action` | string | The refused action, e.g. `approve_loan`. |
+| `resource_id` | string | e.g. `LN-2291`. |
+| `amount` | number | What determines who has the authority. |
+| `required_clearance` | number | The bar a candidate had to clear: the amount. |
+| `rule` | `{id, description}` \| null | The policy rule the blocked call tripped, when the control plane can name it. `null` when it cannot — the page and the DM both still state the authority that was exceeded. |
+| `justification` | string | The requester's own words, rendered verbatim. |
+| `status` | `pending` \| `approved` \| `denied` \| `expired` | |
+| `created_at` | string | ISO 8601, `Z`-suffixed UTC, as `@cg/policy-schema`'s `Timestamp` requires. |
+| `decided_at` | string \| null | `null` while pending. |
+| `decided_by` | string \| null | Email of whoever decided. `null` while pending. |
+| `note` | string \| null | The approver's note. `null` while pending or if none was given. |
+
+There is deliberately **no separate `decision` field**: once decided, `status`
+*is* the decision. Two fields carrying the same fact is two fields that can
+disagree, and a page that rendered "approved" beside a status of `denied` would
+be worse than one that rendered nothing.
+
+`rule` lives on the record rather than beside it, so the read and the write
+cannot answer the question differently.
+
+### `GET /approvals/roster`
+
+Every subject the control plane knows about. Routing needs the whole roster,
+because who was *not* asked is as load-bearing as who was.
+
+```json
+200 { "subjects": [ { "user_id": "riley@…", "display_name": "Riley",
+                      "role": "vp_credit", "clearance": 250000,
+                      "attributes": {} } ] }
+```
+
+### `POST /approvals`
+
+```json
+<- { "requester_id": "dana@…", "action": "approve_loan",
+     "resource_id": "LN-2291", "amount": 95000,
+     "justification": "…", "approver_id": "riley@…",
+     "candidate_approver_ids": ["riley@…", "morgan@…"],
+     "required_clearance": 95000 }
+
+-> 201 { "request": <the record above, status "pending"> }
+```
+
+The store mints `id` and `created_at` — a server clock and a server id. An id
+the toolkit invented would be an id the model could predict, and therefore ask
+about before anyone had approved it.
+
+`action` is a bare action name, not a fully-qualified tool. Resolving it to a
+`ToolMatcher` needs the catalogue, which the control plane has and this toolkit
+deliberately does not.
+
+### `GET /approvals/{id}`
+
+```json
+-> 200 { "request": <the record above> }
+-> 404 { "error": "no approval request apr_…" }
+```
+
+**This is the endpoint #19's page is built on.** The link in the Slack message
+carries the id and nothing else — no token, no signature, no capability — so
+this response has to be enough to render the whole page: who asked, what for,
+how much, which rule, and why. That is what the record above is sized to.
+
+Answering `200` here is *not* authorization. The requester can read the DM she
+sent, so anyone who has the link can reach this. Whether the person looking may
+*decide* is settled at click time by a `/pre` decision on `Approvals.Decide` —
+#19's job, and the beat the demo exists to show.
+
+### `POST /approvals/{id}/decision`
+
+```json
+<- { "decision": "approved" | "denied", "note": string | null,
+     "decided_by": "riley@…" }
+
+-> 200 { "request": <the record above, status now the decision> }
+-> 404 { "error": "no approval request apr_…" }
+```
+
+Recording, not deciding. Whether the caller may decide — role, authority, and
+requester ≠ approver — is answered before this request is ever made.
+
+`decided_by` travels in the body, and that is worth being explicit about
+because `apps/loan-app` deliberately does the opposite: there the actor comes
+from the OAuth token and never from a parameter, because the model chooses the
+arguments. Here the value is `context.user_id`, read server-side inside the
+tool. It is not a tool argument and the model cannot reach it.
 
 ## Configuration
 
@@ -148,7 +257,16 @@ uv run --extra dev pytest        # boots stand-in store and Slack on OS-assigned
 uv run server.py http            # Streamable HTTP on 127.0.0.1:8000
 ```
 
-Nothing in the suite binds a fixed port and nothing reaches the internet.
+Nothing in the suite binds a fixed port and nothing reaches the internet. The
+five files, and what each pins:
+
+| file | |
+|---|---|
+| `test_routing.py` | agreement with #9's TypeScript, row for row |
+| `test_message.py` | the Block Kit payload, and that its link carries no authority |
+| `test_tools.py` | both tools end to end, against real HTTP stand-ins |
+| `test_store_contract.py` | every endpoint of the store contract above, including the `GET` #19 needs and the bearer on all four |
+| `test_isolation.py` | that deleting this directory really is supported |
 
 ## Deploy
 

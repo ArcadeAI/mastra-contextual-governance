@@ -6,9 +6,12 @@ so nothing in this suite can collide with a dev server or with another
 worktree's port block, and the tools reach them over the wire exactly as they
 would reach the real thing. What the tests then assert is what actually arrived.
 
-`FakeStore` doubles as the executable specification of the contract
-`approvals/store.py` documents. When #19 implements those endpoints in
-`apps/hooks`, this file is what they have to satisfy.
+`_StoreHandler` doubles as the executable specification of the contract written
+out under "The approvals store contract" in `tools/approvals/README.md`. When
+#19 implements those endpoints in `apps/hooks`, this file is what they have to
+satisfy, and `test_store_contract.py` is what says so out loud — including the
+`GET /approvals/{id}` read that #19's page is built on and that nothing in this
+toolkit calls.
 
 `FakeSlack` is a Slack that answers the way Slack answers: `200 OK` with
 `{"ok": false, "error": …}` for a refusal, which is the shape a client that
@@ -53,11 +56,36 @@ CAST = [SUBJECTS[key] for key in CASES["cast"]]
 # ---------------------------------------------------------------------------
 
 
+#: Every field the contract in `tools/approvals/README.md` says a record
+#: carries. Named here so the stand-in and the tests agree on completeness, and
+#: so a field dropped from the record is a failing test rather than a page in
+#: #19 that renders a blank.
+RECORD_FIELDS = (
+    "id",
+    "requester_id",
+    "requester_display_name",
+    "approver_id",
+    "approver_display_name",
+    "candidate_approver_ids",
+    "action",
+    "resource_id",
+    "amount",
+    "required_clearance",
+    "rule",
+    "justification",
+    "status",
+    "created_at",
+    "decided_at",
+    "decided_by",
+    "note",
+)
+
+
 @dataclass
 class StoreState:
     roster: list[dict[str, Any]]
-    #: What `POST /approvals` returns as `rule`. `None` exercises the branch
-    #: where the control plane cannot name the rule.
+    #: The policy rule the blocked call tripped, carried on every record.
+    #: `None` exercises the branch where the control plane cannot name it.
     rule: dict[str, str] | None = None
     #: Every request body the toolkit sent, so a test can assert what was persisted.
     created: list[dict[str, Any]] = field(default_factory=list)
@@ -89,6 +117,13 @@ class _StoreHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         return json.loads(self.rfile.read(length) or b"{}")
 
+    def _display_name(self, user_id: str) -> str:
+        """From the roster, so #19's page never has to join two responses."""
+        for subject in self.state.roster:
+            if subject["user_id"] == user_id:
+                return str(subject["display_name"])
+        return user_id
+
     def do_GET(self) -> None:  # noqa: N802
         if not self._authorised():
             self._send(401, {"error": "unauthorised"})
@@ -96,6 +131,18 @@ class _StoreHandler(BaseHTTPRequestHandler):
         if self.path == "/approvals/roster":
             self._send(200, {"subjects": self.state.roster})
             return
+
+        # The read #19's approval page is built on. Nothing in this toolkit
+        # calls it; it is here because the contract has to be executable.
+        if self.path.startswith("/approvals/"):
+            request_id = self.path.removeprefix("/approvals/")
+            record = self.state.records.get(request_id)
+            if record is None:
+                self._send(404, {"error": f"no approval request {request_id}"})
+                return
+            self._send(200, {"request": record})
+            return
+
         self._send(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
@@ -117,18 +164,24 @@ class _StoreHandler(BaseHTTPRequestHandler):
             record = {
                 "id": f"apr_{self.state.seq:012x}",
                 "requester_id": body["requester_id"],
+                "requester_display_name": self._display_name(body["requester_id"]),
                 "approver_id": body["approver_id"],
+                "approver_display_name": self._display_name(body["approver_id"]),
                 "candidate_approver_ids": body["candidate_approver_ids"],
+                "action": body["action"],
                 "resource_id": body["resource_id"],
-                "justification": body["justification"],
+                "amount": body["amount"],
                 "required_clearance": body["required_clearance"],
+                "rule": self.state.rule,
+                "justification": body["justification"],
                 "status": "pending",
-                "note": None,
                 "created_at": "2026-09-09T12:00:00.000Z",
                 "decided_at": None,
+                "decided_by": None,
+                "note": None,
             }
             self.state.records[record["id"]] = record
-            self._send(201, {"request": record, "rule": self.state.rule})
+            self._send(201, {"request": record})
             return
 
         if self.path.startswith("/approvals/") and self.path.endswith("/decision"):
@@ -139,11 +192,14 @@ class _StoreHandler(BaseHTTPRequestHandler):
                 return
             body = self._body()
             self.state.decisions.append({"request_id": request_id, **body})
+            # The same complete shape the create and the read return. There is
+            # no separate `decision` field: once decided, `status` is it.
             record = {
                 **record,
                 "status": body["decision"],
                 "note": body["note"],
                 "decided_at": "2026-09-09T12:05:00.000Z",
+                "decided_by": body["decided_by"],
             }
             self.state.records[request_id] = record
             self._send(200, {"request": record})
