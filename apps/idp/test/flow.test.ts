@@ -71,6 +71,14 @@ function freePort(): number {
   const probe = Bun.serve({ port: 0, fetch: () => new Response(null, { status: 404 }) });
   const { port } = probe;
   probe.stop(true);
+  // `Server.port` is `number | undefined` in bun-types 1.4: a server listening
+  // on a unix socket has no port. This one asked for TCP `:0`, so the branch
+  // should be unreachable — but `port!` would hand `PORT=undefined` to the
+  // child and surface twenty seconds later as "idp did not come up", which
+  // says nothing about the cause. Fail here, where the cause is.
+  if (typeof port !== "number") {
+    throw new Error(`Bun.serve({ port: 0 }) reported no port (got ${String(port)})`);
+  }
   return port;
 }
 
@@ -288,6 +296,27 @@ async function userinfo(accessToken: string): Promise<Record<string, unknown>> {
   expect(response.status).toBe(200);
   return (await response.json()) as Record<string, unknown>;
 }
+
+describe("the fixture's port probe", () => {
+  // The whole fixture rests on this: `beforeAll` takes a port from `freePort`
+  // and hands it to a child process. A probe that returned a port nobody can
+  // bind would fail as a twenty-second boot timeout in every test below, so
+  // assert the property here, where it names itself.
+  test("hands back a port the OS will actually let us bind", () => {
+    const port = freePort();
+
+    expect(Number.isInteger(port)).toBe(true);
+    expect(port).toBeGreaterThan(1024);
+
+    // Free means free: the probe released it, so this can take it.
+    const claim = Bun.serve({ port, fetch: () => new Response("ok") });
+    try {
+      expect(claim.port).toBe(port);
+    } finally {
+      claim.stop(true);
+    }
+  });
+});
 
 describe("health", () => {
   test("answers for Render's health check and names the endpoints", async () => {
