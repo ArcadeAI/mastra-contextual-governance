@@ -11,11 +11,18 @@
  *
  * The four pure modules: #7 (PolicyEngine, `./policy-engine.ts`), #8
  * (RedactionEngine), #9 (ApproverRouter, `./approver-router.ts`) and #10
- * (GrantChecker).
+ * (GrantChecker, `./grant-checker.ts`).
  */
 import { type Decision } from "@cg/policy-schema";
 
-export { Decision, Effect, GovernanceEvent, HookPoint } from "@cg/policy-schema";
+export {
+  Decision,
+  Effect,
+  GovernanceEvent,
+  GRANT_REJECTION_KINDS,
+  GrantRejectionReason,
+  HookPoint,
+} from "@cg/policy-schema";
 
 export {
   attestGrantValidated,
@@ -35,6 +42,18 @@ export {
   type ValidatedGrant,
   type VisibilityDecision,
 } from "./policy-engine.ts";
+
+export {
+  checkGrant,
+  consumeGrant,
+  describeGrantRejection,
+  isGrantRejection,
+  selectGrant,
+  type GrantCheck,
+  type GrantCheckResult,
+  type GrantRejection,
+  type GrantSelection,
+} from "./grant-checker.ts";
 
 export { routeApproval, type RoutingResult } from "./approver-router.ts";
 
