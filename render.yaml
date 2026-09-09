@@ -13,8 +13,8 @@
 # approved on stage are both still there after a restart. Getting back to a
 # clean state is `scripts/reset` (#23).
 #
-# cg-loan-app's and cg-idp's disks are below. cg-hooks' lands with #12, which
-# owns governance.db's seeding.
+# All three database-owning services — cg-loan-app, cg-hooks, cg-idp — mount
+# a disk below.
 #
 # Services with disks give up zero-downtime deploys — Render stops the old
 # instance before starting the new one. Irrelevant for a demo.
@@ -74,16 +74,49 @@ services:
     region: oregon
     dockerfilePath: ./apps/hooks/Dockerfile
     dockerContext: .
+    # Returns 503 while the policy fails to load (a hand-edited rule that no
+    # longer compiles), so an unhealthy control plane is visible here rather
+    # than as every tool call failing.
     healthCheckPath: /health
     autoDeployTrigger: commit
+    # Delete this block to run the control plane ephemerally and pay nothing
+    # for storage — the service re-seeds itself from the fixture on every
+    # boot, and a rule edited on stage is gone at the next restart. Fine for a
+    # look at the demo, wrong for the demo itself (PRD story 30). 1 GB, the
+    # minimum, and it is one `disk:` key away from gone.
+    disk:
+      name: governance
+      mountPath: /data
+      sizeGB: 1
     envVars:
       - key: PORT
         value: 8080
+      # On the disk, not /tmp. Seeded from the fixture only when there is no
+      # schema; after that, edits persist across restarts and redeploys.
+      # Resetting is `scripts/reset` (#23), never a redeploy.
       - key: GOVERNANCE_DB_PATH
-        value: /tmp/governance.db
+        value: /data/governance.db
+      # The bearer token Arcade presents on /access, /pre and /post. Set the
+      # same value on the hook extension in the Arcade dashboard (#13).
       - key: ARCADE_HOOK_SIGNING_SECRET
         sync: false
+      # `tool.toolkit` as Arcade files the deployed toolkits — measured on
+      # #35 (Loan) and derived for Approvals until #18 deploys it. The seeded
+      # rules are keyed on these; a wrong value fails loudly at boot.
       - key: ARCADE_LOAN_TOOLKIT
+        sync: false
+      - key: ARCADE_APPROVALS_TOOLKIT
+        sync: false
+      # The persona emails, same values as cg-web's and cg-idp's — the join
+      # key across the whole system. Read only when governance.db is first
+      # seeded.
+      - key: PERSONA_DANA_EMAIL
+        sync: false
+      - key: PERSONA_SAM_EMAIL
+        sync: false
+      - key: PERSONA_RILEY_EMAIL
+        sync: false
+      - key: PERSONA_MORGAN_EMAIL
         sync: false
       # `fromService` emits a bare host, never a scheme, and blueprints have
       # no string interpolation — so the contract for cross-service addresses

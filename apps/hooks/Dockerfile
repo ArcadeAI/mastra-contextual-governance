@@ -18,8 +18,12 @@ RUN bun install --frozen-lockfile --production --filter '@cg/hooks' --filter '@c
 
 COPY tsconfig.base.json ./
 COPY packages ./packages
-COPY apps/hooks ./apps/hooks
+# `src` only — `test/` and `scripts/bench.ts` have no business in the image.
+# The seed fixture lives under src/fixtures, so it ships.
+COPY apps/hooks/src ./apps/hooks/src
 
 ENV NODE_ENV=production
+# Render injects PORT itself; this default makes a local `docker run -p` match EXPOSE.
+ENV PORT=8080
 EXPOSE 8080
 CMD ["bun", "apps/hooks/src/index.ts"]

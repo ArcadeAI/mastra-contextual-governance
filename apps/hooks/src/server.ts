@@ -1,0 +1,261 @@
+/**
+ * The HTTP layer. Thin on purpose: bearer auth, parse, hand to a handler,
+ * append the audit rows, respond. The one piece of behaviour that is its own
+ * is the fail-closed net around all of that.
+ *
+ * Fails closed, and the failure is audited. Whatever goes wrong between the
+ * request arriving and the response leaving — an unparseable body, a throw in
+ * the engine, the audit write itself failing, our own deadline passing — the
+ * answer Arcade gets is a denial, and rows saying why are appended if the
+ * store will take them. A `/access` whose body cannot be read at all gets a
+ * 5xx, which Arcade's `failure_mode: fail_closed` (set on #13) turns into a
+ * denial of every tool the call was about; everything else gets a well-formed
+ * denying response, because that is precise where a 5xx is blunt.
+ *
+ * The deadline is ours, inside Arcade's 5s, and it is a *budget*, checked at
+ * every stage boundary: after the body is read (the one asynchronous step,
+ * which is raced against a timer), after the policy is evaluated, and before
+ * the audit rows are written. JavaScript cannot interrupt synchronous work,
+ * so a slow evaluation runs to completion — but its result is then discarded,
+ * the call is denied, and the row says `Timeout`. What never happens is an
+ * allow being returned late enough that Arcade has already given up, or an
+ * allow being recorded for a call that was in fact denied.
+ */
+import type { Database } from "bun:sqlite";
+import { createHash, timingSafeEqual } from "node:crypto";
+
+import {
+  AccessHookRequest,
+  HOOK_CONTRACT_VERSION,
+  HOOK_ENDPOINT_PATHS,
+  PostHookRequest,
+  PreHookRequest,
+  type AccessHookResult,
+  type ErrorResponse,
+  type GovernanceEvent,
+  type HookPoint,
+  type PreHookResult,
+} from "@cg/policy-schema";
+
+import { count as auditCount, newEventId, record } from "./audit-log.ts";
+import type { HooksConfig } from "./config.ts";
+import { withCorrelation } from "./correlation.ts";
+import { handleAccess, handlePost, handlePre, type HandlerContext, type Outcome } from "./handlers.ts";
+import type { PolicyCache } from "./policy-cache.ts";
+import { counts } from "./policy-store.ts";
+
+export const SERVICE = "hooks";
+
+export interface ServerDeps {
+  config: HooksConfig;
+  db: Database;
+  cache: PolicyCache;
+  log?: (line: string) => void;
+}
+
+type HookPath = (typeof HOOK_ENDPOINT_PATHS)[keyof typeof HOOK_ENDPOINT_PATHS];
+
+const HOOK_BY_PATH: Record<string, HookPoint> = {
+  [HOOK_ENDPOINT_PATHS.accessHook]: "access",
+  [HOOK_ENDPOINT_PATHS.preHook]: "pre",
+  [HOOK_ENDPOINT_PATHS.postHook]: "post",
+};
+
+class Timeout extends Error {
+  constructor(budgetMs: number, elapsedMs: number, stage: string) {
+    super(`${stage} exceeded the ${budgetMs}ms hook budget (${Math.round(elapsedMs)}ms elapsed)`);
+    this.name = "Timeout";
+  }
+}
+
+export function createServer(deps: ServerDeps) {
+  const { config, db, cache } = deps;
+  const log = deps.log ?? ((line: string) => console.log(`[${SERVICE}] ${line}`));
+  const ctx: HandlerContext = { now: () => new Date().toISOString(), newId: newEventId };
+
+  const authorized = (request: Request): boolean => {
+    const header = request.headers.get("authorization") ?? "";
+    const token = header.startsWith("Bearer ") ? header.slice("Bearer ".length).trim() : "";
+    // Hash both sides so lengths match, then compare in constant time.
+    const digest = (s: string) => createHash("sha256").update(s).digest();
+    return token.length > 0 && timingSafeEqual(digest(token), digest(config.signingSecret));
+  };
+
+  const json = (body: unknown, status = 200): Response => Response.json(body, { status });
+
+  /**
+   * Parse → handle, for one hook. Throws on anything it cannot turn into a
+   * decision; `handleHook` below converts that into the fail-closed response.
+   */
+  const evaluate = (hook: HookPoint, body: unknown): Outcome<unknown> => {
+    const state = cache.current();
+
+    switch (hook) {
+      case "access":
+        return handleAccess(AccessHookRequest.parse(body), state, ctx);
+      case "pre":
+        return handlePre(PreHookRequest.parse(body), state, ctx);
+      case "post":
+        return handlePost(PostHookRequest.parse(body), state, ctx);
+    }
+  };
+
+  /**
+   * The net. Builds the denying response for `hook` and audits the failure,
+   * using whatever of the raw body can be read to say who and what it was
+   * about. Never throws: if even the audit write fails, the denial still goes
+   * out and the log carries both errors.
+   */
+  const failClosed = (hook: HookPoint, raw: unknown, cause: unknown): Response => {
+    const error = cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
+    const id = newEventId();
+    const body = (raw !== null && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+    const toolInfo = (body.tool ?? {}) as Record<string, unknown>;
+    const context = (body.context ?? {}) as Record<string, unknown>;
+    const str = (v: unknown, fallback = ""): string => (typeof v === "string" ? v : fallback);
+
+    const userId = hook === "access" ? str(body.user_id) : str(context.user_id);
+    const reasonFor = (tool: string): string =>
+      `FAIL-CLOSED: the control plane could not evaluate this ${hook} request (${error}). ` +
+      `Do not retry ${tool}; report the reference to an administrator.`;
+    const ts = ctx.now();
+    const row = (eventId: string, tool: string): GovernanceEvent => ({
+      id: eventId,
+      ts,
+      execution_id: str(body.execution_id),
+      hook,
+      user_id: userId,
+      tool,
+      decision: "deny",
+      reason: reasonFor(tool),
+      rule_id: null,
+    });
+    const audit = (events: GovernanceEvent[]): void => {
+      try {
+        record(db, events);
+      } catch (auditCause) {
+        log(`AUDIT WRITE FAILED while failing closed (${id}): ${String(auditCause)}`);
+      }
+    };
+
+    if (hook === "access") {
+      // Deny everything the request named, one row per tool, as the normal
+      // path would have written. If even that cannot be read, one row for the
+      // request and a 5xx: the one signal left, and Arcade's fail_closed mode
+      // makes it a denial.
+      const parsed = AccessHookRequest.safeParse(body);
+      if (parsed.success) {
+        const events: GovernanceEvent[] = [];
+        for (const [toolkit, info] of Object.entries(parsed.data.toolkits)) {
+          for (const name of Object.keys(info.tools ?? {})) {
+            events.push(row(events.length === 0 ? id : newEventId(), `${toolkit}.${name}`));
+          }
+        }
+        audit(events);
+        const response: AccessHookResult = { deny: parsed.data.toolkits };
+        return json(response);
+      }
+      audit([row(id, "*")]);
+      const response: ErrorResponse = { error: withCorrelation(reasonFor("*"), id), code: "CHECK_FAILED" };
+      return json(response, 500);
+    }
+
+    const tool = `${str(toolInfo.toolkit, "?")}.${str(toolInfo.name, "?")}`;
+    audit([row(id, tool)]);
+
+    const response: PreHookResult = {
+      code: "CHECK_FAILED",
+      error_message: withCorrelation(reasonFor(tool), id),
+    };
+    return json(response);
+  };
+
+  const handleHook = async (hook: HookPoint, request: Request): Promise<Response> => {
+    const started = performance.now();
+    const elapsed = () => performance.now() - started;
+    /** The budget check at a stage boundary. Throws `Timeout` once it is spent. */
+    const checkBudget = (stage: string): void => {
+      if (elapsed() > config.deadlineMs) throw new Timeout(config.deadlineMs, elapsed(), stage);
+    };
+    /** The one asynchronous step, raced so a stalled body read cannot hang the call. */
+    const readBody = (): Promise<string> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const deadline = new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Timeout(config.deadlineMs, elapsed(), "reading the request body")),
+          config.deadlineMs,
+        );
+      });
+      return Promise.race([request.text(), deadline]).finally(() => clearTimeout(timer));
+    };
+
+    // Read the body once; the fail-closed path needs it for the audit rows.
+    let raw: unknown = null;
+    let outcome: Outcome<unknown> | null = null;
+    let response: Response;
+    try {
+      const text = await readBody();
+      raw = text.length > 0 ? JSON.parse(text) : null;
+      checkBudget("parsing the request");
+      const evaluated = evaluate(hook, raw);
+      // Over budget after evaluating: the decision is discarded, not recorded,
+      // and the call is denied. Arcade may already have given up on us; what
+      // must not happen is an allow row for a call that was in fact refused.
+      checkBudget("evaluating the policy");
+      // Recorded before the response leaves. A decision that was made but not
+      // written is the one thing a reviewer cannot recover later.
+      record(db, evaluated.events);
+      outcome = evaluated;
+      response = json(outcome.response);
+    } catch (cause) {
+      response = failClosed(hook, raw, cause);
+      log(`${hook} FAILED CLOSED in ${Math.round(elapsed())}ms: ${String(cause)}`);
+    }
+
+    const ms = elapsed().toFixed(1);
+    if (outcome !== null) {
+      const first = outcome.events[0];
+      const summary =
+        outcome.events.length === 1 && first
+          ? `${first.user_id || "?"} ${first.tool} → ${first.decision}${first.rule_id ? ` (${first.rule_id})` : ""}`
+          : `${outcome.events.length} decision(s)`;
+      log(`${hook} ${response.status} ${ms}ms ${summary}`);
+    }
+    return response;
+  };
+
+  const health = (): Response => {
+    const policy = cache.status();
+    const body = {
+      // The generated HealthResponse vocabulary, so Arcade's periodic check
+      // reads it; the rest is ours, for a human at the terminal.
+      status: policy.status === "ready" ? "healthy" : "unhealthy",
+      service: SERVICE,
+      hook_contract: HOOK_CONTRACT_VERSION,
+      policy,
+      counts: counts(db),
+      audit_rows: auditCount(db),
+      failure_mode: "fail-closed",
+    };
+    return json(body, policy.status === "ready" ? 200 : 503);
+  };
+
+  return Bun.serve({
+    port: config.port,
+    idleTimeout: 30,
+    async fetch(request) {
+      const { pathname } = new URL(request.url);
+
+      if (pathname === HOOK_ENDPOINT_PATHS.healthCheck) {
+        return request.method === "GET" ? health() : json({ error: "Method not allowed" }, 405);
+      }
+
+      const hook = HOOK_BY_PATH[pathname as HookPath];
+      if (hook === undefined) return json({ error: "Not found" }, 404);
+      if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+      if (!authorized(request)) return json({ error: "Unauthorized" }, 401);
+
+      return handleHook(hook, request);
+    },
+  });
+}

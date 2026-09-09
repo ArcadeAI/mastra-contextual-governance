@@ -94,6 +94,11 @@ jobs:
           # smoke test hands it a throwaway one.
           - service: idp
             smoke_env: -e BETTER_AUTH_SECRET=ci-smoke-only-not-a-real-secret-0000
+          # cg-hooks likewise refuses to boot in production without the bearer
+          # token Arcade must present: a control plane that fell back to a
+          # known token would accept hook calls from anyone. Throwaway here.
+          - service: hooks
+            smoke_env: -e ARCADE_HOOK_SIGNING_SECRET=ci-smoke-only-not-a-real-secret
     steps:
       - uses: actions/checkout@v4
 

@@ -1,31 +1,41 @@
 /**
  * The control plane. Owns `governance.db`, serves Arcade's `/access`, `/pre`
- * and `/post` hooks, and fans decisions out to the UI over SSE.
+ * and `/post` hooks, and records every decision it makes.
  *
- * A stub for now: the point of this slice is that the deploy pipeline works
- * before any logic goes into it. The hook endpoints land in #12.
+ *     POST /access   which tools this user may see        → { deny }
+ *     POST /pre      may this user make this call          → { code, error_message? }
+ *     POST /post     pass-through until #16                → { code }
+ *     GET  /health   policy revision, counts, fail-closed  (no auth)
+ *
+ * Boot order matters: the policy is loaded into memory *before* the port
+ * opens, so the first `/access` Arcade sends — possibly the 1.6 MB one — is
+ * served from a warm cache, and a background poll of the database's revision
+ * counter picks up live edits. A policy that fails to load does not stop the
+ * service from starting; it starts failing closed, says so on `/health` with
+ * a 503, and reloads on the next edit.
  */
-import { FAIL_CLOSED } from "@cg/governance-core";
+import { usingDevSecret, readConfig } from "./config.ts";
+import { createPolicyCache } from "./policy-cache.ts";
+import { counts, openGovernance } from "./policy-store.ts";
+import { createServer, SERVICE } from "./server.ts";
 
-const SERVICE = "hooks";
-const port = Number(process.env.PORT ?? 8081);
+const log = (line: string) => console.log(`[${SERVICE}] ${line}`);
 
-const server = Bun.serve({
-  port,
-  fetch(request) {
-    const { pathname } = new URL(request.url);
+const config = readConfig();
+const db = openGovernance(config.dbPath, config);
+const cache = createPolicyCache(db, { log, pollMs: config.policyPollMs });
+// Warm before the port opens: Arcade's first /access may be the 1.6 MB one.
+const state = cache.start();
 
-    if (request.method === "GET" && pathname === "/health") {
-      return Response.json({
-        status: "ok",
-        service: SERVICE,
-        // Proves the workspace link resolved at runtime, not just at typecheck.
-        failure_mode: FAIL_CLOSED.effect === "deny" ? "fail-closed" : "unknown",
-      });
-    }
+const server = createServer({ config, db, cache, log });
 
-    return new Response("Not found", { status: 404 });
-  },
-});
-
-console.log(`[${SERVICE}] listening on :${server.port}`);
+const tally = counts(db);
+log(
+  `listening on :${server.port} — ${config.dbPath}: ${tally.subjects} subjects, ` +
+    `${tally.policy_rules} rules, ${tally.audit_log} audit rows; ` +
+    `toolkits ${config.loanToolkit}, ${config.approvalsToolkit}`,
+);
+if (state.status === "failed") log(`STARTED FAIL-CLOSED: ${state.error}`);
+if (usingDevSecret(config)) {
+  log("ARCADE_HOOK_SIGNING_SECRET is unset — using the development token. Not for production.");
+}
