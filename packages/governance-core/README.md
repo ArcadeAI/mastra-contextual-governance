@@ -203,11 +203,19 @@ removal that did not happen. When there was nothing to do, `output` is the very
 same reference that came in, which is how #12 tells an `allow` from a `modify`
 without a deep compare.
 
-Two ways that could have been lost, both closed here rather than left to a
-seed-file author to notice: a pattern whose `replacement` the pattern itself
-matches is refused at compile time, and `remove` is applied to a fixpoint,
-because deleting a match can join what was on either side of it into a new one
-(remove `ab` from `aabb`).
+What that invariant does *not* give on its own is a guarantee that the payload
+settles, and the gap is not obvious: two rules whose patterns rewrite `A` to `B`
+and `B` back to `A` each look fine alone, and together they cycle, recording two
+removals a pass for having done nothing. So the marker a redaction leaves
+behind — a `mask`/`replace` field replacement as well as a pattern's — may not be
+something any pattern that could run alongside it goes on to match, and that is
+checked across the whole policy at compile time.
+
+Two smaller versions of the same thing are closed too: `remove` is applied to a
+fixpoint, because deleting a match can join what was on either side of it into a
+new one (remove `ab` from `aabb`); and if a payload ever does come back equal to
+what arrived, `redact` says so with an empty `redactions[]` rather than reporting
+removals that removed nothing.
 
 ### Fail closed means redact *more*
 
@@ -227,7 +235,7 @@ are case-sensitive — `Loan.get_loan` is not a tool and is refused), a rule wit
 neither fields nor patterns, a malformed field path, a field path repeated
 within a rule, an unparseable regex, a regex that matches the empty string (it
 would rewrite every string it was pointed at), the sticky flag (it would scan
-only from position 0), a replacement its own pattern matches, a duplicate
+only from position 0), a marker some co-applicable pattern matches, a duplicate
 pattern id, a subject matcher that can never match, an empty `reason`, a
 duplicate rule id — and `remove` on an array element addressed by index, which
 renumbers the elements after it and so does not mean the same thing twice.
@@ -236,6 +244,7 @@ The same loudness gap the PolicyEngine has applies here: the engine holds no
 roster, so a misspelled *role* or *user id* in `subjects` cannot be caught at
 compile time. Both engines share one definition of subject matching
 (`src/subjects.ts`) so they cannot drift about who a rule governs.
+
 ## GrantChecker (`src/grant-checker.ts`, #10)
 
 Pure, clock injected. Does a grant authorise **this** call?

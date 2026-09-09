@@ -66,6 +66,7 @@ import type {
   ToolMatcher,
 } from "@cg/policy-schema";
 
+import { deepEqual } from "./inputs.ts";
 import { checkSubjectMatcher, matchesSubject } from "./subjects.ts";
 import type { SubjectOrUnknown, ToolCatalogue, ToolRef } from "./policy-engine.ts";
 
@@ -253,6 +254,8 @@ export function compileOutputPolicy(policy: OutputPolicy): CompiledOutputPolicy 
     });
   }
 
+  checkReplacementsSettle(compiled, problems);
+
   if (problems.length > 0) throw new OutputPolicyCompileError(problems);
 
   compiled.sort(byPriorityThenId);
@@ -396,18 +399,6 @@ function compilePatterns(rule: OutputRule, say: (message: string) => void): Comp
       continue;
     }
 
-    if (pattern.strategy !== "remove" && probe.test(pattern.replacement)) {
-      // The marker a redaction leaves behind must not be something the same
-      // redaction goes on to find. If it is, every pass over the payload
-      // records another redaction of its own last one: the output stops
-      // settling and `redactions[]` grows without anything new being removed.
-      say(
-        `leaves a replacement for pattern "${pattern.id}" that the pattern itself matches, ` +
-          `so redacting an already-redacted payload would not be a no-op`,
-      );
-      continue;
-    }
-
     out.push({
       id: pattern.id,
       strategy: pattern.strategy,
@@ -417,6 +408,66 @@ function compilePatterns(rule: OutputRule, say: (message: string) => void): Comp
     });
   }
   return out;
+}
+
+/**
+ * **A marker one redaction leaves behind must not be something another
+ * redaction goes on to find.**
+ *
+ * If it is, the payload never settles. Two rules whose patterns rewrite `A` to
+ * `B` and `B` back to `A` each compile fine on their own — neither matches its
+ * own replacement — but together they cycle: every pass rewrites the payload
+ * back to where it started and records two redactions for having done nothing.
+ * The output looks idempotent and `redactions[]` lies about it, which is the
+ * shape of failure this project exists to catch. (Found in review of #8.)
+ *
+ * So this is checked across the whole policy rather than per pattern: every
+ * marker any rule writes — a `mask`/`replace` field replacement as well as a
+ * pattern's — is offered to every pattern that could run alongside it. A
+ * `remove` writes nothing, and no pattern may match the empty string, so
+ * removals cannot start a cycle on their own.
+ *
+ * Deliberately conservative about "alongside". Tool matchers are compared, so
+ * rules governing unrelated tools do not constrain each other's markers, but
+ * subject matchers are not: two rules aimed at disjoint sets of subjects are
+ * still checked against each other. Proving two subject bands disjoint is
+ * fiddly, and the cost of being wrong in that direction is a compile error with
+ * an actionable message, not a control that silently does nothing.
+ */
+function checkReplacementsSettle(rules: readonly CompiledOutputRule[], problems: string[]): void {
+  const markers = rules.flatMap((rule) => [
+    ...rule.fields
+      .filter((field) => field.strategy !== "remove")
+      .map((field) => ({ rule, what: `field "${field.source}"`, text: field.replacement })),
+    ...rule.patterns
+      .filter((pattern) => pattern.strategy !== "remove")
+      .map((pattern) => ({ rule, what: `pattern "${pattern.id}"`, text: pattern.replacement })),
+  ]);
+
+  for (const marker of markers) {
+    for (const rule of rules) {
+      if (!toolMatchersOverlap(marker.rule.match, rule.match)) continue;
+      for (const pattern of rule.patterns) {
+        if (!pattern.probe.test(marker.text)) continue;
+        const scanner =
+          rule.id === marker.rule.id
+            ? `pattern "${pattern.id}"`
+            : `pattern "${pattern.id}" of rule "${rule.id}"`;
+        problems.push(
+          `rule "${marker.rule.id}" leaves a replacement for ${marker.what} that ${scanner} ` +
+            `matches, so the payload would not settle: each pass would redact the last pass's ` +
+            `marker and record a removal that removed nothing`,
+        );
+      }
+    }
+  }
+}
+
+/** Could these two matchers ever select the same tool? */
+function toolMatchersOverlap(a: ToolMatcher, b: ToolMatcher): boolean {
+  const segment = (x: string, y: string): boolean =>
+    x === WILDCARD || y === WILDCARD || x === y;
+  return segment(a.toolkit, b.toolkit) && segment(a.tool, b.tool);
 }
 
 /**
@@ -491,6 +542,18 @@ export function redact(input: RedactionInput): RedactionResult {
     if (rule.patterns.length > 0) {
       current = sweep(current, "$", rule.patterns, rule.id, redactions);
     }
+  }
+
+  if (redactions.length > 0 && current !== input.output && deepEqual(current, input.output)) {
+    // Belt to `checkReplacementsSettle`'s braces. The compiler refuses the
+    // markers that let rules undo each other, but it reasons about
+    // replacements in isolation and cannot see a match formed across the seam
+    // where one was spliced in. If the payload came back equal to what arrived,
+    // then whatever the rules did to it they collectively did nothing, and
+    // saying so is the honest answer: `redactions[]` is rendered on the panel
+    // and kept in the audit log, and a removal that removed nothing is a lie in
+    // both.
+    return { output: input.output, redactions: [] };
   }
 
   return { output: current, redactions };
