@@ -209,7 +209,29 @@ export type PolicyRule = z.infer<typeof PolicyRule>;
 // OutputRule — post-execution
 // ---------------------------------------------------------------------------
 
-/** What to do with matched content. `remove` drops it; the others leave a marker. */
+/**
+ * What to do with matched content. The three differ in **how much** they
+ * substitute, which is what makes them three strategies rather than two
+ * spellings of one — a strategy that behaved identically to another would be
+ * a control that silently does nothing.
+ *
+ * | strategy | pattern match | field path |
+ * |---|---|---|
+ * | `mask` | the matched substring becomes `replacement`; the text around it survives | the value becomes `replacement` |
+ * | `replace` | the whole string holding the match becomes `replacement` | the value becomes `replacement` |
+ * | `remove` | the matched substring is deleted and the text closes up | the key is deleted from its parent |
+ *
+ * For a field path `mask` and `replace` necessarily coincide: the match *is*
+ * the whole value, so there is nothing around it to preserve. The distinction
+ * only pays off on a pattern sweep, and that is exactly where it is needed —
+ * a free-text field commonly holds legitimate content *and* something that
+ * must not reach the model, and `mask` keeps the first while `replace` throws
+ * the field away wholesale because none of it is trusted.
+ *
+ * Nothing here is format-preserving. A mask that revealed the length or the
+ * shape of what it covered would teach the model what was taken, which is the
+ * thing the post-execution hook exists to prevent.
+ */
 export const RedactionStrategy = z.enum(["mask", "remove", "replace"]);
 export type RedactionStrategy = z.infer<typeof RedactionStrategy>;
 
@@ -265,6 +287,37 @@ export const OutputRule = z
   })
   .strict();
 export type OutputRule = z.infer<typeof OutputRule>;
+
+/**
+ * One thing that was taken out of a tool's output — the unit `redactions[]` is
+ * made of, and the row the control-plane panel renders beside its before/after
+ * diff (#21).
+ *
+ * **It names where and why, never what.** There is deliberately no field for
+ * the removed value, because this record is written to the audit log and drawn
+ * on a projector: a shape that *could* carry an account number eventually
+ * would, and the redaction would have leaked the thing it removed into the two
+ * places most likely to be read aloud.
+ *
+ * `path` is canonical JSONPath into the tool's output — `$.bank_holder`,
+ * `$.history[0].note`, `$` for the whole payload — so a reader can point at the
+ * field without the value being present. `kind` is the strategy that fired, and
+ * `pattern_id` names the individual scanner on a pattern sweep, or is `null`
+ * when a named field path did the work. Which mechanism found it is therefore
+ * readable off the record rather than guessed at.
+ */
+export const RedactionRecord = z
+  .object({
+    /** Canonical JSONPath to what was redacted. Never accompanied by its value. */
+    path: z.string().min(1),
+    /** The `OutputRule` that fired. */
+    rule_id: z.string().min(1),
+    /** The `PatternRedaction` that matched, or `null` for a field-path redaction. */
+    pattern_id: z.string().nullable().default(null),
+    kind: RedactionStrategy,
+  })
+  .strict();
+export type RedactionRecord = z.infer<typeof RedactionRecord>;
 
 // ---------------------------------------------------------------------------
 // Decision — what every hook returns

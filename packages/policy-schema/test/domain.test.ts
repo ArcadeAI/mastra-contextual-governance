@@ -18,6 +18,7 @@ import {
   HookPoint,
   OutputRule,
   PolicyRule,
+  RedactionRecord,
   Subject,
   Timestamp,
 } from "../src/domain.ts";
@@ -412,5 +413,38 @@ describe("Timestamp", () => {
     // value would make every read back through these schemas fail.
     expect(at("2026-01-01T00:00:00+00:00")).toThrow();
     expect(at("2026-01-01 00:00:00")).toThrow();
+  });
+});
+
+describe("RedactionRecord", () => {
+  const minimal = { path: "$.identifier", rule_id: "rule.redact", kind: "mask" as const };
+
+  it("defaults pattern_id to null, so a field redaction says so rather than omitting it", () => {
+    expect(RedactionRecord.parse(minimal).pattern_id).toBeNull();
+  });
+
+  it("carries the pattern that fired when a sweep found it", () => {
+    const record = RedactionRecord.parse({ ...minimal, pattern_id: "pattern.instruction" });
+    expect(record.pattern_id).toBe("pattern.instruction");
+  });
+
+  it("has nowhere to put the value that was removed", () => {
+    // The whole point of the shape. This record is written to the audit log and
+    // drawn on a projector; a field that could hold the removed value would
+    // eventually hold a real identifier in both places. `.strict()` is what
+    // makes that a parse error rather than a code review someone has to catch.
+    for (const leak of ["value", "before", "removed", "matched", "original"]) {
+      expect(() => RedactionRecord.parse({ ...minimal, [leak]: "4000000000000002" })).toThrow();
+    }
+  });
+
+  it("refuses an empty path or rule_id, which would name nothing on the panel", () => {
+    expect(() => RedactionRecord.parse({ ...minimal, path: "" })).toThrow();
+    expect(() => RedactionRecord.parse({ ...minimal, rule_id: "" })).toThrow();
+  });
+
+  it("survives a JSON round-trip, which is how it reaches the panel", () => {
+    const record = RedactionRecord.parse(minimal);
+    expect(RedactionRecord.parse(JSON.parse(JSON.stringify(record)))).toEqual(record);
   });
 });

@@ -30,6 +30,7 @@ import {
   Grant,
   OutputRule,
   PatternRedaction,
+  RedactionRecord,
   PolicyRule,
   Subject,
   SubjectMatcher,
@@ -221,6 +222,18 @@ export const anOutputRule = builder(OutputRule, {
   reason: "Sensitive field masked and injected instruction stripped.",
   priority: 100,
   enabled: true,
+});
+
+/**
+ * One row of `redactions[]`, as the engine emits it and the panel renders it.
+ * Note what is absent: there is nowhere here to put the value that was taken,
+ * and that is the point.
+ */
+export const aRedactionRecord = builder(RedactionRecord, {
+  path: "$.identifier",
+  rule_id: "rule.redact",
+  pattern_id: null,
+  kind: "mask",
 });
 
 export const aDecision = builder(Decision, {
