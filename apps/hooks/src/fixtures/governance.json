@@ -1,0 +1,93 @@
+{
+  "//": [
+    "The cast and the rules governance.db is seeded from when it has no schema. Edit a row live in the database, not here — this file is read once, on first boot.",
+    "$LOAN and $APPROVALS are replaced at seed time with ARCADE_LOAN_TOOLKIT and ARCADE_APPROVALS_TOOLKIT. Tool names are PascalCase because arcade-mcp PascalCases them unconditionally (measured on #35); a rule keyed on get_loan matches nothing, and a rule that matches nothing is indistinguishable from a rule that permits.",
+    "Emails are the fallback for a local run and must equal apps/idp/src/fixtures/people.json's. PERSONA_<KEY>_EMAIL overrides each one at seed time, exactly as apps/idp does."
+  ],
+  "catalogue": {
+    "$LOAN": {
+      "SearchLoans": ["status?", "min_amount?", "max_amount?"],
+      "GetLoan": ["loan_id"],
+      "ApproveLoan": ["loan_id", "amount"],
+      "DenyLoan": ["loan_id", "reason"]
+    },
+    "$APPROVALS": {
+      "RequestApproval": ["action", "resource_id", "amount", "justification"],
+      "Decide": ["request_id", "decision", "note?"]
+    }
+  },
+  "subjects": [
+    {
+      "persona": "dana",
+      "user_id": "dana.okafor@bank.example",
+      "display_name": "Dana Okafor",
+      "role": "loan_officer",
+      "clearance": 50000
+    },
+    {
+      "persona": "sam",
+      "user_id": "sam.reyes@bank.example",
+      "display_name": "Sam Reyes",
+      "role": "credit_analyst",
+      "clearance": 0
+    },
+    {
+      "persona": "riley",
+      "user_id": "riley.chen@bank.example",
+      "display_name": "Riley Chen",
+      "role": "vp_credit",
+      "clearance": 250000
+    },
+    {
+      "persona": "morgan",
+      "user_id": "morgan.ellis@bank.example",
+      "display_name": "Morgan Ellis",
+      "role": "chief_credit_officer",
+      "clearance": 5000000
+    }
+  ],
+  "policy_rules": [
+    {
+      "id": "access.analysts-cannot-see-approve",
+      "description": "Act 1. A credit analyst never sees the approval tool: it is absent from tools/list, not merely refused.",
+      "hook": "access",
+      "match": { "toolkit": "$LOAN", "tool": "ApproveLoan" },
+      "subjects": { "roles": ["credit_analyst"] },
+      "effect": "deny",
+      "reason": "Credit analysts do not hold approval authority; the tool is hidden from this role.",
+      "priority": 10
+    },
+    {
+      "id": "pre.approve-within-clearance",
+      "description": "Act 2. An approval above the caller's authority is blocked, and the denial tells the model how to escalate and then retry.",
+      "hook": "pre",
+      "match": { "toolkit": "$LOAN", "tool": "ApproveLoan" },
+      "conditions": [{ "input": "amount", "operator": "exceeds_clearance" }],
+      "effect": "deny",
+      "reason": "DENIED: approving {{inputs.loan_id}} for {{inputs.amount}} exceeds your approval authority of {{subject.clearance}}. To proceed, call $APPROVALS.RequestApproval with action=approve_loan, resource_id={{inputs.loan_id}}, amount={{inputs.amount}} and justification=<why this loan should be approved>, then wait for the approval and retry $LOAN.ApproveLoan with loan_id={{inputs.loan_id}} and amount={{inputs.amount}} unchanged.",
+      "priority": 100
+    }
+  ],
+  "output_rules": [
+    {
+      "id": "post.redact-borrower-identifiers",
+      "description": "Acts 3 and 4. The borrower's bank account and tax id never reach the model, and an instruction planted in the underwriter's notes is stripped. Evaluated by the RedactionEngine once #16 wires it in.",
+      "match": { "toolkit": "$LOAN", "tool": "GetLoan" },
+      "fields": [
+        { "path": "bank_account_number", "strategy": "mask", "replacement": "[REDACTED]" },
+        { "path": "tax_id", "strategy": "mask", "replacement": "[REDACTED]" }
+      ],
+      "patterns": [
+        {
+          "id": "pattern.injected-instruction",
+          "regex": "ignore (all )?(previous|prior) instructions[^.]*\\.?",
+          "flags": "i",
+          "strategy": "remove",
+          "replacement": ""
+        }
+      ],
+      "reason": "Borrower identifiers masked and injected instruction stripped before the output reached the model.",
+      "priority": 100
+    }
+  ]
+}

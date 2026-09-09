@@ -16,8 +16,11 @@ Python `arcade-mcp` toolkits, which is what the agent's tools are authored in.
 with the seed data the demo runs on. `tools/loan` is real: the four loan tools, each a
 stateless client of that API, shipped with `arcade deploy`. `apps/idp` is real: the
 enterprise's identity provider, Better Auth as an OAuth 2.1 server, with the four personas
-seeded and a login and consent page. `apps/hooks` and `apps/web` are still stubs that
-serve a health endpoint and nothing else.
+seeded and a login and consent page. `apps/hooks` is real: the control plane, serving
+`/access`, `/pre` and `/post` from a policy held in memory and invalidated by the database,
+recording every decision in an append-only audit log, and failing closed on anything it
+cannot decide (`/post` passes output through until #16). `apps/web` is still a stub that
+serves a health endpoint and nothing else.
 
 See [`DESIGN.md`](./DESIGN.md) for the architecture and the decisions behind it, and
 [issue #1](https://github.com/ArcadeAI/mastra-contextual-governance/issues/1) for the
@@ -87,7 +90,7 @@ curl -H 'Authorization: Bearer dev:dana@example.test' localhost:8082/loans/LN-22
 Each service answers `GET /health`:
 
 ```sh
-curl localhost:8081/health   # {"status":"ok","service":"hooks",...}
+curl localhost:8081/health   # {"status":"healthy","service":"hooks","policy":{"revision":…},...}
 curl localhost:8082/health   # {"status":"ok","service":"loan-app","loans":8}
 curl localhost:8083/health   # {"status":"ok","service":"idp","people":4,...}
 ```

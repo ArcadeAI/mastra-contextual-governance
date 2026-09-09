@@ -7,6 +7,8 @@
     "dev": "bun --watch src/index.ts",
     "start": "bun src/index.ts",
     "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "bench": "bun scripts/bench.ts",
     "build": "echo 'no build step — Bun runs TypeScript directly'"
   },
   "dependencies": {
