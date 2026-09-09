@@ -6,8 +6,8 @@
  * Pure: no I/O, no clock, no randomness, no store. `now` is an argument.
  *
  * This is the security-critical module of the four. The approval link the
- * requester receives deliberately carries **no authority** — she can see the
- * message she sent, so she holds the link too. Possession is not permission:
+ * requester receives deliberately carries **no authority** — they can see the
+ * message they sent, so they hold the link too. Possession is not permission:
  * authorization happens when the button is pressed, and it happens here.
  *
  * A grant is not a general permission. It authorises one action, on one
@@ -286,7 +286,7 @@ function enforceable({ grant }: GrantCheck): GrantRejectionReason | null {
  * Before the subject check, and deliberately: a self-approved grant is invalid
  * whoever presents it and whatever the approval record says. This is the
  * control that makes the no-authority approval link safe — a requester who
- * clicks her own link gets a grant that cannot validate (PRD story 18).
+ * clicks their own link gets a grant that cannot validate (PRD story 18).
  */
 function notSelfApproved({ grant }: GrantCheck): GrantRejectionReason | null {
   return grant.granted_by === grant.subject_id
