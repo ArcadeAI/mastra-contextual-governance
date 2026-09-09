@@ -155,7 +155,8 @@ class TestDeletingItActuallyWorks:
         assert after, "discovery must still find tools/loan"
 
     def test_no_workflow_names_the_deleted_path(self) -> None:
-        workflows = sorted((REPO_ROOT / ".github" / "workflows").glob("*.yml"))
+        directory = REPO_ROOT / ".github" / "workflows"
+        workflows = sorted([*directory.glob("*.yml"), *directory.glob("*.yaml")])
         assert workflows, "no workflows found; this test would pass vacuously"
         offenders = [
             f"{path.name}:{number}: {line.strip()}"

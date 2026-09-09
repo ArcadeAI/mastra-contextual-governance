@@ -258,7 +258,7 @@ uv run server.py http            # Streamable HTTP on 127.0.0.1:8000
 ```
 
 Nothing in the suite binds a fixed port and nothing reaches the internet. The
-five files, and what each pins:
+six files, and what each pins:
 
 | file | |
 |---|---|
@@ -267,6 +267,7 @@ five files, and what each pins:
 | `test_tools.py` | both tools end to end, against real HTTP stand-ins |
 | `test_store_contract.py` | every endpoint of the store contract above, including the `GET` #19 needs and the bearer on all four |
 | `test_isolation.py` | that deleting this directory really is supported |
+| `test_toolkit_discovery.py` | `scripts/list-toolkits.sh`, which CI's matrix is built from — output *and* exit status, for zero, one and two toolkits |
 
 ## Deploy
 
