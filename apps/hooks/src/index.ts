@@ -9,7 +9,8 @@
  *
  * Boot order matters: the policy is loaded into memory *before* the port
  * opens, so the first `/access` Arcade sends — possibly the 1.6 MB one — is
- * served from a warm cache. A policy that fails to load does not stop the
+ * served from a warm cache, and a background poll of the database's revision
+ * counter picks up live edits. A policy that fails to load does not stop the
  * service from starting; it starts failing closed, says so on `/health` with
  * a 503, and reloads on the next edit.
  */
@@ -22,8 +23,9 @@ const log = (line: string) => console.log(`[${SERVICE}] ${line}`);
 
 const config = readConfig();
 const db = openGovernance(config.dbPath, config);
-const cache = createPolicyCache(db, log);
-const state = cache.reload();
+const cache = createPolicyCache(db, { log, pollMs: config.policyPollMs });
+// Warm before the port opens: Arcade's first /access may be the 1.6 MB one.
+const state = cache.start();
 
 const server = createServer({ config, db, cache, log });
 

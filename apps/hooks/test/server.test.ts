@@ -10,9 +10,13 @@ import { AccessHookResult, PreHookResult } from "@cg/policy-schema";
 import { count as auditCount, recent } from "../src/audit-log.ts";
 import type { HooksConfig } from "../src/config.ts";
 import { CORRELATION_TOKEN } from "../src/correlation.ts";
-import { createPolicyCache } from "../src/policy-cache.ts";
+import { createPolicyCache, type PolicyCache } from "../src/policy-cache.ts";
 import { openGovernance } from "../src/policy-store.ts";
 import { createServer } from "../src/server.ts";
+
+/** How long a test waits for the background poll to notice an edit. */
+const POLL_MS = 10;
+const settle = () => Bun.sleep(POLL_MS * 6);
 
 const DANA = "dana.okafor@bank.example";
 const SAM = "sam.reyes@bank.example";
@@ -26,22 +30,25 @@ const config: HooksConfig = {
   approvalsToolkit: "Approvals",
   personaEmails: {},
   deadlineMs: 2500,
+  policyPollMs: 250,
 };
 
 let db: Database;
+let cache: PolicyCache;
 let server: ReturnType<typeof createServer>;
 let base: string;
 const logs: string[] = [];
 
 beforeAll(() => {
   db = openGovernance(":memory:", config);
-  const cache = createPolicyCache(db, (line) => logs.push(line));
-  cache.reload();
+  cache = createPolicyCache(db, { log: (line) => logs.push(line), pollMs: POLL_MS });
+  cache.start();
   server = createServer({ config, db, cache, log: (line) => logs.push(line) });
   base = `http://localhost:${server.port}`;
 });
 
 afterAll(() => {
+  cache.stop();
   server.stop(true);
   db.close();
 });
@@ -86,9 +93,14 @@ describe("bearer auth", () => {
   test("/health needs no token: Render and Arcade both probe it bare", async () => {
     const res = await fetch(`${base}/health`);
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { status: string; policy: { status: string; revision: number } };
+    const body = (await res.json()) as {
+      status: string;
+      policy: { status: string; revision: number; loaded_at: string; last_poll_at: string | null; poll_ms: number };
+    };
     expect(body.status).toBe("healthy");
     expect(body.policy.status).toBe("ready");
+    expect(body.policy.poll_ms).toBe(POLL_MS);
+    expect(body.policy.loaded_at).toBeString();
   });
 });
 
@@ -162,8 +174,28 @@ describe("fails closed, and the failure is audited", () => {
     expect(recent(db, 1)[0]).toMatchObject({ hook: "access", decision: "deny", tool: "*" });
   });
 
+  test("/access failing closed on a readable payload denies and audits every tool named", async () => {
+    // Break the policy so the handler path fails closed, then check the rows.
+    db.run("UPDATE policy_rules SET tool = 'approve_loan' WHERE id = 'pre.approve-within-clearance'");
+    await settle();
+    const before = auditCount(db);
+    const res = await post("/access", {
+      user_id: DANA,
+      toolkits: { Loan: { tools: LOAN_TOOLS }, Github: { tools: { CreateIssue: V, ListRepos: V } } },
+    });
+    expect(AccessHookResult.parse(await res.json()).deny).toHaveProperty("Github");
+    const rows = recent(db, auditCount(db) - before);
+    expect(rows.map((r) => r.tool).sort()).toEqual(
+      ["Github.CreateIssue", "Github.ListRepos", "Loan.ApproveLoan", "Loan.DenyLoan", "Loan.GetLoan", "Loan.SearchLoans"],
+    );
+    expect(rows.every((r) => r.decision === "deny" && r.rule_id === null && /FAIL-CLOSED/.test(r.reason))).toBe(true);
+    db.run("UPDATE policy_rules SET tool = 'ApproveLoan' WHERE id = 'pre.approve-within-clearance'");
+    await settle();
+  });
+
   test("a policy edit that no longer compiles fails every hook closed until fixed, and /health says so", async () => {
     db.run("UPDATE policy_rules SET tool = 'approve_loan' WHERE id = 'pre.approve-within-clearance'");
+    await settle();
 
     const health = await fetch(`${base}/health`);
     expect(health.status).toBe(503);
@@ -178,6 +210,7 @@ describe("fails closed, and the failure is audited", () => {
     expect(AccessHookResult.parse(await access.json())).toEqual({ deny: { Loan: { tools: LOAN_TOOLS } } });
 
     db.run("UPDATE policy_rules SET tool = 'ApproveLoan' WHERE id = 'pre.approve-within-clearance'");
+    await settle();
     expect((await fetch(`${base}/health`)).status).toBe(200);
     const again = await post("/pre", preBody(DANA, "GetLoan", { loan_id: "LN-2291" }));
     expect(await again.json()).toEqual({ code: "OK" });
@@ -185,7 +218,7 @@ describe("fails closed, and the failure is audited", () => {
 });
 
 describe("live policy edits", () => {
-  test("a clearance raised in the database is honoured on the very next call, and the reload is observable", async () => {
+  test("a clearance raised in the database is honoured within one poll interval, and the reload is observable", async () => {
     const denied = await post("/pre", preBody(DANA, "ApproveLoan", { loan_id: "LN-2291", amount: 95_000 }));
     expect(PreHookResult.parse(await denied.json()).code).toBe("CHECK_FAILED");
 
@@ -193,6 +226,7 @@ describe("live policy edits", () => {
     const reloads = logs.filter((l) => l.startsWith("policy loaded")).length;
 
     db.run(`UPDATE subjects SET clearance = 100000 WHERE user_id = '${DANA}'`);
+    await settle();
 
     const allowed = await post("/pre", preBody(DANA, "ApproveLoan", { loan_id: "LN-2291", amount: 95_000 }));
     expect(await allowed.json()).toEqual({ code: "OK" });
@@ -202,13 +236,171 @@ describe("live policy edits", () => {
     expect(logs.filter((l) => l.startsWith("policy loaded")).length).toBe(reloads + 1);
 
     db.run(`UPDATE subjects SET clearance = 50000 WHERE user_id = '${DANA}'`);
+    await settle();
   });
 
-  test("disabling a rule takes effect immediately", async () => {
+  test("disabling a rule takes effect within one poll interval", async () => {
     db.run("UPDATE policy_rules SET enabled = 0 WHERE id = 'access.analysts-cannot-see-approve'");
+    await settle();
     const res = await post("/access", { user_id: SAM, toolkits: { Loan: { tools: LOAN_TOOLS } } });
     expect(await res.json()).toEqual({ deny: {} });
     db.run("UPDATE policy_rules SET enabled = 1 WHERE id = 'access.analysts-cannot-see-approve'");
+    await settle();
+  });
+});
+
+describe("the hot path never reads policy from the database", () => {
+  /** A Database whose every query entry point is counted. */
+  function counting(real: Database): { db: Database; reads: () => number } {
+    let n = 0;
+    const db = new Proxy(real, {
+      get(target, prop, receiver) {
+        const value = Reflect.get(target, prop, receiver);
+        if (typeof value === "function" && ["query", "prepare", "run", "exec", "transaction"].includes(String(prop))) {
+          return (...args: unknown[]) => {
+            n += 1;
+            return (value as (...a: unknown[]) => unknown).apply(target, args);
+          };
+        }
+        return value;
+      },
+    });
+    return { db, reads: () => n };
+  }
+
+  test("a warm /access and /pre make zero policy queries; only the audit write touches SQLite", async () => {
+    const real = openGovernance(":memory:", config);
+    const counted = counting(real);
+    // The cache gets the counted handle; the server's audit writes go to the real one.
+    const isolated = createPolicyCache(counted.db, { pollMs: 60_000 });
+    isolated.start();
+    const srv = createServer({ config, db: real, cache: isolated, log: () => {} });
+    try {
+      const afterWarm = counted.reads();
+      for (let i = 0; i < 20; i++) {
+        const a = await fetch(`http://localhost:${srv.port}/access`, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${SECRET}` },
+          body: JSON.stringify({ user_id: SAM, toolkits: { Loan: { tools: LOAN_TOOLS } } }),
+        });
+        expect(a.status).toBe(200);
+        const p = await fetch(`http://localhost:${srv.port}/pre`, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${SECRET}` },
+          body: JSON.stringify(preBody(DANA, "GetLoan", { loan_id: "LN-2291" })),
+        });
+        expect(p.status).toBe(200);
+      }
+      expect(counted.reads()).toBe(afterWarm);
+      // Sanity: the audit rows did land, on the real handle.
+      expect(auditCount(real)).toBe(20 * 4 + 20);
+    } finally {
+      isolated.stop();
+      srv.stop(true);
+      real.close();
+    }
+  });
+
+  test("current() is a memory read, even a thousand times", () => {
+    const real = openGovernance(":memory:", config);
+    const counted = counting(real);
+    const isolated = createPolicyCache(counted.db, { pollMs: 60_000 });
+    isolated.start();
+    const afterWarm = counted.reads();
+    for (let i = 0; i < 1000; i++) expect(isolated.current().status).toBe("ready");
+    expect(counted.reads()).toBe(afterWarm);
+    isolated.stop();
+    real.close();
+  });
+
+  test("a poll that cannot read the revision keeps serving the cached policy, then fails closed once it is persistent", () => {
+    const real = openGovernance(":memory:", config);
+    let broken = false;
+    const flaky = new Proxy(real, {
+      get(target, prop, receiver) {
+        const value = Reflect.get(target, prop, receiver);
+        if (broken && prop === "query") return () => { throw new Error("disk went away"); };
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const isolated = createPolicyCache(flaky, { pollMs: 60_000, maxPollFailures: 3 });
+    isolated.start();
+    broken = true;
+    expect(isolated.poll().status).toBe("ready");
+    expect(isolated.poll().status).toBe("ready");
+    expect(isolated.status().consecutive_poll_failures).toBe(2);
+    expect(isolated.poll().status).toBe("failed");
+    expect(isolated.status().error).toMatch(/unreadable for 3 polls/);
+    broken = false;
+    expect(isolated.poll().status).toBe("ready");
+    isolated.stop();
+    real.close();
+  });
+});
+
+describe("a cold cache fails closed", () => {
+  test("a server whose cache was never started denies the first /access and loads nothing", async () => {
+    const real = openGovernance(":memory:", config);
+    const isolated = createPolicyCache(real, { pollMs: 60_000 });
+    const srv = createServer({ config, db: real, cache: isolated, log: () => {} });
+    try {
+      const res = await fetch(`http://localhost:${srv.port}/access`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${SECRET}` },
+        body: JSON.stringify({ user_id: DANA, toolkits: { Loan: { tools: { GetLoan: V } } } }),
+      });
+      expect(res.status).toBe(200);
+      expect(AccessHookResult.parse(await res.json())).toEqual({ deny: { Loan: { tools: { GetLoan: V } } } });
+      expect(isolated.current().status).toBe("cold");
+      expect(recent(real, 1)[0]).toMatchObject({ hook: "access", tool: "Loan.GetLoan", decision: "deny", rule_id: null });
+      expect(recent(real, 1)[0]?.reason).toMatch(/has not loaded its policy yet/);
+
+      const health = await fetch(`http://localhost:${srv.port}/health`);
+      expect(health.status).toBe(503);
+    } finally {
+      isolated.stop();
+      srv.stop(true);
+      real.close();
+    }
+  });
+});
+
+describe("the hook budget covers synchronous work", () => {
+  test("an evaluation that runs past HOOK_DEADLINE_MS is denied and audited as a timeout, never returned as OK", async () => {
+    const real = openGovernance(":memory:", config);
+    const inner = createPolicyCache(real, { pollMs: 60_000 });
+    inner.start();
+    // A cache whose current() blocks synchronously — the reviewer's scenario.
+    const slow: PolicyCache = {
+      ...inner,
+      current: () => {
+        const until = performance.now() + 60;
+        while (performance.now() < until) { /* spin */ }
+        return inner.current();
+      },
+    };
+    const srv = createServer({ config: { ...config, deadlineMs: 20 }, db: real, cache: slow, log: () => {} });
+    try {
+      const res = await fetch(`http://localhost:${srv.port}/pre`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${SECRET}` },
+        body: JSON.stringify(preBody(DANA, "GetLoan", { loan_id: "LN-2291" }, "tc_slow")),
+      });
+      expect(res.status).toBe(200);
+      const body = PreHookResult.parse(await res.json());
+      expect(body.code).toBe("CHECK_FAILED");
+      expect(body.error_message).toMatch(/Timeout/);
+      expect(body.error_message).toMatch(CORRELATION_TOKEN);
+      // Exactly one row, the denial — the allow that was computed was discarded.
+      const rows = recent(real, 5).filter((r) => r.execution_id === "tc_slow");
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ decision: "deny", rule_id: null, tool: "Loan.GetLoan" });
+      expect(rows[0]?.reason).toMatch(/exceeded the 20ms hook budget/);
+    } finally {
+      inner.stop();
+      srv.stop(true);
+      real.close();
+    }
   });
 });
 
@@ -242,7 +434,10 @@ describe("latency", () => {
     const body = AccessHookResult.parse(await res.json());
     expect(body.deny?.Loan?.tools).toEqual({ ApproveLoan: V });
     expect(Object.keys(body.deny ?? {}).length).toBe(Object.keys(toolkits).length);
-    // Generous: CI machines are slow. Locally this is tens of milliseconds.
-    expect(ms).toBeLessThan(1000);
+    // Generous: CI machines are slow. Locally this is tens of milliseconds,
+    // including one audit row per tool decided.
+    expect(ms).toBeLessThan(2000);
+    const tools = Object.values(toolkits).reduce((n, t) => n + Object.keys(t.tools).length, 0);
+    expect(auditCount(db)).toBeGreaterThanOrEqual(tools);
   });
 });

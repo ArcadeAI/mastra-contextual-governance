@@ -22,9 +22,9 @@ const LOAN_TOOLS = { SearchLoans: V, GetLoan: V, ApproveLoan: V, DenyLoan: V };
 
 const db = openGovernance(":memory:", { loanToolkit: "Loan", approvalsToolkit: "Approvals", personaEmails: {} });
 const cache = createPolicyCache(db);
-cache.reload();
+cache.start();
 const server = createServer({
-  config: { port: 0, dbPath: ":memory:", signingSecret: SECRET, loanToolkit: "Loan", approvalsToolkit: "Approvals", personaEmails: {}, deadlineMs: 2500 },
+  config: { port: 0, dbPath: ":memory:", signingSecret: SECRET, loanToolkit: "Loan", approvalsToolkit: "Approvals", personaEmails: {}, deadlineMs: 2500, policyPollMs: 250 },
   db,
   cache,
   log: () => {},
@@ -88,5 +88,6 @@ await time("/pre allow", "/pre", {
 }, 200);
 
 console.log(`\naudit rows written: ${db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM audit_log").get()?.n}`);
+cache.stop();
 server.stop(true);
 db.close();

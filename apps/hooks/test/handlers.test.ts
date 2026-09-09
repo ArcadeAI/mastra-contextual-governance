@@ -19,7 +19,9 @@ const MORGAN = "morgan.ellis@bank.example";
 const ready = (): CacheState =>
   createPolicyCache(
     openGovernance(":memory:", { loanToolkit: "Loan", approvalsToolkit: "Approvals", personaEmails: {} }),
-  ).current();
+  ).reload();
+
+const cold: CacheState = { status: "cold" };
 
 const failed: CacheState = {
   status: "failed",
@@ -99,7 +101,7 @@ describe("/access — act 1", () => {
     expect(events[0]?.reason).toMatch(/no registered subject/);
   });
 
-  test("hides an ungoverned toolkit wholesale and audits it as one row", () => {
+  test("hides an ungoverned toolkit and audits every one of its tools, so each decision is reconstructible", () => {
     const { response, events } = handleAccess(
       {
         user_id: DANA,
@@ -114,24 +116,42 @@ describe("/access — act 1", () => {
     expect(response.deny).toEqual({
       Github: { tools: { CreateIssue: [{ version: "2.0.0" }], ListRepos: [{ version: "2.0.0" }] } },
     });
-    const github = events.filter((e) => e.tool.startsWith("Github"));
-    expect(github).toHaveLength(1);
-    expect(github[0]).toMatchObject({ tool: "Github.*", decision: "deny", rule_id: null });
-    expect(github[0]?.reason).toMatch(/not governed/);
-    expect(github[0]?.reason).toMatch(/2 tool\(s\) hidden/);
+    const github = events.filter((e) => e.tool.startsWith("Github."));
+    expect(github.map((e) => e.tool).sort()).toEqual(["Github.CreateIssue", "Github.ListRepos"]);
+    for (const e of github) {
+      expect(e).toMatchObject({ decision: "deny", rule_id: null, user_id: DANA });
+      expect(e.reason).toMatch(/not governed/);
+    }
+    // And one row for every Loan tool too: six decisions, six rows.
+    expect(events).toHaveLength(6);
   });
 
-  test("fails closed when the policy is unavailable: denies everything named, says why", () => {
+  test("fails closed when the policy is unavailable: denies everything named, one row per tool, says why", () => {
     const { response, events } = handleAccess(
       { user_id: DANA, toolkits: { Loan: { tools: LOAN_TOOLS } } },
       failed,
       ctx,
     );
     expect(response).toEqual({ deny: { Loan: { tools: LOAN_TOOLS } } });
-    expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ tool: "Loan.*", decision: "deny", rule_id: null });
-    expect(events[0]?.reason).toContain("FAIL-CLOSED");
-    expect(events[0]?.reason).toContain("Policy failed to compile");
+    expect(events.map((e) => e.tool).sort()).toEqual(
+      ["Loan.ApproveLoan", "Loan.DenyLoan", "Loan.GetLoan", "Loan.SearchLoans"],
+    );
+    for (const e of events) {
+      expect(e).toMatchObject({ decision: "deny", rule_id: null });
+      expect(e.reason).toContain("FAIL-CLOSED");
+      expect(e.reason).toContain("Policy failed to compile");
+    }
+  });
+
+  test("a cold cache denies everything — it never loads policy on a hook call", () => {
+    const { response, events } = handleAccess(
+      { user_id: DANA, toolkits: { Loan: { tools: LOAN_TOOLS } } },
+      cold,
+      ctx,
+    );
+    expect(response).toEqual({ deny: { Loan: { tools: LOAN_TOOLS } } });
+    expect(events).toHaveLength(4);
+    expect(events[0]?.reason).toMatch(/has not loaded its policy yet/);
   });
 
   test("copes with a toolkit that lists no tools", () => {
@@ -232,6 +252,15 @@ describe("/pre — act 2", () => {
     expect(events[0]?.reason).toContain("FAIL-CLOSED");
     expect(events[0]?.reason).toContain("Policy failed to compile");
     expect(events[0]).toMatchObject({ decision: "deny", rule_id: null, tool: "Loan.GetLoan" });
+  });
+});
+
+describe("/pre — cold cache", () => {
+  test("denies with a short message and audits the reason", () => {
+    const { response, events } = handlePre(pre(DANA, "GetLoan", { loan_id: "LN-2291" }), cold, ctx);
+    expect(response.code).toBe("CHECK_FAILED");
+    expect(response.error_message).toMatch(/policy is unavailable/);
+    expect(events[0]?.reason).toMatch(/has not loaded its policy yet/);
   });
 });
 

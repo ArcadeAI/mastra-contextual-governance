@@ -20,6 +20,7 @@ import {
   qualify,
   type AccessHookRequest,
   type AccessHookResult,
+  type Decision,
   type GovernanceEvent,
   type PostHookRequest,
   type PostHookResult,
@@ -45,9 +46,14 @@ export interface Outcome<R> {
 
 /** Why a request is being failed closed, in the words the audit row carries. */
 function failClosedReason(state: CacheState, what: string): string {
-  return state.status === "failed"
-    ? `FAIL-CLOSED: the control plane could not load its policy (${state.error}), so ${what}.`
-    : `FAIL-CLOSED: ${what}.`;
+  switch (state.status) {
+    case "failed":
+      return `FAIL-CLOSED: the control plane could not load its policy (${state.error}), so ${what}.`;
+    case "cold":
+      return `FAIL-CLOSED: the control plane has not loaded its policy yet, so ${what}.`;
+    case "ready":
+      return `FAIL-CLOSED: ${what}.`;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -62,12 +68,11 @@ function failClosedReason(state: CacheState, what: string): string {
  * (every tool in the project fails). So each denied tool's entry is the
  * request's own entry for it, copied across.
  *
- * Audit granularity is deliberate. Tools in a governed toolkit get one row per
- * decision — allowed or hidden — because those are the rows act 1 is about. A
- * toolkit the catalogue does not govern is hidden wholesale by the engine
- * (fail-closed on an unknown toolkit), and with the whole project catalogue in
- * the request that could be thousands of rows saying the same thing; those get
- * one row per toolkit, `Toolkit.*`, with the engine's reason and the count.
+ * One audit row per tool decided, allowed or hidden, governed or not — the
+ * whole-project catalogue makes that thousands of rows per call, and that is
+ * the cost of a table a reviewer can reconstruct every decision from. The
+ * rows go in as one transaction (see `audit-log.ts`), and the bench shows the
+ * cost: tens of milliseconds against a 5 s budget.
  */
 export function handleAccess(
   request: AccessHookRequest,
@@ -79,61 +84,39 @@ export function handleAccess(
   const events: GovernanceEvent[] = [];
 
   const base = { ts, execution_id: "", hook: "access" as const, user_id: request.user_id };
+  const subject = findSubject(state, request.user_id);
 
   for (const [toolkit, info] of Object.entries(request.toolkits)) {
     const versionsByTool = info.tools ?? {};
     const names = Object.keys(versionsByTool);
     if (names.length === 0) continue;
 
-    if (state.status !== "ready") {
-      deny[toolkit] = { tools: { ...versionsByTool } };
-      events.push({
-        ...base,
-        id: ctx.newId(),
-        tool: qualify(toolkit, "*"),
-        decision: "deny",
-        reason: failClosedReason(
-          state,
-          `all ${names.length} tool(s) in "${toolkit}" are hidden from this user`,
-        ),
-        rule_id: null,
-      });
-      continue;
-    }
-
-    const subject = findSubject(state, request.user_id);
     const refs: ToolRef[] = names.map((name) => ({ toolkit, name }));
-    const decisions = resolveVisibility(subject, refs, state.policy);
-    const governed = toolkit in state.catalogue;
+    const decisions: readonly { tool: ToolRef; decision: Decision }[] =
+      state.status === "ready"
+        ? resolveVisibility(subject, refs, state.policy)
+        : refs.map((tool) => ({
+            tool,
+            decision: {
+              effect: "deny",
+              reason: failClosedReason(state, `${qualify(tool.toolkit, tool.name)} is hidden`),
+              rule_id: null,
+            },
+          }));
 
     const hidden: NonNullable<ToolkitInfo["tools"]> = {};
     for (const { tool, decision } of decisions) {
       if (decision.effect === "deny") hidden[tool.name] = versionsByTool[tool.name] ?? [];
-      if (governed) {
-        events.push({
-          ...base,
-          id: ctx.newId(),
-          tool: qualify(tool.toolkit, tool.name),
-          decision: decision.effect,
-          reason: decision.reason,
-          rule_id: decision.rule_id,
-        });
-      }
-    }
-    if (Object.keys(hidden).length > 0) deny[toolkit] = { tools: hidden };
-
-    if (!governed) {
-      // Every decision for an ungoverned toolkit is the same engine denial.
-      const first = decisions[0]?.decision;
       events.push({
         ...base,
         id: ctx.newId(),
-        tool: qualify(toolkit, "*"),
-        decision: first?.effect ?? "deny",
-        reason: `${first?.reason ?? "Ungoverned toolkit."} (${names.length} tool(s) hidden)`,
-        rule_id: first?.rule_id ?? null,
+        tool: qualify(tool.toolkit, tool.name),
+        decision: decision.effect,
+        reason: decision.reason,
+        rule_id: decision.rule_id,
       });
     }
+    if (Object.keys(hidden).length > 0) deny[toolkit] = { tools: hidden };
   }
 
   return { response: { deny }, events };

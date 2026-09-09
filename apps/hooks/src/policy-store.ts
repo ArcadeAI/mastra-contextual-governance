@@ -223,7 +223,9 @@ const SCHEMA = `
     before       TEXT,
     after        TEXT
   );
-  CREATE INDEX idx_audit_log_ts ON audit_log(ts);
+  -- seq already orders rows by time, so no index on ts: a whole-project
+  -- /access appends ~10k rows in one transaction, and every index is paid
+  -- for on each of them.
   CREATE INDEX idx_audit_log_execution ON audit_log(execution_id);
 
   -- Append-only, enforced by the database rather than by convention. A

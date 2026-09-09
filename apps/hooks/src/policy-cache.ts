@@ -6,26 +6,41 @@
  * those calls does not survive that, and a timeout there does not look like a
  * policy problem: every tool in the project fails with "tool access policy
  * service could not be reached". So the compiled policy and the subject roster
- * live here, and a hook call touches the database only to append its audit row.
+ * live here, and **a hook call touches the database only to append its audit
+ * rows**. `current()` is a memory read and nothing else.
  *
  * But the database carries live edits. A presenter raises Dana's clearance in
  * act 1 and expects act 3 to honour it; a rule the cache never picks up is the
- * same failure as losing the edit to a restart. So the cache is not
- * time-based. Every write to `subjects`, `catalogue` or `policy_rules` bumps
- * `policy_revision` (triggers, see `policy-store.ts`), and `current()` reads
- * that one integer on every call — one indexed row, microseconds — and reloads
- * when it has moved. An edit from any connection is live on the next hook call,
- * and the reload is logged and visible on `/health` as `revision` and
- * `loaded_at`, so "did my edit take?" has an answer that is not "rerun the
+ * same failure as losing the edit to a restart. So a background poller reads
+ * one integer, `policy_revision` — bumped by triggers on every write to
+ * `subjects`, `catalogue` or `policy_rules`, from any connection — every
+ * `pollMs` (default 250 ms) and reloads when it has moved. An edit made with a
+ * `sqlite3` shell on the Render disk is live within a quarter of a second, the
+ * reload is logged, and `/health` reports `revision`, `loaded_at` and
+ * `last_poll_at`, so "did my edit take?" has an answer that is not "rerun the
  * prompt and see".
  *
- * A reload that fails — a hand-edited row that no longer parses, a rule that
- * no longer compiles because it names a tool the catalogue lost — puts the
- * cache in the `failed` state, and every hook fails closed until the next
- * successful reload. Not "keep serving the last good policy": that would be a
- * policy edit silently not taking effect, which is exactly the failure this
- * design exists to avoid. The error is on `/health` and in the log, and the
- * fix is another edit, which triggers another reload attempt.
+ * Three states, and only one of them serves policy:
+ *
+ * - `cold` — `start()` has not run. Every hook fails closed. Boot calls
+ *   `start()` before the port opens, so this is never served in practice; it
+ *   exists so that a server constructed without a warm cache denies rather
+ *   than performing, on Arcade's first 1.6 MB request, exactly the database
+ *   load the cache was built to avoid.
+ * - `ready` — serving the policy at `revision`.
+ * - `failed` — the last reload failed: a hand-edited row that no longer
+ *   parses, a rule that no longer compiles because it names a tool the
+ *   catalogue lost. Every hook fails closed until the next successful reload,
+ *   which the next edit triggers. Not "keep serving the last good policy":
+ *   that would be a policy edit silently not taking effect, which is exactly
+ *   the failure this design exists to avoid.
+ *
+ * A *poll* that fails is different from a *reload* that fails. A transient
+ * error reading one integer says nothing about the policy in memory, so the
+ * cache keeps serving it, logs, and retries next tick. Only when the revision
+ * has been unreadable for `maxPollFailures` consecutive ticks (default 20, so
+ * ~5 s) does the cache fail closed — at that point it can no longer promise
+ * that an edit would be noticed, and that promise is the point.
  */
 import type { Database } from "bun:sqlite";
 
@@ -35,6 +50,7 @@ import type { Subject } from "@cg/policy-schema";
 import { readPolicy, readRevision } from "./policy-store.ts";
 
 export type CacheState =
+  | { status: "cold" }
   | {
       status: "ready";
       revision: number;
@@ -52,18 +68,47 @@ export type CacheState =
       error: string;
     };
 
-export interface PolicyCache {
-  /** The policy as of the database's current revision, reloading if it moved. */
-  current(): CacheState;
-  /** Unconditional reload. Boot calls it so a cold cache is never served. */
-  reload(): CacheState;
+/** What `/health` shows about the cache. */
+export interface CacheStatus {
+  status: CacheState["status"];
+  revision: number | null;
+  loaded_at: string | null;
+  failed_at: string | null;
+  error: string | null;
+  poll_ms: number;
+  last_poll_at: string | null;
+  consecutive_poll_failures: number;
 }
 
-export function createPolicyCache(
-  db: Database,
-  log: (line: string) => void = () => {},
-): PolicyCache {
-  let state: CacheState | null = null;
+export interface PolicyCache {
+  /** The policy in memory. Never touches the database. */
+  current(): CacheState;
+  /** Loads the policy now and starts polling the revision. Idempotent. */
+  start(): CacheState;
+  /** Stops polling. Tests and scripts call it so the process can exit. */
+  stop(): void;
+  /** Unconditional reload, synchronous. `start()` calls it; tests may too. */
+  reload(): CacheState;
+  /** One poll tick, synchronous. Exposed so a test can drive it without a clock. */
+  poll(): CacheState;
+  status(): CacheStatus;
+}
+
+export interface PolicyCacheOptions {
+  log?: (line: string) => void;
+  pollMs?: number;
+  maxPollFailures?: number;
+}
+
+export function createPolicyCache(db: Database, options: PolicyCacheOptions = {}): PolicyCache {
+  const log = options.log ?? (() => {});
+  const pollMs = options.pollMs ?? 250;
+  const maxPollFailures = options.maxPollFailures ?? 20;
+
+  let state: CacheState = { status: "cold" };
+  let timer: ReturnType<typeof setInterval> | null = null;
+  let lastPollAt: string | null = null;
+  let pollFailures = 0;
 
   const reload = (): CacheState => {
     let revision: number | null = null;
@@ -92,27 +137,55 @@ export function createPolicyCache(
     return state;
   };
 
-  const current = (): CacheState => {
-    if (state === null) return reload();
+  const poll = (): CacheState => {
+    lastPollAt = new Date().toISOString();
     let revision: number;
     try {
       revision = readRevision(db);
     } catch (cause) {
-      // The one read the hot path makes. If it fails, the store is unusable
-      // and the honest state is failed, not "whatever we loaded last".
+      pollFailures += 1;
       const error = cause instanceof Error ? cause.message : String(cause);
-      state = { status: "failed", revision: null, failed_at: new Date().toISOString(), error };
-      log(`policy revision unreadable — failing closed: ${error}`);
+      if (pollFailures >= maxPollFailures && state.status !== "failed") {
+        state = { status: "failed", revision: null, failed_at: lastPollAt, error: `policy revision unreadable for ${pollFailures} polls: ${error}` };
+        log(`policy revision unreadable for ${pollFailures} polls — failing closed: ${error}`);
+      } else if (pollFailures === 1) {
+        log(`policy revision unreadable (serving cached revision meanwhile): ${error}`);
+      }
       return state;
     }
-    // A failed state is retried on every call until an edit fixes it: the
-    // revision it failed at is recorded, so an unchanged database is not
-    // re-parsed on each hook call for the same error.
-    if (revision !== state.revision) return reload();
+    pollFailures = 0;
+    const loaded = state.status === "cold" ? null : state.revision;
+    if (revision !== loaded) reload();
     return state;
   };
 
-  return { current, reload };
+  const start = (): CacheState => {
+    if (state.status === "cold") reload();
+    if (timer === null) {
+      timer = setInterval(poll, pollMs);
+      // A pending tick must not keep a test or a script alive.
+      if (typeof timer === "object" && "unref" in timer) timer.unref();
+    }
+    return state;
+  };
+
+  const stop = (): void => {
+    if (timer !== null) clearInterval(timer);
+    timer = null;
+  };
+
+  const status = (): CacheStatus => ({
+    status: state.status,
+    revision: state.status === "cold" ? null : state.revision,
+    loaded_at: state.status === "ready" ? state.loaded_at : null,
+    failed_at: state.status === "failed" ? state.failed_at : null,
+    error: state.status === "failed" ? state.error : null,
+    poll_ms: pollMs,
+    last_poll_at: lastPollAt,
+    consecutive_poll_failures: pollFailures,
+  });
+
+  return { current: () => state, start, stop, reload, poll, status };
 }
 
 /**

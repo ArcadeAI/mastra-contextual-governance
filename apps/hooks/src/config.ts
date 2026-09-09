@@ -40,6 +40,11 @@ export interface HooksConfig {
    * failing with "policy service could not be reached".
    */
   deadlineMs: number;
+  /**
+   * How often the cache checks `policy_revision` for a live edit. The hook
+   * path itself never reads the database; this is the only policy read.
+   */
+  policyPollMs: number;
 }
 
 export function readConfig(env: Record<string, string | undefined> = process.env): HooksConfig {
@@ -62,6 +67,7 @@ export function readConfig(env: Record<string, string | undefined> = process.env
     approvalsToolkit: env.ARCADE_APPROVALS_TOOLKIT?.trim() || "Approvals",
     personaEmails,
     deadlineMs: Number(env.HOOK_DEADLINE_MS ?? 2500),
+    policyPollMs: Number(env.POLICY_POLL_MS ?? 250),
   };
 }
 
