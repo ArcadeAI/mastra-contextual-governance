@@ -20,10 +20,11 @@ and the `ResponseCode` enum. Do not edit it; `bun test` fails if the committed f
 what the vendored spec produces.
 
 `src/domain.ts` is **ours**, and hand-written: `Subject`, `PolicyRule`, `OutputRule`,
-`Decision`, `Grant`, `ApprovalRequest`, `GovernanceEvent`, plus the pieces they are built
-from. Domain-agnostic by rule — subjects, tools, inputs, clearances, never what the governed
-system happens to do. A type here that named the demo's business domain would break the
-promise that forking means replacing one app and touching nothing under `packages/`.
+`Decision`, `Grant`, `GrantRejectionReason`, `ApprovalRequest`, `GovernanceEvent`, plus the
+pieces they are built from. Domain-agnostic by rule — subjects, tools, inputs, clearances,
+never what the governed system happens to do. A type here that named the demo's business
+domain would break the promise that forking means replacing one app and touching nothing
+under `packages/`.
 
 `src/fixtures.ts` builds valid instances of both. Every builder takes a deep-partial
 override and returns `schema.parse()` output, so a fixture cannot drift out of conformance
@@ -45,7 +46,7 @@ understand, producing a validator that accepts everything and a test suite that 
 
 See `vendor/README.md` for the pin and how to move it.
 
-## Four choices worth knowing about
+## Five choices worth knowing about
 
 **Generated objects are `.passthrough()`; ours are `.strict()`.** Opposite settings, opposite
 reasons. Arcade's payloads may grow, and Zod 3 strips unknown keys by default — a new field
@@ -69,6 +70,14 @@ exactly; `ceiling` is `{ input, max }` and the input it names must be present, n
 no greater than `max`. That is what lets #10 accept a retry at or below the approved value
 and reject a replay above it — an exact-match input map cannot express the difference. Which
 input carries the bound is data, so nothing here learns what the number counts.
+
+**A rejected grant says why, in a shape two consumers can render.**
+`GrantRejectionReason` is a discriminated union on `kind` — `expired`, `consumed`,
+`self_approved`, `ceiling_exceeded`, `unenforceable` and the rest — and every arm carries the
+values that produced it, because a compliance reviewer has to explain an outcome to an
+auditor (PRD stories 19–22) and "invalid" is not an explanation. `GRANT_REJECTION_KINDS`
+lists them, which is how #10's test suite proves it exercises every one. The checking itself
+is `@cg/governance-core`'s `checkGrant`.
 
 ## Writing policy
 

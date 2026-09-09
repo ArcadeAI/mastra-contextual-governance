@@ -37,6 +37,8 @@ export {
   FieldRedaction,
   GovernanceEvent,
   Grant,
+  GRANT_REJECTION_KINDS,
+  GrantRejectionReason,
   HookPoint,
   Inputs,
   OutputRule,

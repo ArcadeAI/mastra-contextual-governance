@@ -134,3 +134,85 @@ All conditions on a rule must hold. `input` is a dot path into the call's inputs
 
 Numbers are not coerced: `"95"` is malformed, not ninety-five, and the denial says so and
 asks for a number. The limit itself is inclusive — exactly at clearance is allowed.
+
+## GrantChecker (`src/grant-checker.ts`, #10)
+
+Pure, clock injected. Does a grant authorise **this** call?
+
+```ts
+import { checkGrant, selectGrant, consumeGrant, isGrantRejection } from "@cg/governance-core";
+
+// One grant against one call.
+const result = checkGrant({ grant, subject, tool, inputs, now: new Date() });
+
+// Or a set of them — what /pre actually does with the rows for this subject.
+const { grant, rejected } = selectGrant({ grants, subject, tool, inputs, now });
+
+if (grant) {
+  const decision = evaluatePermission({ subject, tool, inputs, policy, grants: [grant] });
+  // …then, once the call has happened:
+  await store.save(consumeGrant(grant));
+}
+```
+
+`checkGrant` returns a `ValidatedGrant` — the only type `evaluatePermission` accepts, and
+`attestGrantValidated` is called exactly once, on the last line of the happy path — or a
+`GrantRejection`. Narrow with `isGrantRejection`. `selectGrant` is `checkGrant` over a set:
+the first valid grant wins, and *every* rejection is reported so the audit row can show that
+a stale grant was present and was not what authorised the call. No grants at all is an
+ordinary outcome, not an error.
+
+**It must be run against the inputs of the call being made.** The engine reads nothing of a
+grant beyond `subject_id`, `match` and `id`; expiry, uses, approver, resource, pinned inputs
+and the ceiling are checked here or nowhere. A grant validated once in the abstract and then
+applied to a different resource at any amount is exactly the replay this module exists to
+stop.
+
+### Checking is not consuming
+
+Two functions, deliberately. `checkGrant` has no side effects and never decrements anything;
+`consumeGrant` spends one use and checks nothing. The caller checks, acts, then consumes and
+persists — single use is enforced by the row, so a `consumeGrant` result that is never saved
+is not a use. `consumeGrant` returns a plain `Grant`, not a `ValidatedGrant`, so a consumed
+grant cannot go back to the engine without a fresh check.
+
+### What is checked, in order
+
+| # | Check | Rejection `kind` |
+|---|---|---|
+| 1 | The grant can constrain something at all: no wildcard in `match`, parseable timestamps, a finite ceiling, no input both pinned and bounded, `resource_id` carried by a pinned input | `unenforceable` |
+| 2 | `granted_by ≠ subject_id` | `self_approved` |
+| 3 | `subject_id` is the caller | `subject_mismatch` |
+| 4 | Not revoked | `revoked` |
+| 5 | `now` inside `[issued_at, expires_at)` | `not_yet_valid`, `expired` |
+| 6 | Uses left (`null` is unlimited) | `consumed` |
+| 7 | Exactly this `toolkit` and `tool` | `tool_mismatch` |
+| 8 | Every pinned input present with the approved value | `resource_mismatch`, `pinned_input_mismatch` |
+| 9 | The call's value on the bounded input is at or below `ceiling.max` | `ceiling_exceeded`, `ceiling_input_missing`, `ceiling_input_not_numeric` |
+
+Order fixes which reason a grant that fails several checks is reported with, and it is
+deliberate: a malformed grant reads as malformed rather than as a scope mismatch, because
+the fix is different — one is a bug in whatever issued it, the other is the control working.
+
+The window excludes its end: a grant good "until 12:15" is not good *at* 12:15.000. The
+ceiling includes its bound: an approval for 95,000 authorises 95,000, mirroring
+`exceeds_clearance`. Numbers are not coerced here either — `"95000"` is not ninety-five
+thousand.
+
+**Row 1 is the one to read twice.** A grant that constrains nothing is worse than no grant:
+it is indistinguishable from a grant that permits, and it looks like a working control. A
+`*` in a grant's `match` would authorise every tool it covers; a `resource_id` that no
+pinned input carries is decorative, because nothing else in the system knows which argument
+names the resource. Both are refused rather than ignored.
+
+### Rejections
+
+Every rejection carries a `GrantRejectionReason` — a discriminated union in
+`@cg/policy-schema`, so the audit log and the panel render the same record — plus a
+one-sentence `message` naming the values that produced it: *"The grant authorises
+`"quantity"` up to 95, but the call passed 500000."* A compliance reviewer has to be able to
+explain an outcome to an auditor (PRD stories 19–22), and "invalid" is not an explanation.
+
+These are **not** the strings the model reads. A blocked call's remediation instruction is
+the policy rule's `reason`; a grant that fails to lift a denial leaves that denial, and its
+instruction, in place.

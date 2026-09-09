@@ -67,6 +67,8 @@ import {
   type ToolMatcher,
 } from "@cg/policy-schema";
 
+import { deepEqual, readPath } from "./inputs.ts";
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -912,28 +914,6 @@ function compare(
     case "lte":
       return actual <= bound;
   }
-}
-
-/** `a.b.c` into a nested record. `undefined` when any segment is missing. */
-function readPath(root: unknown, path: string): unknown {
-  let current: unknown = root;
-  for (const segment of path.split(".")) {
-    if (typeof current !== "object" || current === null) return undefined;
-    current = (current as Record<string, unknown>)[segment];
-  }
-  return current;
-}
-
-function deepEqual(a: unknown, b: unknown): boolean {
-  if (a === b) return true;
-  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
-  if (Array.isArray(a) !== Array.isArray(b)) return false;
-  const ka = Object.keys(a as object);
-  const kb = Object.keys(b as object);
-  if (ka.length !== kb.length) return false;
-  return ka.every((k) =>
-    deepEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]),
-  );
 }
 
 /** A short, quoted rendering of a value for a denial reason. */

@@ -389,6 +389,122 @@ export const Grant = z
   .strict();
 export type Grant = z.infer<typeof Grant>;
 
+/**
+ * Why a grant did not authorise a call.
+ *
+ * A boolean would be cheaper and useless. The audit log has to *explain* an
+ * outcome to a compliance reviewer (PRD stories 19–22) — "the grant was for
+ * WID-1 and the call named WID-9" is the explanation; "invalid" is not —
+ * and the control-plane panel renders the same records. So every rejection
+ * carries the values that produced it, and this is a discriminated union
+ * rather than a string so both consumers can branch on `kind` and neither has
+ * to parse prose.
+ *
+ * The grouping, which is also `GrantChecker`'s (#10) order of checks:
+ *
+ * - `unenforceable` — the grant itself is malformed or self-contradictory, so
+ *   it constrains nothing. A grant that constrains nothing is worse than no
+ *   grant: it is indistinguishable from a grant that permits.
+ * - **who** — `self_approved`, `subject_mismatch`
+ * - **when** — `revoked`, `not_yet_valid`, `expired`
+ * - **how many** — `consumed`
+ * - **what** — `tool_mismatch`, `resource_mismatch`, `pinned_input_mismatch`
+ * - **how much** — `ceiling_exceeded`, `ceiling_input_missing`,
+ *   `ceiling_input_not_numeric`
+ *
+ * `checked_at` is on the time-based arms because the reviewer's first question
+ * about an expiry is always "expired relative to what". It is the `now` the
+ * checker was handed, never a clock it read.
+ */
+export const GrantRejectionReason = z.discriminatedUnion("kind", [
+  /** `problem` is one sentence naming the contradiction. */
+  z.object({ kind: z.literal("unenforceable"), problem: z.string().min(1) }).strict(),
+
+  // who ---------------------------------------------------------------------
+  /** `granted_by` equals `subject_id`: the approver approved themselves. */
+  z
+    .object({
+      kind: z.literal("self_approved"),
+      subject_id: z.string(),
+      granted_by: z.string(),
+    })
+    .strict(),
+  /** The grant empowers someone other than the subject making this call. */
+  z
+    .object({
+      kind: z.literal("subject_mismatch"),
+      granted_to: z.string(),
+      presented_by: z.string(),
+    })
+    .strict(),
+
+  // when --------------------------------------------------------------------
+  z
+    .object({ kind: z.literal("revoked"), revoked_at: Timestamp, checked_at: Timestamp })
+    .strict(),
+  /** Presented before it was issued — a forged or mis-stamped record. */
+  z
+    .object({ kind: z.literal("not_yet_valid"), issued_at: Timestamp, checked_at: Timestamp })
+    .strict(),
+  z
+    .object({ kind: z.literal("expired"), expires_at: Timestamp, checked_at: Timestamp })
+    .strict(),
+
+  // how many ----------------------------------------------------------------
+  /** Single use is the default, so this is the replay of an already-used grant. */
+  z.object({ kind: z.literal("consumed"), uses_remaining: z.number().int() }).strict(),
+
+  // what --------------------------------------------------------------------
+  /** Both sides are `Toolkit.tool`, the form `GovernanceEvent.tool` carries. */
+  z
+    .object({ kind: z.literal("tool_mismatch"), granted_for: z.string(), called: z.string() })
+    .strict(),
+  /** The pinned input carrying the grant's `resource_id` named something else. */
+  z
+    .object({
+      kind: z.literal("resource_mismatch"),
+      input: z.string(),
+      granted_resource_id: z.string(),
+      actual: z.unknown(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("pinned_input_mismatch"),
+      input: z.string(),
+      expected: z.unknown(),
+      actual: z.unknown(),
+    })
+    .strict(),
+
+  // how much ----------------------------------------------------------------
+  /** The replay this module exists to stop: approved for `max`, called with `actual`. */
+  z
+    .object({
+      kind: z.literal("ceiling_exceeded"),
+      input: z.string(),
+      max: z.number(),
+      actual: z.number(),
+    })
+    .strict(),
+  /** A ceiling on an input the call did not carry bounds nothing. */
+  z.object({ kind: z.literal("ceiling_input_missing"), input: z.string() }).strict(),
+  /** `"95000"` is not ninety-five thousand. Numbers are never coerced. */
+  z
+    .object({
+      kind: z.literal("ceiling_input_not_numeric"),
+      input: z.string(),
+      actual: z.unknown(),
+    })
+    .strict(),
+]);
+export type GrantRejectionReason = z.infer<typeof GrantRejectionReason>;
+
+/** Every `kind` the union carries, for exhaustiveness checks in tests. */
+export const GRANT_REJECTION_KINDS = GrantRejectionReason.options.map(
+  (option) => option.shape.kind.value,
+);
+
 // ---------------------------------------------------------------------------
 // GovernanceEvent — the audit row and the SSE frame
 // ---------------------------------------------------------------------------
