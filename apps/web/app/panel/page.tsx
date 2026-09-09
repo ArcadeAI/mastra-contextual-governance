@@ -16,7 +16,7 @@
 import type { Metadata } from "next";
 
 import { ControlPlanePanel } from "../../components/governance/ControlPlanePanel.tsx";
-import { governanceStreamSource } from "../../lib/governance/stream-url.ts";
+import { governanceStreamSource, withFixtureParams } from "../../lib/governance/stream-url.ts";
 
 export const metadata: Metadata = { title: "Control plane — Contextual Governance" };
 
@@ -24,8 +24,16 @@ export const metadata: Metadata = { title: "Control plane — Contextual Governa
 // rendered page would bake in whatever the build machine had.
 export const dynamic = "force-dynamic";
 
-export default function PanelPage() {
-  const { url, mode } = governanceStreamSource(process.env);
+export default async function PanelPage({
+  searchParams,
+}: {
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
+  // In fixture mode the page's own query string tunes the replay, so
+  // `/panel?repeat=2000&delayMs=0` is ten thousand events as fast as the socket
+  // will carry them — the shape of a whole-project `/access` call, and the way
+  // to watch the panel absorb one rather than take a test's word for it.
+  const { url, mode } = withFixtureParams(governanceStreamSource(process.env), await searchParams);
 
   return (
     <main className="cg-page">

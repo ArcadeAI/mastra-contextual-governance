@@ -22,16 +22,44 @@ const DEFAULT_DELAY_MS = 900;
 /** Keeps the connection open once the story has played out. */
 const KEEP_ALIVE_MS = 15_000;
 
+/** Cap on `repeat`, so a mistyped URL cannot ask for a million events. */
+const MAX_REPEAT = 4000;
+
 /** Plain timers, not `Bun.sleep`: this runs under whichever runtime Next uses. */
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * A whole number in `[1, max]` from a query parameter, or `fallback`.
+ *
+ * `Number(null)` is 0, not `NaN`, so an absent parameter has to be checked for
+ * rather than coerced — a bug this route shipped with for one commit, where the
+ * default pacing silently became "all at once" and the acts landed on top of
+ * each other.
+ */
+function positiveParam(
+  params: URLSearchParams,
+  name: string,
+  fallback: number,
+  { min, max }: { min: number; max: number },
+): number {
+  const raw = params.get(name);
+  if (raw === null) return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < min || value > max) return fallback;
+  return value;
+}
+
 export function GET(request: Request): Response {
-  // `Number(null)` is 0, not NaN, so an absent parameter has to be checked for
-  // rather than coerced — otherwise the default pacing silently becomes "all at
-  // once" and the acts land on top of each other.
-  const requested = new URL(request.url).searchParams.get("delayMs");
-  const parsed = requested === null ? Number.NaN : Number(requested);
-  const delayMs = Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_DELAY_MS;
+  const params = new URL(request.url).searchParams;
+  const delayMs = positiveParam(params, "delayMs", DEFAULT_DELAY_MS, { min: 0, max: 60_000 });
+  /**
+   * How many times to replay the sequence. `?repeat=2000&delayMs=0` is ten
+   * thousand events as fast as the socket takes them — the shape of a
+   * whole-project `/access`, which decides 10,844 tools in one call. It is here
+   * so "handles a burst without dropping or reordering" is something a
+   * presenter can watch happen rather than something a test asserts alone.
+   */
+  const repeat = Math.floor(positiveParam(params, "repeat", 1, { min: 1, max: MAX_REPEAT }));
 
   const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
@@ -54,15 +82,20 @@ export function GET(request: Request): Response {
       // than after the first event a second later.
       send(": governance fixture stream\n\n");
 
-      for (const event of aGovernanceEventSequence()) {
-        if (!open) break;
-        await sleep(delayMs);
-        if (!open) break;
-        send(
-          `event: ${GOVERNANCE_EVENT_NAME}\n` +
-            `id: ${event.id}\n` +
-            `data: ${JSON.stringify(event)}\n\n`,
-        );
+      for (let pass = 0; open && pass < repeat; pass += 1) {
+        for (const event of aGovernanceEventSequence()) {
+          if (!open) break;
+          if (delayMs > 0) await sleep(delayMs);
+          if (!open) break;
+          // Each pass needs its own ids, or the timeline de-duplicates the
+          // repeat away and the burst never reaches the panel at all.
+          const replayed = pass === 0 ? event : { ...event, id: `${event.id}_${pass}` };
+          send(
+            `event: ${GOVERNANCE_EVENT_NAME}\n` +
+              `id: ${replayed.id}\n` +
+              `data: ${JSON.stringify(replayed)}\n\n`,
+          );
+        }
       }
 
       // Hold the connection rather than closing it. A close would send the

@@ -250,6 +250,9 @@ body {
   display: flex;
   flex-direction: column;
   gap: 0.6em;
+  /* A card clipped by the bottom of the lane should read as "there is more",
+     not as a rendering fault. The lane's header already says how many more. */
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 3em), transparent 100%);
 }
 
 .cg-lane-empty {
@@ -259,11 +262,10 @@ body {
 }
 
 .cg-lane-behind {
+  margin: 0.3em 0 0;
   font-size: 0.8em;
   font-family: var(--font-mono);
   color: var(--neutral);
-  padding-top: 0.2em;
-  flex: none;
 }
 
 /*
@@ -452,6 +454,10 @@ body {
   font-size: 0.8em;
   color: var(--neutral);
   margin: 0;
+  /* Capped rather than run across the full width: a line of eighty characters
+     is the limit of what anybody reads in one pass, and this is the one piece
+     of prose on the panel. */
+  max-width: 72ch;
 }
 
 @media (prefers-reduced-motion: reduce) {

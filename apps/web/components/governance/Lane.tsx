@@ -55,6 +55,17 @@ export function Lane({
           {lane.name}
         </h3>
         <p className="cg-lane-gloss">{lane.gloss}</p>
+        {/*
+          In the header, not under the cards. Under them it is the first thing a
+          burst pushes out of a lane that clips its overflow — so the one line
+          saying "there is more than this" would disappear exactly when it
+          became true, which is the silent-drop failure this panel must not have.
+        */}
+        {notDrawn > 0 && (
+          <p className="cg-lane-behind">
+            {notDrawn.toLocaleString("en-US")} earlier {notDrawn === 1 ? "decision" : "decisions"}
+          </p>
+        )}
       </header>
 
       <div className="cg-lane-events">
@@ -64,11 +75,6 @@ export function Lane({
           drawn.map((event) => (
             <EventCard key={event.id} event={event} correlated={correlatedIds.has(event.id)} />
           ))
-        )}
-        {notDrawn > 0 && (
-          <p className="cg-lane-behind">
-            {notDrawn.toLocaleString("en-US")} earlier {notDrawn === 1 ? "decision" : "decisions"}
-          </p>
         )}
       </div>
     </section>

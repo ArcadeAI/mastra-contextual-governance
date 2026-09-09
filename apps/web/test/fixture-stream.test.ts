@@ -10,7 +10,11 @@ import { aGovernanceEventSequence } from "@cg/policy-schema";
 import { GET } from "../app/api/governance/fixture-stream/route.ts";
 import { subscribeToGovernanceEvents } from "../lib/governance/subscribe.ts";
 import { allEvents, appendEvents, emptyTimeline, type Timeline } from "../lib/governance/timeline.ts";
-import { governanceStreamSource } from "../lib/governance/stream-url.ts";
+import {
+  FIXTURE_STREAM_PATH,
+  governanceStreamSource,
+  withFixtureParams,
+} from "../lib/governance/stream-url.ts";
 
 const servers: Array<ReturnType<typeof Bun.serve>> = [];
 
@@ -181,5 +185,76 @@ describe("which stream the panel is pointed at", () => {
     expect(governanceStreamSource({ GOVERNANCE_STREAM: "hooks", HOOKS_PUBLIC_HOST: "  " }).mode).toBe(
       "fixture",
     );
+  });
+});
+
+describe("the burst the panel has to survive", () => {
+  test("repeat multiplies the sequence, with distinct ids so none de-duplicate away", async () => {
+    const timeline = await play(`${serveFixtureRoute()}?delayMs=0&repeat=200`, 1000);
+
+    expect(timeline.received).toBe(1000);
+    expect(timeline.counts.allow + timeline.counts.deny + timeline.counts.modify).toBe(1000);
+  });
+
+  test("a thousand events keep their arrival order end to end", async () => {
+    const url = `${serveFixtureRoute()}?delayMs=0&repeat=200`;
+    const seen: string[] = [];
+    const controller = new AbortController();
+    const done = subscribeToGovernanceEvents(url, {
+      onEvents: (batch) => seen.push(...batch.map((event) => event.id)),
+      signal: controller.signal,
+      retryMs: 20,
+    });
+
+    await until(() => seen.length >= 1000, "a thousand events");
+    controller.abort();
+    await done;
+
+    const expected = Array.from({ length: 200 }, (_, pass) =>
+      aGovernanceEventSequence().map((event) => (pass === 0 ? event.id : `${event.id}_${pass}`)),
+    ).flat();
+
+    expect(seen.slice(0, 1000)).toEqual(expected.slice(0, 1000));
+  });
+
+  test("repeat is capped, so a mistyped URL cannot ask for a million events", async () => {
+    // 9,999,999 would take minutes; the cap turns it into a bounded replay.
+    const timeline = await play(`${serveFixtureRoute()}?delayMs=0&repeat=9999999`, 5);
+
+    expect(timeline.received).toBeGreaterThanOrEqual(5);
+  });
+
+  test("a junk repeat falls back to one pass rather than erroring", async () => {
+    const timeline = await play(`${serveFixtureRoute()}?delayMs=0&repeat=banana`, 5);
+
+    expect(timeline.received).toBe(5);
+  });
+});
+
+describe("fixture pacing carried from the page's own query string", () => {
+  const fixture = { url: FIXTURE_STREAM_PATH, mode: "fixture" } as const;
+
+  test("no parameters leaves the URL alone", () => {
+    expect(withFixtureParams(fixture, {})).toEqual(fixture);
+  });
+
+  test("delayMs and repeat are carried over", () => {
+    expect(withFixtureParams(fixture, { repeat: "2000", delayMs: "0" }).url).toBe(
+      "/api/governance/fixture-stream?delayMs=0&repeat=2000",
+    );
+  });
+
+  test("anything else on the page's query string is not", () => {
+    expect(withFixtureParams(fixture, { persona: "dana", token: "secret" })).toEqual(fixture);
+  });
+
+  test("a repeated parameter takes its first value", () => {
+    expect(withFixtureParams(fixture, { repeat: ["3", "9"] }).url).toContain("repeat=3");
+  });
+
+  test("the hook server's stream is never given query parameters", () => {
+    const hooks = { url: "https://cg-hooks.onrender.com/events", mode: "hooks" } as const;
+
+    expect(withFixtureParams(hooks, { repeat: "2000" })).toEqual(hooks);
   });
 });
