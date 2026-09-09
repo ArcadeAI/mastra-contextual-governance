@@ -28,14 +28,23 @@ from typing import Any
 
 import httpx
 
-__all__ = ["SLACK_SCOPES", "SlackError", "api_base_url", "lookup_user_by_email", "post_message"]
+__all__ = [
+    "SLACK_SCOPES",
+    "SlackError",
+    "api_base_url",
+    "lookup_user_by_email",
+    "open_direct_message",
+    "post_message",
+]
 
-#: Exactly the scopes the tool declares, and the reason there are four rather
-#: than three: `users:read` is a prerequisite for `users:read.email`, and Slack
-#: refuses the authorize request outright without it — "Arcade.dev could not be
-#: installed. Invalid permissions requested", before any consent screen
-#: (spike #3, transcript §8). Pinned in `.env.example` alongside this list.
-SLACK_SCOPES = ["chat:write", "users:read", "users:read.email", "users.profile:read"]
+#: Exactly the scopes spike #3 exercised, in the order it lists them. Four
+#: rather than three because `users:read` is a prerequisite for
+#: `users:read.email`: Slack refuses the authorize request outright without it
+#: — "Arcade.dev could not be installed. Invalid permissions requested", before
+#: any consent screen (spike #3, transcript §8). `im:write` is what
+#: `conversations.open` needs, and opening the DM is how the spike reached the
+#: approver. Pinned in `.env.example` alongside this list.
+SLACK_SCOPES = ["chat:write", "im:write", "users:read", "users:read.email"]
 
 _DEFAULT_API_BASE_URL = "https://slack.com/api"
 
@@ -89,14 +98,25 @@ async def lookup_user_by_email(token: str, email: str) -> str:
     return str(user_id)
 
 
+async def open_direct_message(token: str, user_id: str) -> str:
+    """Open the DM with a Slack user and return its `D…` channel id.
+
+    Needs `im:write`. This is the call spike #3 exercised, and posting to the
+    channel it returns is the path that was measured end to end — rather than
+    handing `chat.postMessage` a bare user id and trusting Slack to resolve it,
+    which nothing here has observed.
+    """
+    body = await _call(token, "conversations.open", {"users": user_id})
+    channel = (body.get("channel") or {}).get("id")
+    if not channel:
+        raise SlackError("conversations.open", "no_channel_in_response")
+    return str(channel)
+
+
 async def post_message(
     token: str, channel: str, text: str, blocks: list[dict[str, Any]]
 ) -> dict[str, str]:
-    """Post to `channel` — a channel id, or a user id for that person's DM.
-
-    Passing a user id is deliberate: `chat.postMessage` resolves it to the DM,
-    which is why this toolkit needs no `im:write` and never calls
-    `conversations.open`. See the README's note on scopes.
+    """Post to `channel` — for a DM, the `D…` id `open_direct_message` returned.
 
     `text` is not decoration. Slack uses it for notification previews and for
     clients that cannot render blocks, so a message with blocks and no text

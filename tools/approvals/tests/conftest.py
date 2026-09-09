@@ -12,7 +12,9 @@ would reach the real thing. What the tests then assert is what actually arrived.
 
 `FakeSlack` is a Slack that answers the way Slack answers: `200 OK` with
 `{"ok": false, "error": …}` for a refusal, which is the shape a client that
-only checks status codes reads as success.
+only checks status codes reads as success. It serves the three methods spike #3
+exercised — `users.lookupByEmail`, `conversations.open`, `chat.postMessage` —
+and nothing else, so a call the spike never measured fails here too.
 
 The roster comes from `packages/policy-schema/contract/approver-routing-cases.json`,
 the same file `test_routing.py` and the TypeScript router read, so the cast a
@@ -162,7 +164,11 @@ class _StoreHandler(BaseHTTPRequestHandler):
 class SlackState:
     #: email -> Slack user id, as users.lookupByEmail resolves them.
     users: dict[str, str]
+    #: Slack user id -> the `D…` channel conversations.open returns for them.
+    dms: dict[str, str] = field(default_factory=dict)
     posted: list[dict[str, Any]] = field(default_factory=list)
+    #: Every Slack method that was called, in order.
+    calls: list[str] = field(default_factory=list)
     #: Slack's own error code to answer the next call with, if any.
     fail_with: str | None = None
     seen_tokens: list[str] = field(default_factory=list)
@@ -186,6 +192,7 @@ class _SlackHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         length = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(length) or b"{}")
+        self.state.calls.append(self.path.removeprefix("/api/"))
         self.state.seen_tokens.append(
             (self.headers.get("Authorization") or "").removeprefix("Bearer ")
         )
@@ -201,6 +208,15 @@ class _SlackHandler(BaseHTTPRequestHandler):
                 self._send({"ok": False, "error": "users_not_found"})
                 return
             self._send({"ok": True, "user": {"id": user_id}})
+            return
+
+        if self.path == "/api/conversations.open":
+            user_id = body.get("users", "")
+            channel = self.state.dms.get(user_id)
+            if channel is None:
+                self._send({"ok": False, "error": "user_not_found"})
+                return
+            self._send({"ok": True, "channel": {"id": channel}})
             return
 
         if self.path == "/api/chat.postMessage":
@@ -242,7 +258,8 @@ def slack() -> SlackState:
             SAM.user_id: "U_SAM",
             RILEY.user_id: "U_RILEY",
             MORGAN.user_id: "U_MORGAN",
-        }
+        },
+        dms={"U_DANA": "D_DANA", "U_SAM": "D_SAM", "U_RILEY": "D_RILEY", "U_MORGAN": "D_MORGAN"},
     )
     handler = type("_Bound", (_SlackHandler,), {"state": state})
     server, host = _serve(handler)

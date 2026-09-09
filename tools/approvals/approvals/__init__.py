@@ -43,7 +43,13 @@ from arcade_mcp_server.auth import Slack
 
 from approvals.message import ApprovalMessage, build_blocks, build_fallback_text, format_amount
 from approvals.routing import RoutingResult, Subject, route_approval
-from approvals.slack import SLACK_SCOPES, SlackError, lookup_user_by_email, post_message
+from approvals.slack import (
+    SLACK_SCOPES,
+    SlackError,
+    lookup_user_by_email,
+    open_direct_message,
+    post_message,
+)
 from approvals.store import (
     APPROVALS_STORE_TOKEN_SECRET,
     HOOKS_HOST_SECRET,
@@ -239,13 +245,15 @@ async def request_approval(
 
     slack_token = context.get_auth_token_or_empty()
     try:
-        # A user id is a valid `channel` for chat.postMessage — Slack resolves
-        # it to the DM. That is why this toolkit needs no `im:write` and never
-        # calls conversations.open.
+        # The three calls spike #3 exercised, in that order: resolve the
+        # approver's email to a Slack id, open the DM, post to the channel that
+        # returns. Handing chat.postMessage a bare user id would skip the
+        # middle call and one scope, but nothing has observed that path work.
         approver_slack_id = await lookup_user_by_email(slack_token, approver.user_id)
+        dm_channel = await open_direct_message(slack_token, approver_slack_id)
         posted = await post_message(
             slack_token,
-            approver_slack_id,
+            dm_channel,
             build_fallback_text(message),
             build_blocks(message),
         )

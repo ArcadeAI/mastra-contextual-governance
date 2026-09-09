@@ -74,28 +74,30 @@ Measured end to end in
 [`docs/spikes/03-slack-scopes.md`](../../docs/spikes/03-slack-scopes.md) (#3),
 which also records both fallbacks for a forker who wants a bot instead.
 
-Four scopes, not three:
+Four scopes, not three — exactly the set spike #3 exercised:
 
-    chat:write  users:read  users:read.email  users.profile:read
+    chat:write  im:write  users:read  users:read.email
 
-`users:read` is a prerequisite for `users:read.email` — Slack refuses the
-authorize request outright without it, before any consent screen.
+`users:read` is a prerequisite for `users:read.email`: Slack refuses the
+authorize request outright without it, before any consent screen. `im:write` is
+what `conversations.open` needs.
 
-⚠️ **This list differs from spike #3's by one scope, and the difference is
-deliberate but unverified against live Slack.** The spike declared
-`chat:write, im:write, users:read, users:read.email` and reached the DM with
-`users.lookupByEmail → conversations.open → chat.postMessage`.
-`conversations.open` is what needs `im:write`. Issue #18's `[control]` comment
-and `.env.example` both pin `users.profile:read` in its place, so this toolkit
-does not call `conversations.open` at all: it passes the approver's **user id**
-as `chat.postMessage`'s `channel` and lets Slack resolve the DM. That path was
-not exercised in the spike. If a live run returns `channel_not_found` on a user
-id, add `im:write` and `conversations.open` back — the code for it is two lines
-in `approvals/slack.py`, and the spike's transcript has the exact calls.
+The message reaches the approver by the route the spike measured, and only that
+route:
 
-`SLACK_APPROVALS_CHANNEL` in `.env.example` is **not read by this toolkit**.
-The message goes to the routed approver, because who was asked is the point
-being demonstrated; a fixed channel would lose it.
+    users.lookupByEmail  →  conversations.open  →  chat.postMessage to the D… channel
+
+Handing `chat.postMessage` a bare user id and letting Slack resolve the DM
+would drop the middle call and `im:write` with it. That was proposed on #18 and
+settled against, because nothing had observed it working and a DM that silently
+never arrives is the failure this whole slice exists to avoid.
+`tests/test_tools.py::test_reaches_the_dm_by_the_route_spike_3_measured` pins
+the call order, and the Slack stand-in serves those three methods and nothing
+else, so a call the spike never measured fails in the suite too.
+
+The message goes to the routed approver, never to a shared channel: who was
+asked is the point being demonstrated, and a fixed channel would lose it. There
+is no channel variable to set.
 
 ## Where the approval request lives
 

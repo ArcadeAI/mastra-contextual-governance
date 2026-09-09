@@ -57,11 +57,13 @@ class TestDefinition:
         auth = tool.definition.requirements.authorization
         assert auth is not None
         assert auth.provider_id == "slack"
-        # Four, not three: users:read is a prerequisite for users:read.email
-        # and Slack refuses the authorize request outright without it.
+        # Exactly the four spike #3 exercised. Four rather than three because
+        # users:read is a prerequisite for users:read.email and Slack refuses
+        # the authorize request outright without it; im:write is what
+        # conversations.open needs.
         assert sorted(auth.oauth2.scopes) == [
             "chat:write",
-            "users.profile:read",
+            "im:write",
             "users:read",
             "users:read.email",
         ]
@@ -221,9 +223,31 @@ class TestTheSlackMessage:
         await request_approval(as_dana, **ACT_TWO)
 
         assert len(slack.posted) == 1
-        # A user id as `channel` is the DM. No conversations.open, so no
-        # im:write — see the README's note on scopes.
-        assert slack.posted[0]["channel"] == "U_RILEY"
+        # The `D…` channel conversations.open returned for Riley, not a channel
+        # and not anyone else's DM.
+        assert slack.posted[0]["channel"] == "D_RILEY"
+
+    async def test_reaches_the_dm_by_the_route_spike_3_measured(
+        self, as_dana, store: StoreState, slack: SlackState
+    ) -> None:
+        # Resolve the email, open the DM, post to the channel that returns.
+        # Handing chat.postMessage a bare user id would skip the middle call
+        # and one scope, and nothing has observed that path work.
+        await request_approval(as_dana, **ACT_TWO)
+        assert slack.calls == [
+            "users.lookupByEmail",
+            "conversations.open",
+            "chat.postMessage",
+        ]
+
+    async def test_a_dm_that_will_not_open_is_reported_and_nothing_is_posted(
+        self, as_dana, store: StoreState, slack: SlackState
+    ) -> None:
+        slack.dms = {}
+        with pytest.raises(ToolExecutionError, match="user_not_found"):
+            await request_approval(as_dana, **ACT_TWO)
+        assert slack.posted == []
+        assert len(store.created) == 1
 
     async def test_the_posted_payload_is_block_kit_and_states_everything(
         self, as_dana, store: StoreState, slack: SlackState
