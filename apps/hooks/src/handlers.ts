@@ -198,22 +198,61 @@ export function handlePre(
 // ---------------------------------------------------------------------------
 
 /**
- * Pass-through, recorded. The `RedactionEngine` (#8) wires in at #16; until
- * then every output is allowed unchanged and the audit row says so, so the
- * panel's post lane is live from the first deploy and a reviewer can see that
- * nothing was rewritten rather than wonder whether it was.
+ * Pass-through, recorded — while the control plane is healthy. The
+ * `RedactionEngine` (#8) wires in at #16; until then every output is allowed
+ * unchanged and the audit row says so, so the panel's post lane is live from
+ * the first deploy and a reviewer can see that nothing was rewritten rather
+ * than wonder whether it was.
+ *
+ * "Allowed unchanged" is a decision, and a decision needs a policy to be made
+ * against. With the cache cold or failed there is no policy, so `/post` fails
+ * closed like the other two hooks: `CHECK_FAILED`, the output withheld, a deny
+ * row. A pass-through is only correct when the control plane can vouch for it.
  */
-export function handlePost(request: PostHookRequest, ctx: HandlerContext): Outcome<PostHookResult> {
+export function handlePost(
+  request: PostHookRequest,
+  state: CacheState,
+  ctx: HandlerContext,
+): Outcome<PostHookResult> {
+  const id = ctx.newId();
+  const qualified = qualify(request.tool.toolkit, request.tool.name);
+
+  const decision: Decision =
+    state.status === "ready"
+      ? {
+          effect: "allow",
+          reason: "Output passed through unchanged; output rules are not evaluated until #16.",
+          rule_id: null,
+        }
+      : {
+          effect: "deny",
+          reason: failClosedReason(state, `the output of ${qualified} cannot be released`),
+          rule_id: null,
+        };
+
   const event: GovernanceEvent = {
-    id: ctx.newId(),
+    id,
     ts: ctx.now(),
     execution_id: request.execution_id,
     hook: "post",
     user_id: request.context.user_id ?? "",
-    tool: qualify(request.tool.toolkit, request.tool.name),
-    decision: "allow",
-    reason: "Output passed through unchanged; output rules are not evaluated until #16.",
-    rule_id: null,
+    tool: qualified,
+    decision: decision.effect,
+    reason: decision.reason,
+    rule_id: decision.rule_id,
   };
-  return { response: { code: "OK" }, events: [event] };
+
+  const response: PostHookResult =
+    decision.effect === "allow"
+      ? { code: "OK" }
+      : {
+          code: "CHECK_FAILED",
+          error_message: withCorrelation(
+            `DENIED: the control plane cannot release the output of ${qualified} because its ` +
+              `policy is unavailable. Do not retry ${qualified}; report the reference to an administrator.`,
+            id,
+          ),
+        };
+
+  return { response, events: [event] };
 }

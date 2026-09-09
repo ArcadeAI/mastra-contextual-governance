@@ -209,6 +209,16 @@ describe("fails closed, and the failure is audited", () => {
     const access = await post("/access", { user_id: DANA, toolkits: { Loan: { tools: LOAN_TOOLS } } });
     expect(AccessHookResult.parse(await access.json())).toEqual({ deny: { Loan: { tools: LOAN_TOOLS } } });
 
+    const out = await post("/post", {
+      execution_id: "tc_failed_post",
+      tool: { name: "GetLoan", toolkit: "Loan", version: "1.0.0" },
+      success: true,
+      output: { x: 1 },
+      context: { user_id: DANA },
+    });
+    expect(PreHookResult.parse(await out.json()).code).toBe("CHECK_FAILED");
+    expect(recent(db, 1)[0]).toMatchObject({ hook: "post", execution_id: "tc_failed_post", decision: "deny" });
+
     db.run("UPDATE policy_rules SET tool = 'ApproveLoan' WHERE id = 'pre.approve-within-clearance'");
     await settle();
     expect((await fetch(`${base}/health`)).status).toBe(200);
@@ -354,6 +364,21 @@ describe("a cold cache fails closed", () => {
       expect(isolated.current().status).toBe("cold");
       expect(recent(real, 1)[0]).toMatchObject({ hook: "access", tool: "Loan.GetLoan", decision: "deny", rule_id: null });
       expect(recent(real, 1)[0]?.reason).toMatch(/has not loaded its policy yet/);
+
+      const post = await fetch(`http://localhost:${srv.port}/post`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${SECRET}` },
+        body: JSON.stringify({
+          execution_id: "tc_cold_post",
+          tool: { name: "GetLoan", toolkit: "Loan", version: "1.0.0" },
+          success: true,
+          output: { bank_account_number: "1234" },
+          context: { user_id: DANA },
+        }),
+      });
+      expect(post.status).toBe(200);
+      expect(PreHookResult.parse(await post.json()).code).toBe("CHECK_FAILED");
+      expect(recent(real, 1)[0]).toMatchObject({ hook: "post", execution_id: "tc_cold_post", decision: "deny", rule_id: null });
 
       const health = await fetch(`http://localhost:${srv.port}/health`);
       expect(health.status).toBe(503);

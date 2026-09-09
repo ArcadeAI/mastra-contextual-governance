@@ -157,7 +157,9 @@ schema or on the panel should imply otherwise.
 
 ## Not here
 
-- `RedactionEngine` at `/post` — #16. `/post` returns `OK` and records a pass-through.
+- `RedactionEngine` at `/post` — #16. While the policy is loaded, `/post` returns `OK` and records a
+  pass-through; with the cache cold or failed it fails closed like the other two hooks, because
+  "allowed unchanged" is a decision and there is no policy to make it against.
 - Grants at `/pre` — `GrantChecker` (#10) has not landed and the engine only accepts grants
   that have been through it. Until then a denial stands even after an approval.
 - SSE fan-out — #20. The audit write is the seam.

@@ -96,7 +96,7 @@ export function createServer(deps: ServerDeps) {
       case "pre":
         return handlePre(PreHookRequest.parse(body), state, ctx);
       case "post":
-        return handlePost(PostHookRequest.parse(body), ctx);
+        return handlePost(PostHookRequest.parse(body), state, ctx);
     }
   };
 

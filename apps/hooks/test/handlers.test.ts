@@ -265,18 +265,32 @@ describe("/pre — cold cache", () => {
 });
 
 describe("/post", () => {
+  const postBody = {
+    execution_id: "tc_9",
+    tool: { name: "GetLoan", toolkit: "Loan", version: "1.0.0" },
+    inputs: { loan_id: "LN-2291" },
+    success: true,
+    output: { bank_account_number: "1234" },
+    context: { user_id: DANA },
+  };
+
+  test.each([
+    ["cold", cold],
+    ["failed", failed],
+  ])("fails closed when the cache is %s: CHECK_FAILED, output withheld, deny row", (_label, state) => {
+    const { response, events } = handlePost(postBody, state, ctx);
+    expect(response.code).toBe("CHECK_FAILED");
+    expect(response.error_message).toMatch(/cannot release the output of Loan\.GetLoan/);
+    expect(response.error_message).toMatch(CORRELATION_TOKEN);
+    expect(response).not.toHaveProperty("override");
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ hook: "post", execution_id: "tc_9", tool: "Loan.GetLoan", decision: "deny", rule_id: null });
+    expect(events[0]?.reason).toContain("FAIL-CLOSED");
+    expect(correlationId(response.error_message ?? "")).toBe(events[0]?.id);
+  });
+
   test("passes the output through unchanged and records that it did", () => {
-    const { response, events } = handlePost(
-      {
-        execution_id: "tc_9",
-        tool: { name: "GetLoan", toolkit: "Loan", version: "1.0.0" },
-        inputs: { loan_id: "LN-2291" },
-        success: true,
-        output: { bank_account_number: "1234" },
-        context: { user_id: DANA },
-      },
-      ctx,
-    );
+    const { response, events } = handlePost(postBody, ready(), ctx);
     expect(response).toEqual({ code: "OK" });
     expect(PostHookResult.parse(response)).toEqual(response);
     expect(events[0]).toMatchObject({
