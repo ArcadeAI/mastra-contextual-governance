@@ -59,24 +59,34 @@ jobs:
           NEXT_TELEMETRY_DISABLED: "1"
 
   toolkits:
-    name: test tools/loan
+    name: test tools/${{ matrix.toolkit }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both toolkits are Python `arcade-mcp` packages shipped with
+        # `arcade deploy`, so neither is covered by `bun test` above. A toolkit
+        # missing from this list is a toolkit whose tests never run.
+        toolkit: [loan, approvals]
     steps:
       - uses: actions/checkout@v4
 
       - uses: astral-sh/setup-uv@v6
 
-      # The toolkit's tests boot the real `apps/loan-app` as a subprocess and
-      # drive the four tools through it, so Bun is needed here too.
+      # tools/loan's tests boot the real `apps/loan-app` as a subprocess and
+      # drive the four tools through it, so Bun is needed for that one.
+      # tools/approvals boots its own stand-ins and needs nothing else.
       - uses: oven-sh/setup-bun@v2
+        if: matrix.toolkit == 'loan'
         with:
           bun-version: 1.3.14
 
       - name: Install
+        if: matrix.toolkit == 'loan'
         run: bun install --frozen-lockfile
 
       - name: Test
-        working-directory: tools/loan
+        working-directory: tools/${{ matrix.toolkit }}
         run: uv run --frozen --extra dev pytest
 
   images:
