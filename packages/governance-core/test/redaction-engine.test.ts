@@ -653,6 +653,217 @@ describe("purity", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Idempotence, for any policy that compiles
+// ---------------------------------------------------------------------------
+
+/**
+ * Round 2 of review made the point that the round-1 fix was the wrong shape:
+ * idempotence was being defended by *recognising* cycles at compile time, and
+ * regex interplay always has another one. A lookahead makes a replacement a
+ * prefix of what some other pattern matches without ever matching it in
+ * isolation, so every one of these policies compiles cleanly.
+ *
+ * The guarantee is now structural — the sweep runs to a fixed point — so these
+ * tests assert the property rather than the policies. The compile-time checks
+ * stay as early, loud errors for the cases they *can* see.
+ */
+describe("idempotence holds for any policy that compiles", () => {
+  const catalogue: ToolCatalogue = { Records: { GetRecord: ["record_id"] } };
+  const tool: ToolRef = { toolkit: "Records", name: "GetRecord" };
+
+  /** A pattern rule whose replacement is only ever a prefix of what it matches. */
+  function lookahead(id: string, from: string, to: string, priority: number): OutputRule {
+    return aRule({
+      id,
+      priority,
+      patterns: [
+        { id: `p.${id}`, regex: `${from}(?=12)`, flags: "", strategy: "mask", replacement: to },
+      ],
+    });
+  }
+
+  /** The field marker the reviewer's policies carried alongside the patterns. */
+  const marker = aRule({
+    id: "rule.marker",
+    priority: 4,
+    fields: [{ path: "extra", strategy: "mask", replacement: "[X]" }],
+  });
+
+  function twice(rules: readonly OutputRule[], output: unknown) {
+    const policy = compileOutputPolicy({ catalogue, rules });
+    const once = redact({ output, subject: null, tool, policy });
+    const again = redact({ output: once.output, subject: null, tool, policy });
+    return { once, again };
+  }
+
+  it("a three-rule cycle returns the value to itself, so nothing is recorded for it", () => {
+    // Reviewer's first policy, verbatim: A -> B -> C -> A.
+    const { once, again } = twice(
+      [
+        lookahead("rule.1", "A", "B", 1),
+        lookahead("rule.2", "B", "C", 2),
+        lookahead("rule.3", "C", "A", 3),
+        marker,
+      ],
+      { note: "A12", extra: "raw" },
+    );
+
+    // The three patterns collectively did nothing to `note`, so they say so.
+    expect(once.output).toEqual({ note: "A12", extra: "[X]" });
+    expect(trace(once.redactions)).toEqual(["$.extra rule.marker mask"]);
+
+    expect(again.output).toEqual(once.output);
+    expect(again.redactions).toEqual([]);
+  });
+
+  it("a three-rule drift settles instead of walking on with every call", () => {
+    // Reviewer's second policy, verbatim: the same patterns reordered, which
+    // previously returned B12 on the first call and D12 on the second.
+    const { once, again } = twice(
+      [
+        lookahead("rule.1", "B", "C", 1),
+        lookahead("rule.2", "C", "D", 2),
+        lookahead("rule.3", "A", "B", 3),
+        marker,
+      ],
+      { note: "A12", extra: "raw" },
+    );
+
+    expect(once.output).toEqual({ note: "D12", extra: "[X]" });
+    expect(again.output).toEqual(once.output);
+    expect(again.redactions).toEqual([]);
+  });
+
+  it("a field marker swept by the same call's patterns is not redacted twice", () => {
+    const { once, again } = twice(
+      [marker, lookahead("rule.1", "A", "B", 1)],
+      { note: "A12", extra: "raw" },
+    );
+    expect(once.output).toEqual({ note: "B12", extra: "[X]" });
+    expect(trace(once.redactions)).toEqual([
+      "$.extra rule.marker mask",
+      "$.note rule.1/p.rule.1 mask",
+    ]);
+    expect(again.redactions).toEqual([]);
+  });
+
+  it("withholds a value whose redaction cannot settle, and says that is why", () => {
+    // This one has no fixed point at all: each pass makes the string longer.
+    // `AA` is never followed by `Z`, so no marker check trips and it compiles.
+    const grow = aRule({
+      id: "rule.grow",
+      patterns: [
+        { id: "p.grow", regex: "A(?=Z)", flags: "", strategy: "mask", replacement: "AA" },
+      ],
+    });
+    const { once, again } = twice([grow], { note: "AZ" });
+
+    expect(once.output).toEqual({ note: "[WITHHELD: redaction did not converge]" });
+    expect(once.redactions).toEqual([
+      { path: "$.note", rule_id: null, pattern_id: null, kind: "unsettled" },
+    ]);
+    // Withholding more is the fail-closed direction at /post, and the record
+    // names the engine rather than a rule because no single rule did this.
+    expect(again.output).toEqual(once.output);
+    expect(again.redactions).toEqual([]);
+  });
+
+  describe("as a property, over generated policies", () => {
+    /** Seeded so a failure is reproducible; mulberry32. */
+    function random(seed: number): () => number {
+      let a = seed;
+      return () => {
+        a |= 0;
+        a = (a + 0x6d2b79f5) | 0;
+        let t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+
+    const LETTERS = ["A", "B", "C", "D"] as const;
+    /** Only a lookahead's target, never part of a replacement. */
+    const SENTINEL = "Z";
+    const STRATEGIES = ["mask", "replace", "remove"] as const;
+
+    it("a second pass is always a no-op, over 400 generated policies", () => {
+      const rand = random(20260909);
+      const pick = <T>(xs: readonly T[]): T => xs[Math.floor(rand() * xs.length)] as T;
+      const text = (): string =>
+        Array.from({ length: 2 + Math.floor(rand() * 5) }, () =>
+          pick([...LETTERS, SENTINEL]),
+        ).join("");
+
+      let compiled = 0;
+      let didSomething = 0;
+      let withheld = 0;
+
+      for (let i = 0; i < 400; i += 1) {
+        const rules: OutputRule[] = [];
+        for (let r = 0; r < 1 + Math.floor(rand() * 3); r += 1) {
+          // The replacement never contains the sentinel, so it can never match
+          // the lookahead — every one of these compiles, which is the point.
+          const to = Array.from({ length: 1 + Math.floor(rand() * 2) }, () =>
+            pick(LETTERS),
+          ).join("");
+          rules.push(
+            aRule({
+              id: `rule.${r}`,
+              priority: r,
+              patterns: [
+                {
+                  id: `p.${r}`,
+                  regex: `${pick(LETTERS)}(?=${SENTINEL})`,
+                  flags: "",
+                  strategy: pick(STRATEGIES),
+                  replacement: to,
+                },
+              ],
+            }),
+          );
+        }
+        if (rand() < 0.5) {
+          rules.push(
+            aRule({
+              id: "rule.field",
+              priority: 9,
+              fields: [{ path: "tag", strategy: "mask", replacement: pick(LETTERS) }],
+            }),
+          );
+        }
+
+        const output = {
+          note: text(),
+          tag: text(),
+          nested: { deep: text() },
+          list: [text(), text()],
+        };
+
+        const policy = compileOutputPolicy({ catalogue, rules });
+        compiled += 1;
+
+        const once = redact({ output, subject: null, tool, policy });
+        const again = redact({ output: once.output, subject: null, tool, policy });
+
+        if (once.redactions.length > 0) didSomething += 1;
+        if (once.redactions.some((r) => r.kind === "unsettled")) withheld += 1;
+
+        // The whole claim, on every one of them.
+        expect(again.output).toEqual(once.output);
+        expect(again.redactions).toEqual([]);
+      }
+
+      // Guards against a green run that proved nothing: every policy has to have
+      // reached the engine, most have to have done something, and the
+      // fail-closed branch has to have been exercised rather than assumed.
+      expect(compiled).toBe(400);
+      expect(didSomething).toBeGreaterThan(200);
+      expect(withheld).toBeGreaterThan(0);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Loudness
 // ---------------------------------------------------------------------------
 

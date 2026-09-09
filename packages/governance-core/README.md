@@ -195,27 +195,30 @@ named is named, so one secret does not produce two records.
 
 ### Idempotence
 
-**A redaction is recorded only when something actually changed.** That single
-invariant is what makes the engine idempotent: applying a rule that would
-produce the value already present changes nothing and records nothing, so
-`redact` over its own output is a no-op and `redactions[]` never claims a
-removal that did not happen. When there was nothing to do, `output` is the very
+**The pattern sweep runs to a fixed point.** The applicable patterns are applied
+to a string until a pass leaves it alone, so the value they finish on is one they
+cannot change again — `redact` over its own output is a no-op with an empty
+`redactions[]`, for **any** policy `compileOutputPolicy` accepts. If a value has
+not settled within a bounded number of passes it is withheld and recorded with
+kind `unsettled`, naming the engine rather than a rule: withholding more is the
+fail-closed direction at `/post`, and an `unsettled` row tells an operator their
+output policy is broken rather than that a secret was found.
+
+**Records come from comparing the value, not from counting the steps.** Patterns
+that rewrite a string and hand it back unchanged have collectively done nothing,
+and `redactions[]` says so. A removal that removed nothing is a lie on the panel
+and in the audit log. When there was nothing to do at all, `output` is the very
 same reference that came in, which is how #12 tells an `allow` from a `modify`
 without a deep compare.
 
-What that invariant does *not* give on its own is a guarantee that the payload
-settles, and the gap is not obvious: two rules whose patterns rewrite `A` to `B`
-and `B` back to `A` each look fine alone, and together they cycle, recording two
-removals a pass for having done nothing. So the marker a redaction leaves
-behind — a `mask`/`replace` field replacement as well as a pattern's — may not be
-something any pattern that could run alongside it goes on to match, and that is
-checked across the whole policy at compile time.
-
-Two smaller versions of the same thing are closed too: `remove` is applied to a
-fixpoint, because deleting a match can join what was on either side of it into a
-new one (remove `ab` from `aabb`); and if a payload ever does come back equal to
-what arrived, `redact` says so with an empty `redactions[]` rather than reporting
-removals that removed nothing.
+Both of those replaced an earlier design that enforced "record only what changed"
+per application and tried to *recognise* cycles at compile time. That is a losing
+game: a lookahead makes a replacement a prefix of what another pattern matches
+without ever matching it in isolation, so a check that reasons about replacements
+one at a time can always be walked around — and one such policy did not merely
+mis-record, it returned a different payload on every call. The compile-time
+marker check is still there, but as an early diagnostic for the obvious version
+of the mistake, not as the guarantee.
 
 ### Fail closed means redact *more*
 
@@ -235,8 +238,8 @@ are case-sensitive — `Loan.get_loan` is not a tool and is refused), a rule wit
 neither fields nor patterns, a malformed field path, a field path repeated
 within a rule, an unparseable regex, a regex that matches the empty string (it
 would rewrite every string it was pointed at), the sticky flag (it would scan
-only from position 0), a marker some co-applicable pattern matches, a duplicate
-pattern id, a subject matcher that can never match, an empty `reason`, a
+only from position 0), a marker some co-applicable pattern matches (a
+diagnostic — idempotence does not depend on it), a duplicate pattern id, a subject matcher that can never match, an empty `reason`, a
 duplicate rule id — and `remove` on an array element addressed by index, which
 renumbers the elements after it and so does not mean the same thing twice.
 

@@ -18,6 +18,7 @@ import {
   HookPoint,
   OutputRule,
   PolicyRule,
+  RedactionKind,
   RedactionRecord,
   Subject,
   Timestamp,
@@ -441,6 +442,32 @@ describe("RedactionRecord", () => {
   it("refuses an empty path or rule_id, which would name nothing on the panel", () => {
     expect(() => RedactionRecord.parse({ ...minimal, path: "" })).toThrow();
     expect(() => RedactionRecord.parse({ ...minimal, rule_id: "" })).toThrow();
+  });
+
+  it("lets the engine own a redaction no rule asked for", () => {
+    // Same convention as `Decision.rule_id` and `GovernanceEvent.rule_id`: null
+    // means the engine decided, not a policy row. The post hook needs it for a
+    // value it withheld because the redaction would not settle — no single rule
+    // did that, and blaming one would be fiction in the audit log.
+    const record = RedactionRecord.parse({
+      path: "$.note",
+      rule_id: null,
+      pattern_id: null,
+      kind: "unsettled",
+    });
+    expect(record.rule_id).toBeNull();
+    expect(record.kind).toBe("unsettled");
+  });
+
+  it("defaults rule_id to null rather than requiring it", () => {
+    expect(RedactionRecord.parse({ path: "$.note", kind: "mask" }).rule_id).toBeNull();
+  });
+
+  it("accepts every strategy as a kind, and refuses one that is neither", () => {
+    for (const kind of RedactionKind.options) {
+      expect(RedactionRecord.parse({ ...minimal, kind }).kind).toBe(kind);
+    }
+    expect(() => RedactionRecord.parse({ ...minimal, kind: "withheld" })).toThrow();
   });
 
   it("survives a JSON round-trip, which is how it reaches the panel", () => {

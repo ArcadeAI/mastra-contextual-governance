@@ -235,6 +235,25 @@ export type PolicyRule = z.infer<typeof PolicyRule>;
 export const RedactionStrategy = z.enum(["mask", "remove", "replace"]);
 export type RedactionStrategy = z.infer<typeof RedactionStrategy>;
 
+/**
+ * What a `RedactionRecord` says happened. Every `RedactionStrategy`, plus one
+ * outcome no rule can ask for.
+ *
+ * `unsettled` is the post-hook's fail-closed state. Redaction runs the applicable
+ * patterns over a string until it stops changing; if it has not settled within
+ * the engine's bound, the patterns are rewriting each other's output and there is
+ * no answer to give. The engine then withholds the whole value rather than
+ * handing over whichever revision the loop happened to stop on — withholding
+ * more is the fail-closed direction at `/post`, where the question is what the
+ * model may read.
+ *
+ * It is a separate kind rather than a `mask` so the panel and the audit log can
+ * say *why* the value is gone: an `unsettled` row is a defect in the output
+ * policy, not a secret that was found.
+ */
+export const RedactionKind = z.enum([...RedactionStrategy.options, "unsettled"]);
+export type RedactionKind = z.infer<typeof RedactionKind>;
+
 /** Redact a known field, addressed by dot path into the tool's output. */
 export const FieldRedaction = z
   .object({
@@ -310,11 +329,15 @@ export const RedactionRecord = z
   .object({
     /** Canonical JSONPath to what was redacted. Never accompanied by its value. */
     path: z.string().min(1),
-    /** The `OutputRule` that fired. */
-    rule_id: z.string().min(1),
+    /**
+     * The `OutputRule` that fired, or `null` when the engine itself withheld the
+     * value rather than a rule — the same convention `Decision.rule_id` and
+     * `GovernanceEvent.rule_id` use for an engine-authored outcome.
+     */
+    rule_id: z.string().min(1).nullable().default(null),
     /** The `PatternRedaction` that matched, or `null` for a field-path redaction. */
     pattern_id: z.string().nullable().default(null),
-    kind: RedactionStrategy,
+    kind: RedactionKind,
   })
   .strict();
 export type RedactionRecord = z.infer<typeof RedactionRecord>;

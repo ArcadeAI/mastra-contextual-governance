@@ -77,6 +77,7 @@ describe("resolvable by package name", () => {
       "PolicyRule",
       "OutputRule",
       "RedactionRecord",
+      "RedactionKind",
       "Decision",
       "Grant",
       "ApprovalRequest",

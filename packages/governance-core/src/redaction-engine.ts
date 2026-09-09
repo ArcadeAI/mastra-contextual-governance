@@ -34,13 +34,31 @@
  * this project is about. `priority` and `id` order the rules so the result is
  * deterministic, not so that one rule can suppress another.
  *
- * ## A redaction is recorded only when something changed
+ * ## Idempotence, by construction
  *
- * This single invariant is what makes the engine idempotent. Applying a rule
- * that would produce exactly the value already present records nothing and
- * changes nothing, so redacting an already-redacted payload is a no-op — and
- * `redactions[]`, which the panel renders and the audit log keeps, never claims
- * a removal that did not happen.
+ * Two rules, in this order.
+ *
+ * **The pattern sweep runs to a fixed point.** The applicable patterns are
+ * applied to a string over and over until a pass leaves it alone. Whatever the
+ * patterns do to each other's output, the value they finish on is one they
+ * cannot change again — so `redact` over its own output is a no-op, for every
+ * policy that compiles rather than for the subset a checker was clever enough
+ * to admit. If the value has not settled within a bounded number of passes, the
+ * engine withholds it (`unsettled`) rather than handing over whichever revision
+ * the loop stopped on.
+ *
+ * **A redaction is recorded by comparing the value, not by counting the steps.**
+ * Patterns that rewrite a string and hand it back unchanged have collectively
+ * done nothing, and `redactions[]` — which the panel renders and the audit log
+ * keeps — says so. A removal that removed nothing is a lie in both places.
+ *
+ * This was learned the hard way, in review: the first version enforced "record
+ * only what changed" per application and tried to catch cycles at compile time.
+ * Lookaheads make a replacement a prefix of what another pattern matches without
+ * matching it in isolation, so the check could always be walked around — and one
+ * such policy did not merely mis-record, it returned a *different payload* on
+ * every call. Recognising bad policies was the wrong shape of defence; not
+ * depending on recognising them is the right one.
  *
  * ## Fail closed means redact *more*
  *
@@ -57,6 +75,11 @@
  * catalogue does not list, a malformed field path, an unparseable regex, a
  * regex that can match the empty string, a subject matcher that can never
  * match, and a rule that would redact nothing at all.
+ *
+ * These are early warnings, not the idempotence guarantee — that lives at
+ * runtime, above. A policy the marker check waves through is still safe; the
+ * check exists so the obvious mistakes are caught at seed time with a message,
+ * rather than at `/post` with a withheld field.
  */
 import type {
   OutputRule,
@@ -181,6 +204,19 @@ type CompiledOutputRule = {
   readonly fields: readonly CompiledField[];
   readonly patterns: readonly CompiledPattern[];
 };
+
+/** One pattern, and the rule that contributed it to this call's sweep. */
+type Scanner = {
+  readonly ruleId: string;
+  readonly pattern: CompiledPattern;
+};
+
+/**
+ * What the model gets instead of a string whose redaction would not settle.
+ * Deliberately says which of the two it is — a value withheld because the policy
+ * is broken, not a secret that was found.
+ */
+const WITHHELD = "[WITHHELD: redaction did not converge]";
 
 /** Returned by an edit that deletes rather than substitutes. */
 const DROP: unique symbol = Symbol("drop");
@@ -414,12 +450,15 @@ function compilePatterns(rule: OutputRule, say: (message: string) => void): Comp
  * **A marker one redaction leaves behind must not be something another
  * redaction goes on to find.**
  *
- * If it is, the payload never settles. Two rules whose patterns rewrite `A` to
- * `B` and `B` back to `A` each compile fine on their own — neither matches its
- * own replacement — but together they cycle: every pass rewrites the payload
- * back to where it started and records two redactions for having done nothing.
- * The output looks idempotent and `redactions[]` lies about it, which is the
- * shape of failure this project exists to catch. (Found in review of #8.)
+ * If it is, the payload churns: two rules whose patterns rewrite `A` to `B` and
+ * `B` back to `A` each compile fine alone — neither matches its own replacement
+ * — but together they undo each other. The engine survives that now (the sweep
+ * runs to a fixed point), so this is a **diagnostic, not a safety net**: it turns
+ * the obvious version of the mistake into a compile error naming both rules,
+ * instead of a value that is silently withheld at `/post` because it would not
+ * settle. It catches replacements that match in isolation and nothing subtler —
+ * a lookahead walks straight past it — which is exactly why the guarantee is not
+ * built on it. (Both halves learned in review of #8.)
  *
  * So this is checked across the whole policy rather than per pattern: every
  * marker any rule writes — a `mask`/`replace` field replacement as well as a
@@ -531,18 +570,26 @@ export function redact(input: RedactionInput): RedactionResult {
   const redactions: RedactionRecord[] = [];
   let current = input.output;
 
-  for (const rule of policy.rules) {
-    if (!matchesTool(rule.match, tool)) continue;
-    if (!appliesToSubject(rule, subject)) continue;
+  const applicable = policy.rules.filter(
+    (rule) => matchesTool(rule.match, tool) && appliesToSubject(rule, subject),
+  );
 
-    // Fields first: what a rule can name, it names. See the module comment.
+  // Fields first, across every applicable rule: what a rule can name, it names,
+  // so a value that has already been pulled is not still there for the sweep to
+  // find and record a second time.
+  for (const rule of applicable) {
     for (const field of rule.fields) {
       current = editField(current, field.segments, "$", field, rule.id, redactions);
     }
-    if (rule.patterns.length > 0) {
-      current = sweep(current, "$", rule.patterns, rule.id, redactions);
-    }
   }
+
+  // Then *one* sweep carrying every applicable rule's patterns. Sweeping rule by
+  // rule would let two rules chase each other across the payload — one rewriting
+  // what the other just wrote — with each sweep looking locally settled.
+  const scanners = applicable.flatMap((rule) =>
+    rule.patterns.map((pattern) => ({ ruleId: rule.id, pattern })),
+  );
+  if (scanners.length > 0) current = sweep(current, "$", scanners, redactions);
 
   if (redactions.length > 0 && current !== input.output && deepEqual(current, input.output)) {
     // Belt to `checkReplacementsSettle`'s braces. The compiler refuses the
@@ -675,33 +722,45 @@ function applyToValue(value: unknown, field: CompiledField): unknown | typeof DR
 // ---------------------------------------------------------------------------
 
 /**
- * Apply every pattern to every string reachable from `node`, recording each
- * one that changed something. Object *keys* are left alone: a key is structure,
- * and rewriting it would hand the model a payload whose shape no longer matches
- * the tool's own contract.
+ * Apply the scanners to every string reachable from `node`. Object *keys* are
+ * left alone: a key is structure, and rewriting it would hand the model a
+ * payload whose shape no longer matches the tool's own contract.
  */
 function sweep(
   node: unknown,
   at: string,
-  patterns: readonly CompiledPattern[],
-  ruleId: string,
+  scanners: readonly Scanner[],
   out: RedactionRecord[],
 ): unknown {
   if (typeof node === "string") {
-    let text = node;
-    for (const pattern of patterns) {
-      const next = applyPattern(text, pattern);
-      if (next === text) continue;
-      out.push({ path: at, rule_id: ruleId, pattern_id: pattern.id, kind: pattern.strategy });
-      text = next;
+    const settled = settle(node, scanners);
+
+    if (!settled.converged) {
+      out.push({ path: at, rule_id: null, pattern_id: null, kind: "unsettled" });
+      return WITHHELD;
     }
-    return text;
+
+    // The record follows from the *value*, not from the steps taken to reach it.
+    // Scanners that rewrote the string and then put it back did nothing, and
+    // saying otherwise would put a removal that removed nothing on the panel and
+    // in the audit log.
+    if (settled.text === node) return node;
+
+    for (const scanner of settled.fired) {
+      out.push({
+        path: at,
+        rule_id: scanner.ruleId,
+        pattern_id: scanner.pattern.id,
+        kind: scanner.pattern.strategy,
+      });
+    }
+    return settled.text;
   }
 
   if (Array.isArray(node)) {
     let changed = false;
     const next = node.map((element, i) => {
-      const child = sweep(element, `${at}[${i}]`, patterns, ruleId, out);
+      const child = sweep(element, `${at}[${i}]`, scanners, out);
       if (child !== element) changed = true;
       return child;
     });
@@ -712,7 +771,7 @@ function sweep(
     let changed = false;
     const next: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(node)) {
-      const child = sweep(value, `${at}.${key}`, patterns, ruleId, out);
+      const child = sweep(value, `${at}.${key}`, scanners, out);
       if (child !== value) changed = true;
       next[key] = child;
     }
@@ -720,6 +779,64 @@ function sweep(
   }
 
   return node;
+}
+
+/**
+ * Apply the scanners to `original` until the text stops changing, and report
+ * whether it got there.
+ *
+ * **This is where idempotence comes from, and it is a runtime guarantee rather
+ * than a compile-time one on purpose.** Whether a set of regexes can rewrite
+ * each other's output forever is a question about regex interplay — lookaheads
+ * make a replacement a *prefix* of what some other pattern matches without ever
+ * matching it in isolation — and any check that reasons about replacements one
+ * at a time will keep missing cases. Two policies from review of #8 make the
+ * point: one where three patterns cycle a value back to itself, and one where
+ * they walk it a step further on every call, so a second `redact` returned a
+ * different payload than the first. Running to a fixed point answers both
+ * without having to recognise either.
+ *
+ * After this returns `converged`, applying the same scanners again changes
+ * nothing — that is what a fixed point *is* — so `redact` over its own output is
+ * a no-op and records nothing. The guarantee holds for any policy that compiles,
+ * not for the subset a checker was clever enough to admit.
+ *
+ * The bound is generous rather than tight. There is no cheap upper bound on the
+ * passes a legitimate policy needs — an adversarially ordered chain of `n`
+ * patterns takes `n` — so the limit is set well clear of anything a sane policy
+ * reaches, and hitting it is read as a defect in the policy rather than a
+ * problem with the payload. Well-formed policies settle on the second pass: one
+ * that changes the text, one that confirms nothing more applies.
+ */
+function settle(
+  original: string,
+  scanners: readonly Scanner[],
+): { text: string; fired: readonly Scanner[]; converged: boolean } {
+  const limit = 2 * scanners.length + 8;
+  // Which scanners contributed, deduplicated — one that fires on three passes of
+  // the same value is one redaction of it, not three — and reported in policy
+  // order rather than the order the loop happened to reach them.
+  const fired = new Set<number>();
+  const contributors = (): Scanner[] =>
+    [...fired].sort((a, b) => a - b).map((index) => scanners[index] as Scanner);
+  let text = original;
+
+  for (let pass = 0; pass < limit; pass += 1) {
+    const before = text;
+    scanners.forEach((scanner, index) => {
+      const next = applyPattern(text, scanner.pattern);
+      if (next === text) return;
+      text = next;
+      fired.add(index);
+    });
+    // The *pass* is what has to settle, not each scanner within it. Scanners
+    // that rewrite a value and hand it back unchanged have collectively done
+    // nothing, and that is a converged pass — the caller then compares the text
+    // to what it started as and records nothing at all.
+    if (text === before) return { text, fired: contributors(), converged: true };
+  }
+
+  return { text, fired: contributors(), converged: false };
 }
 
 /**
@@ -733,18 +850,11 @@ function applyPattern(text: string, pattern: CompiledPattern): string {
       // `replaceAll` with a string, not a function: a `$&` in the replacement
       // would otherwise re-insert the matched text the rule just removed.
       return text.replace(pattern.global, () => pattern.replacement);
-    case "remove": {
-      // Deleting a match can join what was on either side of it into a new
-      // one — remove `ab` from `aabb` and `ab` is what is left. So the pattern
-      // is applied until the text stops changing, which terminates because
-      // every pass that changes anything makes the string strictly shorter.
-      let text_ = text;
-      for (;;) {
-        const next = text_.replace(pattern.global, () => "");
-        if (next === text_) return text_;
-        text_ = next;
-      }
-    }
+    case "remove":
+      // Deleting a match can join what was on either side of it into a new one —
+      // remove `ab` from `aabb` and `ab` is what is left. One application here;
+      // `settle` runs the whole set until nothing changes, which covers it.
+      return text.replace(pattern.global, () => "");
     case "replace":
       return pattern.probe.test(text) ? pattern.replacement : text;
   }

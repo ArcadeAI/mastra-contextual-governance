@@ -44,6 +44,7 @@ export {
   OutputRule,
   PatternRedaction,
   PolicyRule,
+  RedactionKind,
   RedactionRecord,
   RedactionStrategy,
   Subject,
