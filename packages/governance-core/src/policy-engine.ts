@@ -58,6 +58,10 @@
  * the grant lifted.
  */
 import {
+  checkSubjectMatcher,
+  matchesSubject as subjectMatches,
+} from "./subjects.ts";
+import {
   type Condition,
   type Decision,
   type Grant,
@@ -351,39 +355,6 @@ export function compilePolicy(policy: Policy): CompiledPolicy {
   compiled.sort((a, b) => a.priority - b.priority || a.id.localeCompare(b.id));
 
   return { catalogue, rules: compiled, [COMPILED]: true };
-}
-
-/**
- * A subject matcher that can never match is a rule that silently permits. The
- * engine holds no roster, so a misspelled role or user id cannot be caught here
- * — that is the one loudness gap the README states — but the parts that are
- * provable from the schema alone are refused.
- */
-function checkSubjectMatcher(m: NonNullable<PolicyRule["subjects"]>): string[] {
-  const problems: string[] = [];
-  if (m.roles !== null && m.roles.length === 0) {
-    problems.push(`subjects.roles is an empty list, which matches nobody; use null to mean "any role"`);
-  }
-  if (m.user_ids !== null && m.user_ids.length === 0) {
-    problems.push(`subjects.user_ids is an empty list, which matches nobody; use null to mean "anyone"`);
-  }
-  if (m.clearance_below !== null && m.clearance_below <= 0) {
-    problems.push(
-      `subjects.clearance_below is ${m.clearance_below}, but clearance is never negative, ` +
-        `so no subject can be below it`,
-    );
-  }
-  if (
-    m.clearance_below !== null &&
-    m.clearance_at_least !== null &&
-    m.clearance_below <= m.clearance_at_least
-  ) {
-    problems.push(
-      `subjects.clearance_at_least (${m.clearance_at_least}) is not below subjects.clearance_below ` +
-        `(${m.clearance_below}), so the band is empty and matches nobody`,
-    );
-  }
-  return problems;
 }
 
 /** The arguments of every catalogued tool a matcher can match. */
@@ -799,15 +770,7 @@ function matchesTool(match: ToolMatcher, tool: ToolRef): boolean {
 }
 
 function matchesSubject(rule: CompiledRule, subject: Subject): boolean {
-  const m = rule.subjects;
-  if (m === null) return true;
-  if (m.user_ids !== null && !m.user_ids.includes(subject.user_id)) return false;
-  if (m.roles !== null && !m.roles.includes(subject.role)) return false;
-  if (m.clearance_below !== null && !(subject.clearance < m.clearance_below)) return false;
-  if (m.clearance_at_least !== null && !(subject.clearance >= m.clearance_at_least)) {
-    return false;
-  }
-  return true;
+  return subjectMatches(rule.subjects, subject);
 }
 
 function grantApplies(grant: ValidatedGrant, subject: Subject, tool: ToolRef): boolean {
