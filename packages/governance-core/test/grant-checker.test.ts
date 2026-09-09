@@ -139,7 +139,29 @@ const rows: readonly Row[] = [
     expect: "valid",
   },
 
+  {
+    name: "a ceiling on a nested input, read as a dot path like a rule's condition",
+    grant: {
+      resource_id: null,
+      pinned_inputs: {},
+      ceiling: { input: "order.quantity", max: 95 },
+    },
+    inputs: { order: { quantity: 95 } },
+    expect: "valid",
+  },
+
   // -- how much: the replay this module exists to stop ---------------------
+  {
+    name: "a nested bounded input is bounded too",
+    grant: {
+      resource_id: null,
+      pinned_inputs: {},
+      ceiling: { input: "order.quantity", max: 95 },
+    },
+    inputs: { order: { quantity: 96 } },
+    expect: "ceiling_exceeded",
+    reason: { input: "order.quantity", max: 95, actual: 96 },
+  },
   {
     name: "amount above the granted ceiling: $95K approved, $500K attempted",
     inputs: { widget_id: "WID-1", quantity: 500_000 },
@@ -309,6 +331,16 @@ const rows: readonly Row[] = [
       pinned_inputs: { widget_id: "WID-1", quantity: 95 },
       ceiling: { input: "quantity", max: 95 },
     },
+    expect: "unenforceable",
+  },
+  {
+    name: "the same contradiction reached through a dot path",
+    grant: {
+      resource_id: null,
+      pinned_inputs: { order: { quantity: 95 } },
+      ceiling: { input: "order.quantity", max: 95 },
+    },
+    inputs: { order: { quantity: 95 } },
     expect: "unenforceable",
   },
   {

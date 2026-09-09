@@ -139,9 +139,9 @@ export function checkGrant(check: GrantCheck): GrantCheckResult {
   return attestGrantValidated(check.grant);
 }
 
-/** Narrow `checkGrant`'s result. A `Grant` has no `outcome` field. */
+/** Narrow `checkGrant`'s result. A `Grant` carries no `outcome` field. */
 export function isGrantRejection(result: GrantCheckResult): result is GrantRejection {
-  return "outcome" in result;
+  return "outcome" in result && result.outcome === "rejected";
 }
 
 /**
@@ -254,7 +254,7 @@ function enforceable({ grant }: GrantCheck): GrantRejectionReason | null {
         `its ceiling on "${ceiling.input}" is ${String(ceiling.max)}, which bounds nothing`,
       );
     }
-    if (Object.hasOwn(pinned_inputs, ceiling.input)) {
+    if (readPath(pinned_inputs, ceiling.input) !== undefined) {
       // A pin is equality and a ceiling is an upper bound. Pinning the input the
       // ceiling names silently replaces "up to the approved amount" with
       // "exactly the approved amount" — narrower than the approver chose, and
