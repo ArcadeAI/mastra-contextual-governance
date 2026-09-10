@@ -671,6 +671,14 @@ describe("idempotence holds for any policy that compiles", () => {
   const catalogue: ToolCatalogue = { Records: { GetRecord: ["record_id"] } };
   const tool: ToolRef = { toolkit: "Records", name: "GetRecord" };
 
+  /**
+   * What the engine substitutes for a value it cannot settle. Written out here
+   * rather than imported: this is the string every scanner in every compiling
+   * policy has to be unable to touch, so a test that read it from the module
+   * would agree with the module by construction and prove nothing.
+   */
+  const WITHHELD_SENTINEL = "[withheld: unsettled redaction]";
+
   /** A pattern rule whose replacement is only ever a prefix of what it matches. */
   function lookahead(id: string, from: string, to: string, priority: number): OutputRule {
     return aRule({
@@ -758,7 +766,7 @@ describe("idempotence holds for any policy that compiles", () => {
     });
     const { once, again } = twice([grow], { note: "AZ" });
 
-    expect(once.output).toEqual({ note: "[WITHHELD: redaction did not converge]" });
+    expect(once.output).toEqual({ note: WITHHELD_SENTINEL });
     expect(once.redactions).toEqual([
       { path: "$.note", rule_id: null, pattern_id: null, kind: "unsettled" },
     ]);
@@ -766,6 +774,73 @@ describe("idempotence holds for any policy that compiles", () => {
     // names the engine rather than a rule because no single rule did this.
     expect(again.output).toEqual(once.output);
     expect(again.redactions).toEqual([]);
+  });
+
+  describe("the strings the engine itself writes", () => {
+    /** The non-convergent half of the round-3 policy. */
+    const grow = aRule({
+      id: "rule.grow",
+      patterns: [
+        { id: "p.grow", regex: "A(?=Z)", flags: "", strategy: "mask", replacement: "AA" },
+      ],
+    });
+
+    function sentinelRule(regex: string, flags: string): OutputRule {
+      return aRule({
+        id: "rule.sentinel",
+        priority: 2,
+        patterns: [{ id: "p.sentinel", regex, flags, strategy: "mask", replacement: "X" }],
+      });
+    }
+
+    it("the round-3 policy is stable: WITHHELD -> X cannot touch the sentinel", () => {
+      // The reviewer's policy verbatim. It compiles — `WITHHELD` in upper case
+      // does not occur in the sentinel — and the point is that it is now inert
+      // rather than that it is refused.
+      const { once, again } = twice([grow, sentinelRule("WITHHELD", "")], { note: "AZ" });
+      expect(once.output).toEqual({ note: WITHHELD_SENTINEL });
+      expect(once.redactions).toEqual([
+        { path: "$.note", rule_id: null, pattern_id: null, kind: "unsettled" },
+      ]);
+      expect(again.output).toEqual(once.output);
+      expect(again.redactions).toEqual([]);
+    });
+
+    it("refuses any pattern that can match the sentinel, however partially", () => {
+      // The class, not the case. Each of these reaches the sentinel a different
+      // way — case-insensitively, in lower case, through one word of it, and
+      // through its punctuation — and each is a compile error rather than a
+      // payload that changes on the second call.
+      const reaches: ReadonlyArray<readonly [label: string, regex: string, flags: string]> = [
+        ["case-insensitively", "WITHHELD", "i"],
+        ["in the sentinel's own case", "withheld", ""],
+        ["through a single word of it", "unsettled", ""],
+        ["through its punctuation", String.raw`\[with`, ""],
+        ["through a word in its tail", "redaction", ""],
+      ];
+      for (const [label, regex, flags] of reaches) {
+        expect(() => policyOf([grow, sentinelRule(regex, flags)]), label).toThrow(
+          /matches the engine's withheld sentinel/,
+        );
+      }
+    });
+
+    it("refuses a pattern reaching the sentinel even from an unrelated tool", () => {
+      // No overlap test on the sentinel, deliberately: every rule is applicable
+      // on some call, and on that call some value may fail to settle, so there
+      // is no pattern anywhere in the policy that may match it.
+      expect(() =>
+        policyOf([
+          aRule({
+            id: "rule.elsewhere",
+            match: { toolkit: TOOLKIT, tool: SEARCH },
+            patterns: [
+              { id: "p.s", regex: "withheld", flags: "", strategy: "mask", replacement: "X" },
+            ],
+          }),
+        ]),
+      ).toThrow(/matches the engine's withheld sentinel/);
+    });
   });
 
   describe("as a property, over generated policies", () => {
@@ -781,12 +856,17 @@ describe("idempotence holds for any policy that compiles", () => {
       };
     }
 
+    /** Literal text as a regular expression. */
+    function escapeRegex(literal: string): string {
+      return literal.replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
+    }
+
     const LETTERS = ["A", "B", "C", "D"] as const;
     /** Only a lookahead's target, never part of a replacement. */
     const SENTINEL = "Z";
     const STRATEGIES = ["mask", "replace", "remove"] as const;
 
-    it("a second pass is always a no-op, over 400 generated policies", () => {
+    it("a second pass is always a no-op, over 600 generated policies", () => {
       const rand = random(20260909);
       const pick = <T>(xs: readonly T[]): T => xs[Math.floor(rand() * xs.length)] as T;
       const text = (): string =>
@@ -794,18 +874,46 @@ describe("idempotence holds for any policy that compiles", () => {
           pick([...LETTERS, SENTINEL]),
         ).join("");
 
+      /**
+       * Marker strings the generated policies write, and fragments of the
+       * sentinel — the strings the engine itself can put into a payload. A
+       * pattern aimed at one of these is exactly the round-2 and round-3 class,
+       * so the generator produces them on purpose and the compiler is expected
+       * to refuse a good share of what comes out.
+       */
+      const MARKERS = ["[M1]", "[M2]", "[REDACTED]"] as const;
+      const ENGINE_WRITES = [
+        ...MARKERS,
+        WITHHELD_SENTINEL,
+        "withheld",
+        "unsettled",
+        "redaction",
+        "[with",
+      ] as const;
+
       let compiled = 0;
+      let rejected = 0;
       let didSomething = 0;
       let withheld = 0;
 
-      for (let i = 0; i < 400; i += 1) {
+      for (let i = 0; i < 600; i += 1) {
         const rules: OutputRule[] = [];
         for (let r = 0; r < 1 + Math.floor(rand() * 3); r += 1) {
-          // The replacement never contains the sentinel, so it can never match
-          // the lookahead — every one of these compiles, which is the point.
-          const to = Array.from({ length: 1 + Math.floor(rand() * 2) }, () =>
-            pick(LETTERS),
-          ).join("");
+          // Three kinds of pattern: one that can only ever match payload text,
+          // one aimed at a marker this policy writes, and one aimed at something
+          // the engine writes. Only the first kind is safe, and the compiler is
+          // what has to know that.
+          const roll = rand();
+          const regex =
+            roll < 0.55
+              ? `${pick(LETTERS)}(?=${SENTINEL})`
+              : roll < 0.8
+                ? escapeRegex(pick(MARKERS))
+                : escapeRegex(pick(ENGINE_WRITES));
+          const to =
+            rand() < 0.5
+              ? pick(MARKERS)
+              : Array.from({ length: 1 + Math.floor(rand() * 2) }, () => pick(LETTERS)).join("");
           rules.push(
             aRule({
               id: `rule.${r}`,
@@ -813,8 +921,8 @@ describe("idempotence holds for any policy that compiles", () => {
               patterns: [
                 {
                   id: `p.${r}`,
-                  regex: `${pick(LETTERS)}(?=${SENTINEL})`,
-                  flags: "",
+                  regex,
+                  flags: rand() < 0.3 ? "i" : "",
                   strategy: pick(STRATEGIES),
                   replacement: to,
                 },
@@ -827,7 +935,7 @@ describe("idempotence holds for any policy that compiles", () => {
             aRule({
               id: "rule.field",
               priority: 9,
-              fields: [{ path: "tag", strategy: "mask", replacement: pick(LETTERS) }],
+              fields: [{ path: "tag", strategy: "mask", replacement: pick(MARKERS) }],
             }),
           );
         }
@@ -839,7 +947,14 @@ describe("idempotence holds for any policy that compiles", () => {
           list: [text(), text()],
         };
 
-        const policy = compileOutputPolicy({ catalogue, rules });
+        let policy;
+        try {
+          policy = compileOutputPolicy({ catalogue, rules });
+        } catch (error) {
+          expect(error).toBeInstanceOf(OutputPolicyCompileError);
+          rejected += 1;
+          continue;
+        }
         compiled += 1;
 
         const once = redact({ output, subject: null, tool, policy });
@@ -848,16 +963,20 @@ describe("idempotence holds for any policy that compiles", () => {
         if (once.redactions.length > 0) didSomething += 1;
         if (once.redactions.some((r) => r.kind === "unsettled")) withheld += 1;
 
-        // The whole claim, on every one of them.
+        // The whole claim, on every policy that compiled.
         expect(again.output).toEqual(once.output);
         expect(again.redactions).toEqual([]);
       }
 
-      // Guards against a green run that proved nothing: every policy has to have
-      // reached the engine, most have to have done something, and the
-      // fail-closed branch has to have been exercised rather than assumed.
-      expect(compiled).toBe(400);
-      expect(didSomething).toBeGreaterThan(200);
+      // Guards against a green run that proved nothing: the generator has to
+      // have produced both kinds, the compiler has to have refused the unsafe
+      // ones rather than the property holding because nothing was generated,
+      // and the fail-closed branch has to have been exercised rather than
+      // assumed.
+      expect(compiled + rejected).toBe(600);
+      expect(compiled).toBeGreaterThan(100);
+      expect(rejected).toBeGreaterThan(100);
+      expect(didSomething).toBeGreaterThan(50);
       expect(withheld).toBeGreaterThan(0);
     });
   });

@@ -38,14 +38,20 @@
  *
  * Two rules, in this order.
  *
- * **The pattern sweep runs to a fixed point.** The applicable patterns are
- * applied to a string over and over until a pass leaves it alone. Whatever the
- * patterns do to each other's output, the value they finish on is one they
- * cannot change again — so `redact` over its own output is a no-op, for every
- * policy that compiles rather than for the subset a checker was clever enough
- * to admit. If the value has not settled within a bounded number of passes, the
- * engine withholds it (`unsettled`) rather than handing over whichever revision
- * the loop stopped on.
+ * **The whole transformation runs to a fixed point** — field rules and pattern
+ * sweeps together, not the sweep alone. Settling half of an operation says
+ * nothing about applying the other half again, so the pair is iterated until a
+ * pass leaves the payload alone, and what `redact` returns is by definition
+ * something another `redact` does not change. If a *string* has not settled
+ * within the sweep's bound the engine withholds it (`unsettled`) rather than
+ * handing over whichever revision the loop stopped on.
+ *
+ * **Every string the engine can write is inert to every scanner.** A field's
+ * marker, a pattern's replacement, and the withheld sentinel are all text the
+ * engine puts into the payload; a pattern that can match one would rewrite it on
+ * the next call. `checkMarkersAreInert` refuses that at compile time — three
+ * rounds of review found three different strings in this set, so the check is
+ * stated over the set rather than over the case in front of it.
  *
  * **A redaction is recorded by comparing the value, not by counting the steps.**
  * Patterns that rewrite a string and hand it back unchanged have collectively
@@ -76,10 +82,12 @@
  * regex that can match the empty string, a subject matcher that can never
  * match, and a rule that would redact nothing at all.
  *
- * These are early warnings, not the idempotence guarantee — that lives at
- * runtime, above. A policy the marker check waves through is still safe; the
- * check exists so the obvious mistakes are caught at seed time with a message,
- * rather than at `/post` with a withheld field.
+ * The marker check is the one exception to "diagnostic, not guarantee": nothing
+ * at runtime can make a scanner stop matching the sentinel, so that one is load
+ * bearing. The rest are early warnings — a policy they wave through is still
+ * safe, because the runtime settles it either way; they exist so the obvious
+ * mistakes are caught at seed time with a message rather than at `/post` with a
+ * withheld field.
  */
 import type {
   OutputRule,
@@ -205,6 +213,13 @@ type CompiledOutputRule = {
   readonly patterns: readonly CompiledPattern[];
 };
 
+/**
+ * Where a transform reports what it did. Candidates rather than records — the
+ * caller decides which survive, by comparing the payload it got back with the
+ * one it passed in.
+ */
+type Note = (record: RedactionRecord) => void;
+
 /** One pattern, and the rule that contributed it to this call's sweep. */
 type Scanner = {
   readonly ruleId: string;
@@ -216,7 +231,15 @@ type Scanner = {
  * Deliberately says which of the two it is — a value withheld because the policy
  * is broken, not a secret that was found.
  */
-const WITHHELD = "[WITHHELD: redaction did not converge]";
+const WITHHELD = "[withheld: unsettled redaction]";
+
+/**
+ * How many times the whole transformation may be re-applied before the engine
+ * gives up on it settling. Two is what a well-formed policy needs — one pass
+ * that changes the payload, one that confirms nothing more applies — and the
+ * rest is slack for a policy the marker check did not catch.
+ */
+const TRANSFORM_PASS_LIMIT = 8;
 
 /** Returned by an edit that deletes rather than substitutes. */
 const DROP: unique symbol = Symbol("drop");
@@ -290,7 +313,7 @@ export function compileOutputPolicy(policy: OutputPolicy): CompiledOutputPolicy 
     });
   }
 
-  checkReplacementsSettle(compiled, problems);
+  checkMarkersAreInert(compiled, problems);
 
   if (problems.length > 0) throw new OutputPolicyCompileError(problems);
 
@@ -447,33 +470,40 @@ function compilePatterns(rule: OutputRule, say: (message: string) => void): Comp
 }
 
 /**
- * **A marker one redaction leaves behind must not be something another
- * redaction goes on to find.**
+ * **Every string the engine can write must be inert to every scanner.**
  *
- * If it is, the payload churns: two rules whose patterns rewrite `A` to `B` and
- * `B` back to `A` each compile fine alone — neither matches its own replacement
- * — but together they undo each other. The engine survives that now (the sweep
- * runs to a fixed point), so this is a **diagnostic, not a safety net**: it turns
- * the obvious version of the mistake into a compile error naming both rules,
- * instead of a value that is silently withheld at `/post` because it would not
- * settle. It catches replacements that match in isolation and nothing subtler —
- * a lookahead walks straight past it — which is exactly why the guarantee is not
- * built on it. (Both halves learned in review of #8.)
+ * That is the whole invariant, and it covers three kinds of string: a field's
+ * `mask`/`replace` marker, a pattern's replacement, and the sentinel the engine
+ * substitutes for a value whose redaction would not settle. Each of them is
+ * text the engine puts into the payload; if a pattern can match one, the next
+ * call rewrites it, and the payload the model got is not the payload it gets
+ * next time.
  *
- * So this is checked across the whole policy rather than per pattern: every
- * marker any rule writes — a `mask`/`replace` field replacement as well as a
- * pattern's — is offered to every pattern that could run alongside it. A
- * `remove` writes nothing, and no pattern may match the empty string, so
- * removals cannot start a cycle on their own.
+ * Learned in three rounds of review of #8, each finding a different string that
+ * was not covered: a pattern's own replacement, then another rule's, then the
+ * withheld sentinel itself. So the check is stated over the *set* of strings the
+ * engine can write rather than over the case in front of it.
  *
- * Deliberately conservative about "alongside". Tool matchers are compared, so
- * rules governing unrelated tools do not constrain each other's markers, but
- * subject matchers are not: two rules aimed at disjoint sets of subjects are
- * still checked against each other. Proving two subject bands disjoint is
- * fiddly, and the cost of being wrong in that direction is a compile error with
- * an actionable message, not a control that silently does nothing.
+ * The test is `regex.test(marker)` — a partial match anywhere in the string, not
+ * an anchored one — because a pattern that matches part of a marker rewrites
+ * part of it, which is enough.
+ *
+ * Two scoping rules, and they differ on purpose:
+ *
+ * - A **rule's marker** is only ever swept by the patterns that run on the same
+ *   call, so it is checked against rules whose tool matchers overlap. Unrelated
+ *   toolkits can reuse a marker string.
+ * - The **sentinel** is checked against every pattern in the policy, with no
+ *   overlap test. Any rule is applicable on some call, and on that call some
+ *   value may fail to settle — so there is no pattern anywhere in the policy
+ *   that is safe to let match it.
+ *
+ * This is a compile-time diagnostic and the runtime does not depend on it being
+ * complete: `redact` runs the whole transformation to a fixed point regardless.
+ * The check is what turns "your policy is broken" into a message at seed time
+ * instead of a withheld field on stage.
  */
-function checkReplacementsSettle(rules: readonly CompiledOutputRule[], problems: string[]): void {
+function checkMarkersAreInert(rules: readonly CompiledOutputRule[], problems: string[]): void {
   const markers = rules.flatMap((rule) => [
     ...rule.fields
       .filter((field) => field.strategy !== "remove")
@@ -498,6 +528,18 @@ function checkReplacementsSettle(rules: readonly CompiledOutputRule[], problems:
             `marker and record a removal that removed nothing`,
         );
       }
+    }
+  }
+
+  for (const rule of rules) {
+    for (const pattern of rule.patterns) {
+      if (!pattern.probe.test(WITHHELD)) continue;
+      problems.push(
+        `rule "${rule.id}" has a pattern "${pattern.id}" that matches the engine's withheld ` +
+          `sentinel ${JSON.stringify(WITHHELD)}; that is the value the engine substitutes when a ` +
+          `redaction will not settle, so a pattern that rewrites it would make the withheld ` +
+          `payload itself unstable`,
+      );
     }
   }
 }
@@ -567,43 +609,79 @@ function byPriorityThenId(a: CompiledOutputRule, b: CompiledOutputRule): number 
  */
 export function redact(input: RedactionInput): RedactionResult {
   const { policy, subject, tool } = input;
-  const redactions: RedactionRecord[] = [];
-  let current = input.output;
 
   const applicable = policy.rules.filter(
     (rule) => matchesTool(rule.match, tool) && appliesToSubject(rule, subject),
   );
-
-  // Fields first, across every applicable rule: what a rule can name, it names,
-  // so a value that has already been pulled is not still there for the sweep to
-  // find and record a second time.
-  for (const rule of applicable) {
-    for (const field of rule.fields) {
-      current = editField(current, field.segments, "$", field, rule.id, redactions);
-    }
-  }
-
-  // Then *one* sweep carrying every applicable rule's patterns. Sweeping rule by
-  // rule would let two rules chase each other across the payload — one rewriting
-  // what the other just wrote — with each sweep looking locally settled.
   const scanners = applicable.flatMap((rule) =>
     rule.patterns.map((pattern) => ({ ruleId: rule.id, pattern })),
   );
-  if (scanners.length > 0) current = sweep(current, "$", scanners, redactions);
 
-  if (redactions.length > 0 && current !== input.output && deepEqual(current, input.output)) {
-    // Belt to `checkReplacementsSettle`'s braces. The compiler refuses the
-    // markers that let rules undo each other, but it reasons about
-    // replacements in isolation and cannot see a match formed across the seam
-    // where one was spliced in. If the payload came back equal to what arrived,
-    // then whatever the rules did to it they collectively did nothing, and
-    // saying so is the honest answer: `redactions[]` is rendered on the panel
-    // and kept in the audit log, and a removal that removed nothing is a lie in
-    // both.
+  // Candidates, not yet records: keyed so that the same removal seen on two
+  // passes is one redaction, and pruned below to those that actually changed
+  // something.
+  const candidates = new Map<string, RedactionRecord>();
+  const note = (record: RedactionRecord): void => {
+    candidates.set(
+      `${record.path}\u0000${record.rule_id ?? ""}\u0000${record.pattern_id ?? ""}\u0000${record.kind}`,
+      record,
+    );
+  };
+
+  let current = input.output;
+
+  // The *whole* transformation runs to a fixed point, fields and patterns
+  // together. Settling the pattern sweep alone is not enough: the fields and the
+  // sweep are two halves of one operation, and a guarantee about half of it says
+  // nothing about applying the other half again. Iterating the pair means the
+  // value this returns is by definition one that another `redact` leaves alone.
+  //
+  // Reference equality is the convergence test, and it is exact rather than an
+  // approximation: every transform below returns its input by reference when it
+  // changes nothing, so a pass that produces a new object produced a difference.
+  let converged = false;
+  for (let pass = 0; pass < TRANSFORM_PASS_LIMIT; pass += 1) {
+    const before = current;
+
+    // Fields first: what a rule can name, it names, so a value already pulled is
+    // not still there for the sweep to find and record a second time.
+    for (const rule of applicable) {
+      for (const field of rule.fields) {
+        current = editField(current, field.segments, "$", field, rule.id, note);
+      }
+    }
+
+    // Then one sweep carrying every applicable rule's patterns. Sweeping rule by
+    // rule would let two rules chase each other across the payload — one
+    // rewriting what the other just wrote — with each sweep looking settled.
+    if (scanners.length > 0) current = sweep(current, "$", scanners, note);
+
+    if (current === before) {
+      converged = true;
+      break;
+    }
+  }
+
+  if (!converged) {
+    // Unreachable for any policy that compiles — `checkMarkersAreInert` refuses
+    // the patterns that could rewrite what a pass writes — and kept anyway,
+    // because the guarantee should not rest on that check being complete.
+    // Withholding everything is the fail-closed direction at /post.
+    return {
+      output: WITHHELD,
+      redactions: [{ path: "$", rule_id: null, pattern_id: null, kind: "unsettled" }],
+    };
+  }
+
+  // Records follow from input versus output. Whatever the rules did on the way,
+  // a payload that came back as it arrived had nothing removed from it, and
+  // `redactions[]` is rendered on the panel and kept in the audit log — a
+  // removal that removed nothing is a lie in both.
+  if (current === input.output || deepEqual(current, input.output)) {
     return { output: input.output, redactions: [] };
   }
 
-  return { output: current, redactions };
+  return { output: current, redactions: [...candidates.values()] };
 }
 
 function matchesTool(match: ToolMatcher, tool: ToolRef): boolean {
@@ -644,7 +722,7 @@ function editField(
   at: string,
   field: CompiledField,
   ruleId: string,
-  out: RedactionRecord[],
+  note: Note,
 ): unknown {
   if (segments.length === 0) {
     const next = applyToValue(node, field);
@@ -652,7 +730,7 @@ function editField(
       // The root cannot be dropped, and an unchanged value is not a redaction.
       return node;
     }
-    out.push({ path: at, rule_id: ruleId, pattern_id: null, kind: field.strategy });
+    note({ path: at, rule_id: ruleId, pattern_id: null, kind: field.strategy });
     return next;
   }
 
@@ -662,11 +740,11 @@ function editField(
     if (!isPlainObject(node) || !Object.hasOwn(node, head.key)) return node;
     const childPath = `${at}.${head.key}`;
     if (tail.length === 0 && field.strategy === "remove") {
-      out.push({ path: childPath, rule_id: ruleId, pattern_id: null, kind: "remove" });
+      note({ path: childPath, rule_id: ruleId, pattern_id: null, kind: "remove" });
       const { [head.key]: _dropped, ...rest } = node;
       return rest;
     }
-    const child = editField(node[head.key], tail, childPath, field, ruleId, out);
+    const child = editField(node[head.key], tail, childPath, field, ruleId, note);
     if (child === node[head.key]) return node;
     return { ...node, [head.key]: child };
   }
@@ -686,7 +764,7 @@ function editField(
   // and dropped in one pass rather than one at a time under shifting indices.
   if (tail.length === 0 && field.strategy === "remove") {
     for (const index of indices) {
-      out.push({ path: `${at}[${index}]`, rule_id: ruleId, pattern_id: null, kind: "remove" });
+      note({ path: `${at}[${index}]`, rule_id: ruleId, pattern_id: null, kind: "remove" });
     }
     return node.filter((_, i) => !targeted.has(i));
   }
@@ -694,7 +772,7 @@ function editField(
   let changed = false;
   const next = node.map((element, i) => {
     if (!targeted.has(i)) return element;
-    const child = editField(element, tail, `${at}[${i}]`, field, ruleId, out);
+    const child = editField(element, tail, `${at}[${i}]`, field, ruleId, note);
     if (child !== element) changed = true;
     return child;
   });
@@ -730,13 +808,13 @@ function sweep(
   node: unknown,
   at: string,
   scanners: readonly Scanner[],
-  out: RedactionRecord[],
+  note: Note,
 ): unknown {
   if (typeof node === "string") {
     const settled = settle(node, scanners);
 
     if (!settled.converged) {
-      out.push({ path: at, rule_id: null, pattern_id: null, kind: "unsettled" });
+      note({ path: at, rule_id: null, pattern_id: null, kind: "unsettled" });
       return WITHHELD;
     }
 
@@ -747,7 +825,7 @@ function sweep(
     if (settled.text === node) return node;
 
     for (const scanner of settled.fired) {
-      out.push({
+      note({
         path: at,
         rule_id: scanner.ruleId,
         pattern_id: scanner.pattern.id,
@@ -760,7 +838,7 @@ function sweep(
   if (Array.isArray(node)) {
     let changed = false;
     const next = node.map((element, i) => {
-      const child = sweep(element, `${at}[${i}]`, scanners, out);
+      const child = sweep(element, `${at}[${i}]`, scanners, note);
       if (child !== element) changed = true;
       return child;
     });
@@ -771,7 +849,7 @@ function sweep(
     let changed = false;
     const next: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(node)) {
-      const child = sweep(value, `${at}.${key}`, scanners, out);
+      const child = sweep(value, `${at}.${key}`, scanners, note);
       if (child !== value) changed = true;
       next[key] = child;
     }

@@ -195,30 +195,43 @@ named is named, so one secret does not produce two records.
 
 ### Idempotence
 
-**The pattern sweep runs to a fixed point.** The applicable patterns are applied
-to a string until a pass leaves it alone, so the value they finish on is one they
-cannot change again — `redact` over its own output is a no-op with an empty
-`redactions[]`, for **any** policy `compileOutputPolicy` accepts. If a value has
-not settled within a bounded number of passes it is withheld and recorded with
-kind `unsettled`, naming the engine rather than a rule: withholding more is the
-fail-closed direction at `/post`, and an `unsettled` row tells an operator their
-output policy is broken rather than that a secret was found.
+> **The invariant:** for any policy `compileOutputPolicy` accepts, `redact` returns
+> a payload that redacting again leaves identical with an empty `redactions[]` —
+> because every string the engine can write is refused at compile time if any
+> pattern could match it, and the whole transformation is then run to a fixed
+> point.
 
-**Records come from comparing the value, not from counting the steps.** Patterns
-that rewrite a string and hand it back unchanged have collectively done nothing,
-and `redactions[]` says so. A removal that removed nothing is a lie on the panel
+Three things hold that up.
+
+**The whole transformation runs to a fixed point** — field rules and pattern
+sweeps together, not the sweep alone. Settling half an operation says nothing
+about applying the other half again, so the pair is iterated until a pass leaves
+the payload alone.
+
+**Every string the engine can write is inert to every scanner.** A field's
+marker, a pattern's replacement and the withheld sentinel are all text the engine
+puts into a payload, and a pattern that can match one would rewrite it next time.
+The check is `regex.test(marker)` — a partial match anywhere is enough — and for
+the sentinel it runs against every pattern in the policy, with no tool-overlap
+test, because any rule is applicable on some call.
+
+**Records come from comparing input to output**, not from counting steps. A
+payload that came back as it arrived had nothing removed from it, whatever the
+rules did on the way, and a removal that removed nothing is a lie on the panel
 and in the audit log. When there was nothing to do at all, `output` is the very
 same reference that came in, which is how #12 tells an `allow` from a `modify`
 without a deep compare.
 
-Both of those replaced an earlier design that enforced "record only what changed"
-per application and tried to *recognise* cycles at compile time. That is a losing
-game: a lookahead makes a replacement a prefix of what another pattern matches
-without ever matching it in isolation, so a check that reasons about replacements
-one at a time can always be walked around — and one such policy did not merely
-mis-record, it returned a different payload on every call. The compile-time
-marker check is still there, but as an early diagnostic for the obvious version
-of the mistake, not as the guarantee.
+If a string still cannot settle it is withheld and recorded with kind
+`unsettled` and `rule_id: null` — the engine owns that outcome, not a rule.
+Withholding more is the fail-closed direction at `/post`, and the row tells an
+operator their output policy is broken rather than that a secret was found.
+
+This shape was arrived at over three rounds of review, each of which found a
+different string that the previous version left exposed: a pattern's own
+replacement, then another rule's marker, then the sentinel itself. The lesson is
+in the invariant above — it is stated over the *set* of strings the engine can
+write, so it does not need to be restated the next time one is added.
 
 ### Fail closed means redact *more*
 
@@ -238,8 +251,8 @@ are case-sensitive — `Loan.get_loan` is not a tool and is refused), a rule wit
 neither fields nor patterns, a malformed field path, a field path repeated
 within a rule, an unparseable regex, a regex that matches the empty string (it
 would rewrite every string it was pointed at), the sticky flag (it would scan
-only from position 0), a marker some co-applicable pattern matches (a
-diagnostic — idempotence does not depend on it), a duplicate pattern id, a subject matcher that can never match, an empty `reason`, a
+only from position 0), a marker some co-applicable pattern matches, a pattern
+that can match the withheld sentinel, a duplicate pattern id, a subject matcher that can never match, an empty `reason`, a
 duplicate rule id — and `remove` on an array element addressed by index, which
 renumbers the elements after it and so does not mean the same thing twice.
 
