@@ -31,6 +31,7 @@ import {
   type AccessHookResult,
   type Decision,
   type GovernanceEvent,
+  type Grant,
   type Inputs,
   type PostHookRequest,
   type PostHookResult,
@@ -45,6 +46,7 @@ import {
   DECIDE,
   grantFrom,
   REQUEST_APPROVAL,
+  whyUnusable,
   withResolvedApproval,
   type ApprovalControl,
 } from "./approval-governance.ts";
@@ -257,14 +259,33 @@ function decidePre(
       ? withResolvedApproval(request.inputs, stored, clickerId)
       : request.inputs;
 
-  // Grants this subject holds for this exact call. `GrantChecker` judges each
-  // one against *these* inputs — a grant validated in the abstract and then
-  // applied to another resource is the replay it exists to stop.
+  // Grants this subject holds for this exact call, in two steps.
+  //
+  // First: is the row even eligible to be asked about? A grant is minted
+  // `pending` by an approving `/pre` and is turned on only by the transaction
+  // that records the winning decision as `approved`, so a grant whose request
+  // was denied — or whose decision nobody has recorded yet — never reaches the
+  // checker at all. That is what stops an approval that lost a race from
+  // lifting the denial that won it.
+  //
+  // Then: does an eligible grant authorise *this* call? That is
+  // `GrantChecker`'s question, judged against these inputs — a grant validated
+  // in the abstract and then applied to another resource is the replay it
+  // exists to stop.
+  const held = subject === null ? [] : control.store.grantsFor(subject.user_id, tool);
+  const eligible: Grant[] = [];
+  const ineligible: string[] = [];
+  for (const stored of held) {
+    const problem = whyUnusable(stored);
+    if (problem === null) eligible.push(stored.grant);
+    else ineligible.push(`Grant ${stored.grant.id} was not considered: ${problem}.`);
+  }
+
   const selection =
     subject === null
       ? { grant: null as ValidatedGrant | null, rejected: [] as readonly GrantRejection[] }
       : selectGrant({
-          grants: control.store.grantsFor(subject.user_id, tool),
+          grants: eligible,
           subject,
           tool,
           inputs,
@@ -288,13 +309,14 @@ function decidePre(
     const spent = consumeGrant(selection.grant);
     control.store.consume(spent);
     notes.push(
-      `Grant ${spent.id} was decisive and has been consumed (${spent.uses_remaining ?? "unlimited"} ` +
-        `use(s) left, expires ${spent.expires_at}).`,
+      `Consumed grant ${spent.id}, issued against approval request ${spent.request_id} ` +
+        `(${spent.uses_remaining ?? "unlimited"} use(s) left, expires ${spent.expires_at}).`,
     );
   }
   for (const rejection of selection.rejected) {
     notes.push(`Grant ${rejection.grant_id} did not apply: ${rejection.message}`);
   }
+  notes.push(...ineligible);
 
   if (decision.effect === "allow" && inApprovals && tool.name === DECIDE && stored !== null) {
     notes.unshift(...settleDecision(stored, subject, inputs, control, ctx));
@@ -339,7 +361,7 @@ function settleDecision(
   if (outcome !== "approved") return [`${headline} No grant is issued by a denial.`];
 
   const grant = grantFrom(stored, decidedBy, control, new Date(ctx.now()));
-  const inserted = control.store.issueGrant(grant);
+  const inserted = control.store.issueGrant(grant, "approved");
   if (inserted === "duplicate_request") {
     return [`${headline} A grant for this approval already exists; no second one was issued.`];
   }
@@ -348,9 +370,11 @@ function settleDecision(
       ? "no numeric ceiling"
       : `${grant.ceiling.input} at most ${grant.ceiling.max}`;
   return [
-    `${headline} Grant ${grant.id} issued to ${grant.subject_id} for ` +
-      `${qualify(grant.match.toolkit, grant.match.tool)} on ${String(grant.resource_id)}, ` +
-      `${ceiling}, ${String(grant.uses_remaining)} use, expiring ${grant.expires_at}.`,
+    `${headline} Grant ${grant.id} minted PENDING for ${grant.subject_id} on ` +
+      `${qualify(grant.match.toolkit, grant.match.tool)} for ${String(grant.resource_id)}, ` +
+      `${ceiling}, ${String(grant.uses_remaining)} use, expiring ${grant.expires_at}. ` +
+      `It authorises nothing until the transaction that records this approval activates it, ` +
+      `and a recorded denial voids it instead.`,
   ];
 }
 

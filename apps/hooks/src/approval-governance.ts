@@ -33,11 +33,20 @@
  * cannot write one — it has no database — and the store endpoints do not,
  * because recording a decision is not the same act as issuing authority.
  *
- * It is *consumed* somewhere else entirely: on the retry, in `handlePre`, when
- * a grant is what turned a denial into an allow. Checking and consuming are
- * two steps in `GrantChecker` on purpose (#10), and they stay two steps here —
- * the grant is spent only when it was decisive, so a call that policy allowed
- * on its own does not quietly burn the one use an approval bought.
+ * But the pre-hook cannot write a *usable* one, and that distinction is the
+ * whole of round 1's fix. `/pre` runs before the tool that records the
+ * decision, so at the moment it writes, the outcome is not yet settled and
+ * another `Decide` may still be in flight with the opposite answer. So the row
+ * it writes is `pending`, which authorises nothing, and only the transaction
+ * that records `approved` — winning the compare-and-swap on the request —
+ * turns it on. A recorded `denied` voids it in that same transaction. See
+ * `grants-store.ts`.
+ *
+ * A grant is *consumed* somewhere else again: on the retry, in `handlePre`,
+ * when a grant is what turned a denial into an allow. Checking and consuming
+ * are two steps in `GrantChecker` on purpose (#10), and they stay two steps
+ * here — the grant is spent only when it was decisive, so a call that policy
+ * allowed on its own does not quietly burn the one use an approval bought.
  */
 import type { Database } from "bun:sqlite";
 
@@ -50,7 +59,9 @@ import {
   insertGrant,
   newGrantId,
   persistConsumption,
+  type AuthorizedDecision,
   type InsertOutcome,
+  type StoredGrant,
 } from "./grants-store.ts";
 import { subjectKey } from "./policy-cache.ts";
 
@@ -64,8 +75,8 @@ export const APPROVAL_INPUT = "approval";
 /** The database reads and writes `/pre` needs. Everything else it does is pure. */
 export interface PreStore {
   approval(requestId: string): StoredApproval | null;
-  grantsFor(subjectId: string, tool: ToolRef): Grant[];
-  issueGrant(grant: Grant): InsertOutcome;
+  grantsFor(subjectId: string, tool: ToolRef): StoredGrant[];
+  issueGrant(grant: Grant, authorizes: AuthorizedDecision): InsertOutcome;
   consume(grant: Grant): void;
 }
 
@@ -83,7 +94,7 @@ export function createPreStore(db: Database): PreStore {
   return {
     approval: (requestId) => readApproval(db, requestId),
     grantsFor: (subjectId, tool) => readGrantsFor(db, subjectId, tool),
-    issueGrant: (grant) => insertGrant(db, grant),
+    issueGrant: (grant, authorizes) => insertGrant(db, grant, authorizes),
     consume: (grant) => persistConsumption(db, grant),
   };
 }
@@ -179,6 +190,45 @@ export function createApprovalControl(
     grantTtlSeconds: options.grantTtlSeconds,
     newGrantId: options.newGrantId ?? newGrantId,
   };
+}
+
+/**
+ * Why a stored grant may not even be considered, or `null` when it may.
+ *
+ * Two independent conditions, both required, and deliberately not collapsed
+ * into one: the grant must have been **activated**, and the request it came
+ * from must have **recorded** `approved`. Either alone leaves a hole. A grant
+ * still `pending` belongs to a decision nobody has recorded, and a request
+ * that reads `approved` may have activated a *different* grant — or none,
+ * because the approval was written straight to the store with no pre-hook
+ * behind it. Requiring both is what makes "usable" mean "the winning recorded
+ * decision was approved, and this is the grant that decision turned on".
+ *
+ * Returning a sentence rather than a boolean is the point: the audit row says
+ * a grant was present and why it was ignored, which is the difference between
+ * a control that fired and a table that happened to be empty.
+ */
+export function whyUnusable(stored: StoredGrant): string | null {
+  if (stored.lifecycle === "void") {
+    return (
+      `it was voided at ${stored.voided_at ?? "an unrecorded time"} because approval request ` +
+      `${stored.grant.request_id} was decided ${stored.requestStatus ?? "otherwise"}`
+    );
+  }
+  if (stored.lifecycle !== "active") {
+    return (
+      `it is still pending activation — approval request ${stored.grant.request_id} is ` +
+      `${stored.requestStatus ?? "missing"}, and only the transaction that records an ` +
+      `approval turns a grant on`
+    );
+  }
+  if (stored.requestStatus !== "approved") {
+    return (
+      `approval request ${stored.grant.request_id} now reads ` +
+      `${stored.requestStatus ?? "missing"}, not approved`
+    );
+  }
+  return null;
 }
 
 /** The whole roster, in the order `routeApproval` wants it: any order. */

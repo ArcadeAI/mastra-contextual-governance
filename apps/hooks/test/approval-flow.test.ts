@@ -164,7 +164,9 @@ describe("act 2, end to end", () => {
     const row = lastRowFor("Loan.ApproveLoan");
     expect(row?.decision).toBe("allow");
     expect(row?.reason).toContain("Covered by an active grant");
-    expect(row?.reason).toContain("consumed");
+    // The reason names the grant it spent, and the approval it came from.
+    expect(row?.reason).toContain(`Consumed grant ${allGrants(db)[0]!.grant.id}`);
+    expect(row?.reason).toContain(`approval request ${request.id}`);
   });
 
   test("the allow row for RequestApproval names who was routed to and who was not bothered", async () => {
@@ -300,7 +302,14 @@ describe("the grant an approval buys", () => {
 
     const grants = allGrants(db);
     expect(grants).toHaveLength(1);
-    const grant = grants[0]!;
+    const stored = grants[0]!;
+    const grant = stored.grant;
+
+    // Activated by the transaction that recorded the approval, not by /pre.
+    expect(stored.lifecycle).toBe("active");
+    expect(stored.authorizes).toBe("approved");
+    expect(stored.requestStatus).toBe("approved");
+    expect(stored.activated_at).toBeString();
 
     expect(grant.subject_id).toBe(DANA);
     expect(grant.granted_by).toBe(RILEY);
@@ -323,7 +332,7 @@ describe("the grant an approval buys", () => {
 
     expect(denied(second)).toContain("exceeds your approval authority");
     expect(lastRowFor("Loan.ApproveLoan")?.reason).toContain("already been used");
-    expect(allGrants(db)[0]?.uses_remaining).toBe(0);
+    expect(allGrants(db)[0]?.grant.uses_remaining).toBe(0);
   });
 
   test("cannot be replayed against a different resource", async () => {
@@ -337,7 +346,7 @@ describe("the grant an approval buys", () => {
     expect(denied(elsewhere)).toContain("exceeds your approval authority");
     expect(lastRowFor("Loan.ApproveLoan")?.reason).toContain("authorises resource \"LN-2291\"");
     // Unspent: a grant is consumed only when it was decisive.
-    expect(allGrants(db)[0]?.uses_remaining).toBe(1);
+    expect(allGrants(db)[0]?.grant.uses_remaining).toBe(1);
   });
 
   test("cannot be applied to a larger amount, and still holds at the approved one", async () => {
@@ -346,7 +355,7 @@ describe("the grant an approval buys", () => {
     const bigger = await pre(DANA, "Loan", "ApproveLoan", { loan_id: "LN-2291", amount: 120_000 });
     expect(denied(bigger)).toContain("exceeds your approval authority");
     expect(lastRowFor("Loan.ApproveLoan")?.reason).toContain("up to 95000, but the call passed 120000");
-    expect(allGrants(db)[0]?.uses_remaining).toBe(1);
+    expect(allGrants(db)[0]?.grant.uses_remaining).toBe(1);
 
     // Inclusive at the bound: an approval for 95,000 authorises 95,000.
     expect((await pre(DANA, "Loan", "ApproveLoan", { loan_id: "LN-2291", amount: 95_000 })).code).toBe("OK");
@@ -359,12 +368,12 @@ describe("the grant an approval buys", () => {
     // is not his, and his own clearance does not cover the call.
     const sam = await pre(SAM, "Loan", "ApproveLoan", { loan_id: "LN-2291", amount: 95_000 });
     expect(denied(sam)).toContain("exceeds your approval authority of 0");
-    expect(allGrants(db)[0]?.uses_remaining).toBe(1);
+    expect(allGrants(db)[0]?.grant.uses_remaining).toBe(1);
   });
 
   test("expires: the same call denied once the window has passed", async () => {
     await approved();
-    const grant = allGrants(db)[0]!;
+    const grant = allGrants(db)[0]!.grant;
 
     // The only test that reaches past HTTP, because it needs a clock it can
     // move. `handlePre` is what the server calls; the context is the server's,
@@ -389,7 +398,7 @@ describe("the grant an approval buys", () => {
 
     expect(response.code).toBe("CHECK_FAILED");
     expect(events[0]?.reason).toContain(`expired at ${grant.expires_at}`);
-    expect(allGrants(db)[0]?.uses_remaining).toBe(1);
+    expect(allGrants(db)[0]?.grant.uses_remaining).toBe(1);
   });
 });
 

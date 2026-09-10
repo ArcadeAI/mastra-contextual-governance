@@ -186,7 +186,22 @@ const SCHEMA = `
   );
 
   -- Grants: one row per approval outcome, in the shape @cg/policy-schema's
-  -- Grant describes. Written by the approval flow (#10, #19); read at /pre.
+  -- Grant describes, plus the three lifecycle columns below. Written by the
+  -- approval flow (#10, #19); read at /pre.
+  --
+  -- The lifecycle exists because issuing a grant and recording the decision
+  -- that justifies it are two writes, and two writes race. A grant is minted
+  -- 'pending' by /pre and becomes usable only inside the same transaction that
+  -- records the winning decision as 'approved'; a decision that records
+  -- 'denied' voids it in that same transaction. So an approval that loses the
+  -- race leaves a row that never becomes authority, rather than one that is
+  -- authority until somebody notices.
+  --
+  --   pending  minted by /pre, not usable, waiting for a recorded decision
+  --   active   the recorded decision was 'approved'. The only usable state.
+  --   void     the recorded decision was 'denied', or the request settled
+  --            without this grant winning. revoked_at is set too, so
+  --            GrantChecker refuses it even if the status is ignored.
   CREATE TABLE grants (
     id             TEXT PRIMARY KEY,
     subject_id     TEXT NOT NULL,
@@ -200,9 +215,17 @@ const SCHEMA = `
     issued_at      TEXT NOT NULL,
     expires_at     TEXT NOT NULL,
     uses_remaining INTEGER,
-    revoked_at     TEXT
+    revoked_at     TEXT,
+    status         TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending', 'active', 'void')),
+    -- The decision this grant was minted for. Activation matches on it, so a
+    -- grant can only ever be turned on by the outcome it was issued against.
+    authorizes     TEXT NOT NULL DEFAULT 'approved'
+                        CHECK (authorizes IN ('approved', 'denied')),
+    activated_at   TEXT,
+    voided_at      TEXT
   );
-  CREATE INDEX idx_grants_subject_tool ON grants(subject_id, toolkit, tool);
+  CREATE INDEX idx_grants_subject_tool ON grants(subject_id, toolkit, tool, status);
   -- One approval, one grant, enforced by the database. The /pre handler that
   -- issues a grant and the store call that flips the request to 'approved'
   -- are two writes, and only the second one closes the "still pending" rule.

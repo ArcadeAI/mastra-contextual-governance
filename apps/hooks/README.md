@@ -55,7 +55,7 @@ Six tables you can read at a glance, because one gets edited live on stage:
 | `catalogue` | every governed tool and the arguments a call must supply | rarely |
 | `policy_rules` | `/access` and `/pre` rules, one row each; `enabled = 0` switches one off | yes |
 | `output_rules` | `/post` redaction rules, stored now and evaluated from #16 | — |
-| `grants` | narrow permissions produced by approvals, written **only** by `/pre` | — |
+| `grants` | narrow permissions produced by approvals; minted **only** by `/pre`, activated **only** by the transaction that records the approval | — |
 | `approval_requests` | escalations the approvals toolkit writes and the approval page reads; empty on seed | — |
 | `audit_log` | one row per decision, append-only | never |
 
@@ -182,10 +182,46 @@ triggered it. `action` is a bare name; `action-binding.ts` turns it into a tool 
 names using the catalogue and the rule that bounds the amount, and **refuses rather than
 guesses** when either is ambiguous.
 
-Consumption happens somewhere else: on the retry, in `handlePre`, when a grant is what turned a
-denial into an allow. The call is evaluated twice — with the grant and without it — so a use is
-spent only when the grant was decisive, and a call policy would have allowed anyway does not
-quietly burn the one use an approval bought.
+### A grant is minted pending, and only a recorded approval turns it on
+
+Issuing the grant and recording the decision are two writes, and two writes race. Round 1 of
+#52's review drove it: two `Decide` calls both pass `/pre` while the request is still `pending`,
+one approving and one denying; the denial is recorded first, the approval's store write loses
+with a `409`, and the grant the approval already minted is left usable against a request whose
+recorded outcome is `denied`.
+
+Ordering the two writes differently only moves the window, so the lifecycle closes the class
+instead:
+
+| state | meaning |
+|---|---|
+| `pending` | minted by `/pre`. Authorises nothing. |
+| `active` | the winning recorded decision was `approved`. The only usable state. |
+| `void` | the winning recorded decision was `denied`. `revoked_at` is set too. |
+
+`POST /approvals/{id}/decision` is a **compare-and-swap**: it flips the request from `pending`
+to the decision, and `changes === 1` is what declares this decision the winner. In that same
+transaction, a winning `approved` activates the request's pending grant and a winning `denied`
+voids it. A decision that loses the swap changes nothing, and therefore activates nothing and
+voids nothing it did not win the right to.
+
+At the retry, `/pre` considers a grant only when **both** its lifecycle is `active` **and** the
+request it came from currently reads `approved` (`whyUnusable` in `approval-governance.ts`).
+Either condition alone leaves a hole: a `pending` grant belongs to a decision nobody recorded,
+and a request reading `approved` may have activated a different grant or none at all. A grant
+that fails either check is named in the audit row with the reason it was skipped, because a
+control that fires silently is indistinguishable from one that did not.
+
+`test/decision-race.test.ts` holds this: the reviewer's sequence verbatim, its mirror image, a
+late losing decision, a grant nobody ever recorded, and a property test running all 24
+interleavings of the four operations and asserting that a successful retry implies a recorded
+status of `approved`.
+
+Consumption happens somewhere else again: on the retry, in `handlePre`, when a grant is what
+turned a denial into an allow. The call is evaluated twice — with the grant and without it — so
+a use is spent only when the grant was decisive, and a call policy would have allowed anyway
+does not quietly burn the one use an approval bought. The allow row names the grant it spent and
+the approval request it came from.
 
 ## What the audit log is, and is not
 

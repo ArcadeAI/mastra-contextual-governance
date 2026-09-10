@@ -16,18 +16,28 @@
  * ever sent. The requester can read the DM she sent, so she can reach the read
  * too — which is exactly why the link is safe to put in a conversation.
  *
- * **It does not overwrite a decision.** `recordDecision` writes only while the
- * request is `pending` and reports `already_decided` otherwise. The contract
- * does not specify that case and the pre-hook's "still pending" rule is the
- * control that stops it, but a store that would let `denied` be rewritten to
- * `approved` is a store the audit trail cannot vouch for, and refusing costs
- * one `WHERE` clause.
+ * **It does not overwrite a decision.** `recordDecision` is a compare-and-swap:
+ * it writes only while the request is `pending`, and reports `already_decided`
+ * otherwise. That `WHERE status = 'pending'` is not politeness — it is the
+ * point at which one of several in-flight decisions is declared the winner,
+ * and everything that follows from a decision hangs off whether it changed a
+ * row.
+ *
+ * **It settles the request's grants in the same transaction.** Winning the swap
+ * with `approved` activates the pending grant the pre-hook minted; winning it
+ * with `denied` voids every pending grant the request owns. A decision that
+ * loses the swap changes nothing and therefore settles nothing — it cannot
+ * activate a grant, and it cannot void one it did not win the right to. This
+ * is what closes the race round 1 of #52's review found: there is no
+ * interleaving in which a grant is usable and the recorded outcome is not
+ * `approved`, because the two facts are written together or not at all.
  */
 import type { Database } from "bun:sqlite";
 
 import { ApprovalRecord, type ApprovalStatus } from "@cg/policy-schema";
 
 import type { ActionBinding } from "./action-binding.ts";
+import { activatePendingGrants, voidPendingGrants } from "./grants-store.ts";
 
 /**
  * Ids are minted here and nowhere else. The toolkit does not supply one on
@@ -72,7 +82,13 @@ export interface DecisionInput {
 }
 
 export type DecisionOutcome =
-  | { outcome: "recorded"; approval: StoredApproval }
+  | {
+      outcome: "recorded";
+      approval: StoredApproval;
+      /** Grants this decision turned on, and grants it voided. */
+      grantsActivated: number;
+      grantsVoided: number;
+    }
   | { outcome: "not_found" }
   | { outcome: "already_decided"; approval: StoredApproval };
 
@@ -163,25 +179,44 @@ export function recordDecision(
   return db.transaction((): DecisionOutcome => {
     const existing = readApproval(db, id);
     if (existing === null) return { outcome: "not_found" };
-    if (existing.record.status !== "pending") {
-      return { outcome: "already_decided", approval: existing };
+
+    const at = now();
+    // The compare-and-swap. `changes` is the whole answer: 1 means this
+    // decision is the one that settled the request, 0 means another already
+    // had. Reading the status first and then updating would be two answers
+    // with a gap between them.
+    const won =
+      db
+        .prepare(
+          `UPDATE approval_requests
+              SET status = $status, note = $note, decided_at = $decided_at, decided_by = $decided_by
+            WHERE id = $id AND status = 'pending'`,
+        )
+        .run({
+          $id: id,
+          $status: input.decision,
+          $note: input.note,
+          $decided_at: at,
+          $decided_by: input.decided_by,
+        }).changes === 1;
+
+    if (!won) {
+      const current = readApproval(db, id);
+      if (current === null) throw new Error(`approval ${id} vanished while being decided`);
+      // Changed nothing, and so settles nothing: a losing decision must not
+      // void a grant it did not win the right to void.
+      return { outcome: "already_decided", approval: current };
     }
 
-    db.prepare(
-      `UPDATE approval_requests
-          SET status = $status, note = $note, decided_at = $decided_at, decided_by = $decided_by
-        WHERE id = $id AND status = 'pending'`,
-    ).run({
-      $id: id,
-      $status: input.decision,
-      $note: input.note,
-      $decided_at: now(),
-      $decided_by: input.decided_by,
-    });
+    // Same transaction, because "the request is approved" and "its grant is
+    // usable" are one fact written twice, and a reader must never see one
+    // without the other.
+    const grantsActivated = input.decision === "approved" ? activatePendingGrants(db, id, at) : 0;
+    const grantsVoided = input.decision === "denied" ? voidPendingGrants(db, id, at) : 0;
 
     const updated = readApproval(db, id);
     if (updated === null) throw new Error(`approval ${id} vanished while being decided`);
-    return { outcome: "recorded", approval: updated };
+    return { outcome: "recorded", approval: updated, grantsActivated, grantsVoided };
   })();
 }
 
