@@ -26,6 +26,7 @@ import { openGovernance } from "../src/policy-store.ts";
 import { createServer } from "../src/server.ts";
 
 const SECRET = "test-secret";
+const STORE_TOKEN = "test-store-token";
 const DANA = "dana.okafor@bank.example";
 const SAM = "sam.reyes@bank.example";
 
@@ -33,11 +34,13 @@ const config: HooksConfig = {
   port: 0,
   dbPath: ":memory:",
   signingSecret: SECRET,
+  approvalsStoreToken: STORE_TOKEN,
   loanToolkit: "Loan",
   approvalsToolkit: "Approvals",
   personaEmails: {},
   deadlineMs: 2500,
   policyPollMs: 250,
+  grantTtlSeconds: 900,
 };
 
 // ---------------------------------------------------------------------------

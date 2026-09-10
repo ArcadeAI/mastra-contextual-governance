@@ -66,11 +66,13 @@ const config: HooksConfig = {
   port: 0,
   dbPath: ":memory:",
   signingSecret: SECRET,
+  approvalsStoreToken: "interop-store-token",
   loanToolkit: "Loan",
   approvalsToolkit: "Approvals",
   personaEmails: {},
   deadlineMs: 2500,
   policyPollMs: 250,
+  grantTtlSeconds: 900,
 };
 
 const db = openGovernance(":memory:", config);
