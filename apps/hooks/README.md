@@ -37,6 +37,26 @@ bun run --cwd apps/hooks test
 bun run --cwd apps/hooks bench          # latency, over HTTP, including the 1.6 MB /access
 ```
 
+Both bearers fall back to a development value when unset, so a local run needs no
+configuration. **Under `NODE_ENV=production` there is no fallback**: the service refuses to
+boot without `ARCADE_HOOK_SIGNING_SECRET` *and* `APPROVALS_STORE_TOKEN`, because a control
+plane that came up on a known token would accept hook calls from anyone, and an approvals
+store that did would accept the record a human then acts on from anyone. Booting the image
+locally therefore needs both:
+
+```sh
+docker build -f apps/hooks/Dockerfile -t cg-hooks:local .
+docker run --rm -p 8080:8080 -e PORT=8080 \
+  -e ARCADE_HOOK_SIGNING_SECRET=local-only \
+  -e APPROVALS_STORE_TOKEN=local-only \
+  cg-hooks:local
+curl -fsS http://localhost:8080/health
+```
+
+That is exactly what CI's `build hooks image` job does — build, boot under
+`NODE_ENV=production`, ask `/health` the question Render asks — so a new required variable
+that nobody wired up fails there rather than on a deploy.
+
 ## The HTTP layer is thin
 
 `server.ts` authenticates, parses, hands the payload to a handler in `handlers.ts`, appends the
@@ -65,6 +85,12 @@ still raised in act 3 and after a restart. Resetting is `scripts/reset` (#23), n
 The schema and the seed rows go in as one transaction, so a seed that fails leaves no schema and
 the next boot retries — rather than a green service with an empty cast, permanently, on a disk
 that persists.
+
+⚠️ **Seed-if-empty means there are no migrations.** `hasSchema` looks for one table
+(`policy_rules`), so a `governance.db` created by an earlier revision is treated as already
+seeded and never gains tables added since — a database from before #19 comes up green and then
+answers `no such table: approval_requests` on the first `/approvals` call. Delete the file (or
+run `scripts/reset`, #23) after pulling a schema change. A fresh clone is unaffected.
 
 Two things in the fixture are substituted at seed time and nowhere else: the toolkit names
 (`$LOAN`, `$APPROVALS` → `ARCADE_LOAN_TOOLKIT`, `ARCADE_APPROVALS_TOOLKIT`) and the persona

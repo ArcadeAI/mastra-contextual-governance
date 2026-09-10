@@ -136,11 +136,19 @@ jobs:
           # smoke test hands it a throwaway one.
           - service: idp
             smoke_env: -e BETTER_AUTH_SECRET=ci-smoke-only-not-a-real-secret-0000
-          # cg-hooks likewise refuses to boot in production without the bearer
-          # token Arcade must present: a control plane that fell back to a
-          # known token would accept hook calls from anyone. Throwaway here.
+          # cg-hooks likewise refuses to boot in production without its two
+          # bearers, and for the same reason in both cases: a control plane
+          # that fell back to a known token would accept hook calls from
+          # anyone, and an approvals store that fell back to one would accept
+          # the approval record a human then acts on from anyone. Two secrets
+          # rather than one because they have two holders — Arcade signs the
+          # hooks, the deployed approvals toolkit and cg-web call /approvals —
+          # and neither is accepted in the other's place. Throwaway here; both
+          # are `sync: false` in render.yaml.
           - service: hooks
-            smoke_env: -e ARCADE_HOOK_SIGNING_SECRET=ci-smoke-only-not-a-real-secret
+            smoke_env: >-
+              -e ARCADE_HOOK_SIGNING_SECRET=ci-smoke-only-not-a-real-secret
+              -e APPROVALS_STORE_TOKEN=ci-smoke-only-not-a-real-token
     steps:
       - uses: actions/checkout@v4
 

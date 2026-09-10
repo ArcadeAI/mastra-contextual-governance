@@ -202,13 +202,6 @@ export function grantsFor(
     .map(fromRow);
 }
 
-export function grantForRequest(db: Database, requestId: string): StoredGrant | null {
-  const row = db
-    .query<Row, { $request_id: string }>(`${SELECT} WHERE g.request_id = $request_id`)
-    .get({ $request_id: requestId });
-  return row === null ? null : fromRow(row);
-}
-
 /**
  * Write back a grant `consumeGrant` has spent. Single use is enforced by the
  * row, not by the returned value, so this is the step that makes it true.

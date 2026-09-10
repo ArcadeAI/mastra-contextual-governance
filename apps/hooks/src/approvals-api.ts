@@ -37,7 +37,7 @@ import type { Database } from "bun:sqlite";
 import { z } from "zod";
 
 import { evaluatePermission } from "@cg/governance-core";
-import { ApprovalStatus, type Subject } from "@cg/policy-schema";
+import type { Subject } from "@cg/policy-schema";
 
 import { resolveAction } from "./action-binding.ts";
 import { createApproval, readApproval, recordDecision } from "./approvals-store.ts";
@@ -268,6 +268,3 @@ async function readJson(request: Request): Promise<unknown> {
     return null;
   }
 }
-
-/** Exported for the status vocabulary a test asserts against. */
-export const APPROVAL_STATUSES = ApprovalStatus.options;

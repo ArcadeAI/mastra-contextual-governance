@@ -24,10 +24,28 @@ export interface WebConfig {
   approvalsToolkit: string;
 }
 
+/**
+ * The value `apps/hooks` falls back to when `APPROVALS_STORE_TOKEN` is unset
+ * and it is not running in production — see `DEV_STORE_TOKEN` in
+ * `apps/hooks/src/config.ts`, which refuses to boot without a real one under
+ * `NODE_ENV=production`.
+ *
+ * Duplicated rather than imported because `apps/web` does not depend on
+ * `apps/hooks` in the package graph and should not start to. The cost of a
+ * duplicated literal is drift, so `test/config.test.ts` reads the other file
+ * and fails if the two ever disagree — which is a cheaper guarantee than a
+ * dependency edge between the governed UI and the control plane.
+ *
+ * Without this fallback a clean checkout renders the approval page as "nothing
+ * to decide": the store answers `401`, the page has no request to show, and
+ * nothing on screen says the cause is an unset variable.
+ */
+const DEV_STORE_TOKEN = "cg-approvals-store-dev-token-not-for-production";
+
 export function readWebConfig(env: Record<string, string | undefined> = process.env): WebConfig {
   return {
     hooksHost: env.HOOKS_PUBLIC_HOST?.trim() || "localhost:8081",
-    approvalsStoreToken: env.APPROVALS_STORE_TOKEN?.trim() ?? "",
+    approvalsStoreToken: env.APPROVALS_STORE_TOKEN?.trim() || DEV_STORE_TOKEN,
     arcadeApiUrl: (env.ARCADE_API_URL?.trim() || "https://api.arcade.dev").replace(/\/+$/, ""),
     arcadeApiKey: env.ARCADE_API_KEY?.trim() ?? "",
     approvalsToolkit: env.ARCADE_APPROVALS_TOOLKIT?.trim() || "Approvals",

@@ -23,6 +23,7 @@ import type { Database } from "bun:sqlite";
 
 import { PreHookResult, type ApprovalRecord } from "@cg/policy-schema";
 
+import { recent } from "../src/audit-log.ts";
 import type { HooksConfig } from "../src/config.ts";
 import { allGrants } from "../src/grants-store.ts";
 import { createPolicyCache, type PolicyCache } from "../src/policy-cache.ts";
@@ -132,6 +133,10 @@ const record = (id: string, decision: "approved" | "denied") =>
 const retry = (resourceId: string) =>
   pre(DANA, "Loan", "ApproveLoan", { loan_id: resourceId, amount: 95_000 });
 
+/** The most recent audit row for one tool. */
+const lastRowFor = (tool: string) =>
+  recent(db, 50).find((event) => event.tool === tool);
+
 const statusOf = async (id: string): Promise<string> =>
   ((await (await store("GET", `/approvals/${id}`)).json()) as { request: ApprovalRecord }).request
     .status;
@@ -233,7 +238,7 @@ describe("the reviewer's sequence, verbatim", () => {
 
     await retry("LN-LOUD");
 
-    const row = [...allRows()].reverse().find((event) => event.tool === "Loan.ApproveLoan");
+    const row = lastRowFor("Loan.ApproveLoan");
     // A grant that was present and ignored must be visible as exactly that. A
     // control that fires silently is indistinguishable from one that did not.
     expect(row?.reason).toContain("was not considered");
@@ -327,16 +332,3 @@ describe("across every interleaving", () => {
     expect(usableWhenApproved.length).toBeGreaterThan(0);
   });
 });
-
-// Local import kept at the bottom: only the loudness test reads the log.
-function allRows() {
-  return recentRows(db);
-}
-
-function recentRows(database: Database) {
-  return database
-    .query<{ tool: string; reason: string }, []>(
-      "SELECT tool, reason FROM audit_log ORDER BY seq ASC",
-    )
-    .all();
-}

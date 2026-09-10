@@ -51,7 +51,7 @@
 import type { Database } from "bun:sqlite";
 
 import type { ToolRef } from "@cg/governance-core";
-import type { Grant, Inputs, Subject } from "@cg/policy-schema";
+import type { Grant, Inputs } from "@cg/policy-schema";
 
 import { readApproval, type StoredApproval } from "./approvals-store.ts";
 import {
@@ -229,9 +229,4 @@ export function whyUnusable(stored: StoredGrant): string | null {
     );
   }
   return null;
-}
-
-/** The whole roster, in the order `routeApproval` wants it: any order. */
-export function rosterOf(subjects: ReadonlyMap<string, Subject>): Subject[] {
-  return [...subjects.values()];
 }
