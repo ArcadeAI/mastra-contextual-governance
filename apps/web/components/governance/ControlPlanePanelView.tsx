@@ -6,6 +6,13 @@
  * value never reaches the markup, that three states are distinguishable
  * without colour — is a property of *this*, and none of it needs a socket, a
  * browser, or a fake timer to check.
+ *
+ * There is deliberately no prose on the panel. `DESIGN.md` open risk 2 — that
+ * Arcade refuses an unmet auth requirement before any hook runs, so such a
+ * refusal reaches nothing here — is a real caveat and it lives in
+ * `apps/web/README.md`. A paragraph of it on a projector was read as noise in
+ * design review, which is a fair reading: nobody at the back of a room reads a
+ * footnote, and the space it took belonged to the lanes.
  */
 import type { GovernanceEvent } from "@cg/policy-schema";
 
@@ -74,6 +81,7 @@ export function ControlPlanePanelView({
             hook={hook}
             events={timeline.lanes[hook]}
             behind={timeline.behind[hook]}
+            counts={timeline.laneCounts[hook]}
             visible={VISIBLE_PER_LANE}
             flashKey={
               timeline.lanes[hook][0]?.id === timeline.latestId
@@ -84,21 +92,6 @@ export function ControlPlanePanelView({
           />
         ))}
       </div>
-
-      {/*
-        DESIGN.md open risk 2, said out loud rather than left as a gap. Arcade
-        evaluates a tool's auth requirements before the first hook runs, so a
-        call refused there writes no audit row and can never appear here. An
-        empty lane is therefore not evidence that nothing was attempted, and a
-        panel that implied otherwise would be overclaiming exactly where this
-        demo needs to be trusted.
-      */}
-      <p className="cg-footnote">
-        Every decision the access, pre and post hooks made is here. Arcade checks whether the
-        caller holds a tool&rsquo;s credential before any hook runs, and a call refused there
-        leaves no record — so an empty lane means no hook was reached, not that nothing was
-        tried.
-      </p>
     </div>
   );
 }

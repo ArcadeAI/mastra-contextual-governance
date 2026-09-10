@@ -6,6 +6,7 @@ import {
   allEvents,
   appendEvents,
   emptyTimeline,
+  HOOK_POINTS,
   LANE_CAPACITY,
 } from "../lib/governance/timeline.ts";
 
@@ -228,5 +229,67 @@ describe("appendEvents does not mutate what it was given", () => {
     expect(before.lanes.pre).toBe(laneBefore);
     expect(before.lanes.pre).toHaveLength(1);
     expect(before.received).toBe(1);
+  });
+});
+
+describe("per-lane counts", () => {
+  test("each lane tallies only its own hook", () => {
+    const timeline = timelineOf([
+      anEvent(1, "access", "deny"),
+      anEvent(2, "pre", "deny"),
+      anEvent(3, "pre", "allow"),
+      anEvent(4, "post", "modify"),
+      anEvent(5, "post", "modify"),
+    ]);
+
+    expect(timeline.laneCounts.access).toEqual({ allow: 0, deny: 1, modify: 0 });
+    expect(timeline.laneCounts.pre).toEqual({ allow: 1, deny: 1, modify: 0 });
+    expect(timeline.laneCounts.post).toEqual({ allow: 0, deny: 0, modify: 2 });
+  });
+
+  test("the three lanes sum to the global tally", () => {
+    const events = Array.from({ length: 90 }, (_, index) =>
+      anEvent(
+        index,
+        index % 3 === 0 ? "access" : index % 3 === 1 ? "pre" : "post",
+        index % 2 === 0 ? "allow" : "deny",
+      ),
+    );
+
+    const timeline = timelineOf(events);
+
+    for (const decision of ["allow", "deny", "modify"] as const) {
+      const summed = HOOK_POINTS.reduce(
+        (total, hook) => total + timeline.laneCounts[hook][decision],
+        0,
+      );
+      expect(summed).toBe(timeline.counts[decision]);
+    }
+  });
+
+  test("a lane keeps counting past its capacity", () => {
+    const events = Array.from({ length: 400 }, (_, index) =>
+      anEvent(index, "access", "deny"),
+    );
+
+    const timeline = timelineOf(events, 5);
+
+    expect(timeline.lanes.access).toHaveLength(5);
+    expect(timeline.laneCounts.access.deny).toBe(400);
+  });
+
+  test("an empty timeline has three zeroed lanes", () => {
+    expect(emptyTimeline().laneCounts).toEqual({
+      access: { allow: 0, deny: 0, modify: 0 },
+      pre: { allow: 0, deny: 0, modify: 0 },
+      post: { allow: 0, deny: 0, modify: 0 },
+    });
+  });
+
+  test("a replayed duplicate does not double-count its lane", () => {
+    let timeline = timelineOf([anEvent(1, "pre", "deny")]);
+    timeline = appendEvents(timeline, [anEvent(1, "pre", "deny")]);
+
+    expect(timeline.laneCounts.pre.deny).toBe(1);
   });
 });

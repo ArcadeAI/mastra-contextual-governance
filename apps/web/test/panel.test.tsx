@@ -190,8 +190,14 @@ describe("a modification shows a diff, and never the value it removed", () => {
     expect(render([redaction])).not.toContain(injection);
   });
 
-  test("the removed value is replaced by a mask, so the audience sees it was there", () => {
-    expect(render([redaction])).toContain("●");
+  test("the removed value is replaced by a mask that says it is a mask", () => {
+    const markup = render([redaction]);
+
+    // Not a row of dots: from across a room those read as a value in a masked
+    // font rather than as the absence of one.
+    expect(markup).toContain('class="cg-mask"');
+    expect(markup).toContain("withheld");
+    expect(markup).not.toContain("●");
   });
 
   test("the changed paths are named", () => {
@@ -236,11 +242,27 @@ describe("a modification shows a diff, and never the value it removed", () => {
     expect(markup).not.toContain("Ignore all previous instructions");
   });
 
-  test("the diff's direction is announced, not left to the glyphs", () => {
+  test("each changed leaf is labelled field, before and after", () => {
     const markup = render([redaction]);
+    const diff = markup.slice(markup.indexOf('class="cg-diff"'));
 
-    expect(markup).toContain("Removed:");
-    expect(markup).toContain("Kept:");
+    expect(diff).toContain('class="cg-diff-path">bank_account_number');
+    expect(diff).toContain(">before<");
+    expect(diff).toContain(">after<");
+  });
+
+  test("a leaf removed outright says so rather than showing an empty after", () => {
+    const markup = render([
+      aGovernanceEvent({
+        id: "evt_gone",
+        decision: "modify",
+        before: { id: "LN-2291", ssn: "078-05-1120" },
+        after: { id: "LN-2291" },
+      }),
+    ]);
+
+    expect(markup).toContain("removed entirely");
+    expect(markup).not.toContain("078-05-1120");
   });
 });
 
@@ -333,19 +355,19 @@ describe("the connection, said out loud", () => {
   });
 });
 
-describe("the layer-2 footnote", () => {
-  // DESIGN.md open risk 2: Arcade refuses on an unmet auth requirement before
-  // any hook fires, so that refusal can never appear here. Saying so is what
-  // stops an empty lane being read as "no governance happened".
-  test("names the check that happens upstream of every hook", () => {
-    const markup = render([]);
+describe("no prose on the projector", () => {
+  // The layer-2 caveat (DESIGN.md open risk 2) was a paragraph in the bottom
+  // left. Design review cut it: nobody at the back of a room reads a footnote,
+  // and the space belonged to the lanes. It lives in apps/web/README.md now.
+  test("the bottom-left paragraph is gone", () => {
+    const markup = render(aGovernanceEventSequence());
 
-    expect(markup).toContain("before any hook runs");
-    expect(markup).toContain("leaves no record");
+    expect(markup).not.toContain("cg-footnote");
+    expect(markup).not.toContain("leaves no record");
   });
 
-  test("is present even when the panel is full of events", () => {
-    expect(render(aGovernanceEventSequence())).toContain("leaves no record");
+  test("the panel ends with the lanes", () => {
+    expect(render([]).trimEnd().endsWith("</div></div>")).toBe(true);
   });
 });
 
@@ -403,5 +425,156 @@ describe("the panel is a component, not a page", () => {
 
     expect(markup.startsWith('<div class="cg-panel">')).toBe(true);
     expect(markup).not.toContain("<body");
+  });
+});
+
+describe("each card is tinted by its decision", () => {
+  // The design review's central ask: from across a room the block of colour is
+  // what carries. `data-decision` is what globals.css hangs the tint, the left
+  // accent bar and the inset edge on, so every card must be tagged with it and
+  // the three tags must differ.
+  const one = (decision: "allow" | "deny" | "modify"): string =>
+    cards(render([aGovernanceEvent({ id: `evt_${decision}`, decision })]))[0] ?? "";
+
+  test("a denied card carries the deny tint", () => {
+    expect(one("deny")).toContain('class="cg-event" data-decision="deny"');
+  });
+
+  test("an allowed card carries the allow tint", () => {
+    expect(one("allow")).toContain('class="cg-event" data-decision="allow"');
+  });
+
+  test("a modified card carries the modify tint", () => {
+    expect(one("modify")).toContain('class="cg-event" data-decision="modify"');
+  });
+
+  test("the three tints are different from one another", () => {
+    const tags = (["allow", "deny", "modify"] as const).map(
+      (decision) => /data-decision="(\w+)"/.exec(one(decision))?.[1],
+    );
+
+    expect(new Set(tags).size).toBe(3);
+    expect(tags).toEqual(["allow", "deny", "modify"]);
+  });
+
+  test("the decision label inside the card matches the tint it carries", () => {
+    expect(one("deny")).toContain("Denied");
+    expect(one("allow")).toContain("Allowed");
+    expect(one("modify")).toContain("Modified");
+  });
+});
+
+describe("each lane header carries its own counts", () => {
+  /** The `<header>` of one lane, so a count cannot be matched from elsewhere. */
+  function laneHeader(markup: string, hook: "access" | "pre" | "post"): string {
+    const at = markup.indexOf(`id="cg-lane-${hook}"`);
+    const from = markup.lastIndexOf("<header", at);
+    return markup.slice(from, markup.indexOf("</header>", at));
+  }
+
+  const events = [
+    aGovernanceEvent({ id: "evt_a1", hook: "access", decision: "deny" }),
+    aGovernanceEvent({ id: "evt_p1", hook: "pre", decision: "deny" }),
+    aGovernanceEvent({ id: "evt_p2", hook: "pre", decision: "allow" }),
+    aGovernanceEvent({ id: "evt_o1", hook: "post", decision: "modify" }),
+    aGovernanceEvent({ id: "evt_o2", hook: "post", decision: "modify" }),
+    aGovernanceEvent({ id: "evt_o3", hook: "post", decision: "allow" }),
+  ];
+
+  test("pre shows one allowed and one denied", () => {
+    const header = laneHeader(render(events), "pre");
+
+    expect(header).toContain('data-decision="allow"><span class="cg-lane-count-value">1</span>');
+    expect(header).toContain('data-decision="deny"><span class="cg-lane-count-value">1</span>');
+  });
+
+  test("post shows one allowed and two modified", () => {
+    const header = laneHeader(render(events), "post");
+
+    expect(header).toContain('data-decision="allow"><span class="cg-lane-count-value">1</span>');
+    expect(header).toContain('data-decision="modify"><span class="cg-lane-count-value">2</span>');
+  });
+
+  test("access shows only its one denial, and no counts it did not make", () => {
+    const header = laneHeader(render(events), "access");
+
+    expect(header).toContain('data-decision="deny"><span class="cg-lane-count-value">1</span>');
+    expect(header).not.toContain('data-decision="allow"');
+    expect(header).not.toContain('data-decision="modify"');
+  });
+
+  test("a lane counts only its own hook, never another lane's", () => {
+    const header = laneHeader(render(events), "access");
+
+    // Six events in total, five of them in other lanes.
+    expect(header).not.toContain("cg-lane-count-value\">2<");
+    expect(header).not.toContain("cg-lane-count-value\">6<");
+  });
+
+  test("an empty lane draws no counters at all rather than three zeroes", () => {
+    const header = laneHeader(render([]), "pre");
+
+    expect(header).not.toContain("cg-lane-counts");
+    expect(header).not.toContain(">0<");
+  });
+
+  test("the global tally still totals every lane", () => {
+    const markup = render(events);
+
+    expect(markup).toContain('<span class="cg-stat-value">2</span><span class="cg-stat-label">Allowed</span>');
+    expect(markup).toContain('<span class="cg-stat-value">2</span><span class="cg-stat-label">Denied</span>');
+    expect(markup).toContain('<span class="cg-stat-value">2</span><span class="cg-stat-label">Modified</span>');
+  });
+
+  test("lane counts keep counting past what the lane can draw", () => {
+    const flood = Array.from({ length: 400 }, (_, index) =>
+      aGovernanceEvent({ id: `evt_${index}`, hook: "access", decision: "deny" }),
+    );
+
+    expect(laneHeader(render(flood), "access")).toContain(
+      '<span class="cg-lane-count-value">400</span>',
+    );
+  });
+});
+
+describe("the type hierarchy the card is read through", () => {
+  const event = aGovernanceEvent({
+    id: "evt_1",
+    decision: "deny",
+    tool: "Loan.ApproveLoan",
+    user_id: "dana@northwind.test",
+    rule_id: "rule.clearance",
+    reason: "Exceeds your approval authority of 50000.",
+  });
+
+  test("the tool call is its own element, ahead of the decision", () => {
+    const card = cards(render([event]))[0] ?? "";
+
+    expect(card.indexOf('class="cg-tool"')).toBeLessThan(card.indexOf('class="cg-decision"'));
+  });
+
+  test("the rule is a chip, not another line of the same kind as the tool", () => {
+    const card = cards(render([event]))[0] ?? "";
+
+    expect(card).toContain('<p class="cg-rule">rule.clearance</p>');
+    expect(card.indexOf('class="cg-decision"')).toBeLessThan(card.indexOf('class="cg-rule"'));
+  });
+
+  test("time leads the card and the user sits at the far end of the same line", () => {
+    const card = cards(render([event]))[0] ?? "";
+    const meta = card.slice(card.indexOf('class="cg-event-meta"'), card.indexOf('class="cg-tool"'));
+
+    expect(meta).toContain("cg-event-time");
+    expect(meta).toContain("cg-event-user");
+    expect(meta.indexOf("cg-event-time")).toBeLessThan(meta.indexOf("cg-event-user"));
+    expect(card.indexOf('class="cg-event-meta"')).toBeLessThan(card.indexOf('class="cg-tool"'));
+  });
+
+  test("the reason is prose, carrying no identifier styling", () => {
+    const card = cards(render([event]))[0] ?? "";
+
+    expect(card).toContain(
+      '<p class="cg-reason">Exceeds your approval authority of 50000.</p>',
+    );
   });
 });

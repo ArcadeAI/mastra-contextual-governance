@@ -61,19 +61,33 @@ argues against the thing this project argues for.
 
 ### What it will not show you
 
-Two limits, both deliberate, both stated on the panel itself or in the code:
+Two limits, both deliberate.
 
-- **A removed value is never rendered.** `before` is replaced by a mask built from the
-  value's type and nothing else. The panel is the one surface guaranteed to be on a
-  projector; act 3's whole point is that a bank account number did not reach the model,
-  and printing it here would be worse than having no diff. `after` *is* shown, because
-  that is what the model received. `maskedDiff()` has an `annotation` slot ready for
-  #8's `redactions[]` chips.
-- **A layer-2 refusal is invisible here.** Arcade evaluates a tool's auth requirements
-  *before* `/pre`, so a call refused there fires no hook and writes no audit row
-  (`DESIGN.md` open risk 2). The panel says so in a footnote, because otherwise an empty
-  lane is ambiguous between "nothing happened" and "refused upstream of everything shown
-  here".
+**A removed value is never rendered.** `before` is replaced by a mask built from the
+value's type and nothing else — not truncated, not partially shown, not hashed. The
+panel is the one surface guaranteed to be on a projector; act 3's whole point is that a
+bank account number did not reach the model, and printing it here would be worse than
+having no diff. `after` *is* shown, because that is what the model received.
+
+The mask says `text withheld` on a hatched field rather than drawing a row of dots. A
+design review found the dots read, at projector distance, as a value in a masked font
+rather than as the absence of one — and the phrasing leaks strictly less, since the dots
+were length-proportional and these are not. `maskedDiff()` has an `annotation` slot
+ready for `redactions[]` chips; #8 has landed the `RedactionRecord` type but
+`GovernanceEvent` does not carry an array of them yet, so nothing populates it.
+
+**A layer-2 refusal never reaches this panel, and an empty lane is not proof that
+nothing was tried.** Arcade evaluates a tool's auth requirements *before* `/pre`, so a
+persona without a token for a tool is refused upstream of every hook: no `/pre` event,
+no audit row, nothing on screen (measured, spike #2; `DESIGN.md` open risk 2). Every
+decision the access, pre and post hooks made is on the panel. That is not the same as
+every refusal the persona met, and no beat that needs to be *seen* should be staged as
+an auth failure.
+
+This caveat used to be a paragraph in the panel's bottom-left corner. Design review cut
+it, fairly: nobody at the back of a room reads a footnote, and the space it took
+belonged to the lanes. It is true, it matters, and it belongs in the runbook rather than
+on the projector.
 
 ### Correlation
 

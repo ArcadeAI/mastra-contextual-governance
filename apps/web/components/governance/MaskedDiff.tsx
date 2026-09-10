@@ -1,13 +1,17 @@
 /**
  * The before/after diff for a `modify`.
  *
- * A unified stack rather than two side-by-side columns: a lane is a third of
- * half a screen, and two columns at that width wrap every value into an
- * unreadable ribbon. Stacked, each changed leaf reads as three short lines,
- * which is also the form a developer already knows from a diff.
+ * Three parts per changed leaf — the field, what it was, what it became —
+ * stacked rather than set in two columns, because a lane is a third of half a
+ * screen and two columns at that width wrap every value into an unreadable
+ * ribbon.
  *
- * Every `before` here is a mask produced by `maskedDiff()`. This component
- * cannot print a removed value because it is never handed one.
+ * Every `before` here is a mask produced by `maskedDiff()`, and this component
+ * cannot print a removed value because it is never handed one. The mask is
+ * drawn on a hatched field with the word *withheld* in it: a design review
+ * found that the previous row of dots read, at projector distance, as a value
+ * in a masked font rather than as the absence of one. The visual language is
+ * something struck out of a document, which is what happened to it.
  */
 import { maskedDiff } from "../../lib/governance/diff.ts";
 
@@ -26,32 +30,33 @@ export function MaskedDiff({ before, after }: { before: unknown; after: unknown 
     <div className="cg-diff">
       {rows.map((row) => (
         <div className="cg-diff-row" key={row.path}>
-          <div className="cg-diff-path">{row.path === "" ? "(whole payload)" : row.path}</div>
-          {row.before !== null && (
-            <div className="cg-diff-before">
-              <span className="cg-diff-sign" aria-hidden="true">
-                −
-              </span>
-              <span>
-                <span className="cg-visually-hidden">Removed: </span>
-                {row.before}
-              </span>
-            </div>
-          )}
-          {row.after !== null && (
-            <div className="cg-diff-after">
-              <span className="cg-diff-sign" aria-hidden="true">
-                +
-              </span>
-              <span>
-                <span className="cg-visually-hidden">Kept: </span>
-                {row.after}
-              </span>
-            </div>
-          )}
-          {/* Populated when #8's `redactions[]` lands: the rule_id / pattern_id
-              that names why this leaf changed. Absent until then. */}
-          {row.annotation !== null && <div className="cg-diff-path">{row.annotation}</div>}
+          <p className="cg-diff-path">{row.path === "" ? "(whole payload)" : row.path}</p>
+
+          <div className="cg-diff-pair">
+            <span className="cg-diff-label">before</span>
+            <span className="cg-diff-value" data-side="before">
+              {row.before === null ? (
+                <span className="cg-diff-absent">not present</span>
+              ) : (
+                <span className="cg-mask">{row.before}</span>
+              )}
+            </span>
+
+            <span className="cg-diff-label">after</span>
+            <span className="cg-diff-value" data-side="after">
+              {row.after === null ? (
+                <span className="cg-diff-absent">removed entirely</span>
+              ) : (
+                row.after
+              )}
+            </span>
+          </div>
+
+          {/* Populated when `GovernanceEvent` carries a `redactions[]` array:
+              the rule_id / pattern_id that names why this leaf changed. #8 has
+              landed the RedactionRecord type but the event does not carry them
+              yet, so this is absent. */}
+          {row.annotation !== null && <p className="cg-diff-path">{row.annotation}</p>}
         </div>
       ))}
     </div>

@@ -1,15 +1,25 @@
 /**
  * One decision, as a card.
  *
- * Everything the audience needs is on the face of it. Nothing is behind a
- * hover: the panel is watched from across a room by people who cannot reach
- * the trackpad, and half of them are looking at a photograph of it.
+ * The card answers three questions in the order a presenter narrates them, and
+ * each answer is a different *kind* of type so the order survives being seen
+ * rather than read:
  *
- * Reading order is deliberate and matches how a presenter narrates: *what
- * happened* (the decision, largest and coloured), *to what* (the tool), *to
- * whom* (the user), *because of what* (the rule), *and why* (the reason). The
- * `rule_id` is on every card that has one, not only denials — "which rule
- * allowed this" is the question act 1 turns on.
+ * 1. **Which tool call** — largest, first, monospace, because it is an
+ *    identifier and identifiers are the only thing monospace is used for here.
+ * 2. **What happened** — the decision, in the display face and its own colour,
+ *    so it is visibly a different sort of thing from the identifier above it.
+ * 3. **Which rule** — a chip in the chrome colour, which is reserved and never
+ *    a decision, so it cannot read as a fourth outcome and cannot be confused
+ *    with the tool name.
+ *
+ * Above all three, a quiet line carrying the time at the leading edge and the
+ * user at the far end — two identifiers that need to be present and need not
+ * compete.
+ *
+ * Nothing is behind a hover. The panel is watched from across a room by people
+ * who cannot reach the trackpad, and half of them are looking at a photograph
+ * of it.
  */
 import type { GovernanceEvent } from "@cg/policy-schema";
 
@@ -41,24 +51,23 @@ export function EventCard({
       data-correlated={correlated ? "true" : "false"}
       data-event-id={event.id}
     >
-      <div className="cg-decision">
+      <p className="cg-event-meta">
+        <time className="cg-event-time" dateTime={event.ts}>
+          {timeOf(event.ts)}
+        </time>
+        <span className="cg-event-user">{event.user_id}</span>
+      </p>
+
+      <p className="cg-tool">{event.tool}</p>
+
+      <p className="cg-decision">
         <span className="cg-glyph" aria-hidden="true">
           {decision.glyph}
         </span>
         <span>{decision.label}</span>
-        <time className="cg-time" dateTime={event.ts}>
-          {timeOf(event.ts)}
-        </time>
-      </div>
+      </p>
 
-      <p className="cg-tool">{event.tool}</p>
-
-      {/* The rule gets a line of its own. "Which rule did this" is the question
-          the whole panel exists to answer, and it loses that job crammed into a
-          run of metadata. */}
       {event.rule_id !== null && <p className="cg-rule">{event.rule_id}</p>}
-
-      <p className="cg-meta">{event.user_id}</p>
 
       {event.reason !== "" && <p className="cg-reason">{event.reason}</p>}
 

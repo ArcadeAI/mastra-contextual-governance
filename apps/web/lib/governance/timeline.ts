@@ -36,6 +36,13 @@ export interface Timeline {
   readonly behind: Readonly<Record<HookPoint, number>>;
   /** Decisions over everything ever received, not just what is on screen. */
   readonly counts: Readonly<Record<Effect, number>>;
+  /**
+   * The same tally, per lane. A lane's header carries its own counts as well
+   * as the panel's global ones, because "the pre-hook denied one call" is a
+   * different and more useful fact than "something denied one call" — and the
+   * three lanes are the structure the panel is read through.
+   */
+  readonly laneCounts: Readonly<Record<HookPoint, Readonly<Record<Effect, number>>>>;
   /** Total events accepted, after de-duplication. */
   readonly received: number;
   /** The most recent event's id — what the lane flashes for. `null` when empty. */
@@ -53,6 +60,11 @@ export function emptyTimeline(): Timeline {
     lanes: { access: [], pre: [], post: [] },
     behind: { access: 0, pre: 0, post: 0 },
     counts: { allow: 0, deny: 0, modify: 0 },
+    laneCounts: {
+      access: { allow: 0, deny: 0, modify: 0 },
+      pre: { allow: 0, deny: 0, modify: 0 },
+      post: { allow: 0, deny: 0, modify: 0 },
+    },
     received: 0,
     latestId: null,
     arrival: new Map(),
@@ -82,6 +94,11 @@ export function appendEvents(
   };
   const behind = { ...timeline.behind };
   const counts = { ...timeline.counts };
+  const laneCounts: Record<HookPoint, Record<Effect, number>> = {
+    access: { ...timeline.laneCounts.access },
+    pre: { ...timeline.laneCounts.pre },
+    post: { ...timeline.laneCounts.post },
+  };
   const arrival = new Map(timeline.arrival);
 
   for (const event of fresh) {
@@ -90,6 +107,7 @@ export function appendEvents(
     lanes[event.hook].unshift(event);
     arrival.set(event.id, arrival.size);
     counts[event.decision] += 1;
+    laneCounts[event.hook][event.decision] += 1;
   }
 
   for (const hook of HOOK_POINTS) {
@@ -104,6 +122,7 @@ export function appendEvents(
     lanes,
     behind,
     counts,
+    laneCounts,
     received: timeline.received + fresh.length,
     latestId: fresh[fresh.length - 1]?.id ?? timeline.latestId,
     arrival,

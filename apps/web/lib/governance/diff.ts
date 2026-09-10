@@ -14,14 +14,15 @@
  * plane let through to the model. Hiding it would leave the diff saying
  * nothing, and a diff that shows neither side does not demonstrate a control.
  *
- * Why every `before` and not just the sensitive ones: on `main` today a
- * `GovernanceEvent` carries `before` and `after` as opaque payloads and nothing
- * says which leaf was masked for being a secret and which was rewritten for
- * carrying an injected instruction. With no way to tell them apart, the safe
- * reading of every removed value is "secret". When #8's `redactions[]` lands —
- * path, `rule_id`, `pattern_id`, kind, and never the removed value — it is
- * additive: see {@link DiffRow.annotation}, which exists for exactly that and
- * is unpopulated until then.
+ * Why every `before` and not just the sensitive ones: a `GovernanceEvent`
+ * carries `before` and `after` as opaque payloads and nothing on it says which
+ * leaf was masked for being a secret and which was rewritten for carrying an
+ * injected instruction. With no way to tell them apart, the safe reading of
+ * every removed value is "secret". #8 has landed `RedactionRecord` — path,
+ * `rule_id`, `pattern_id`, kind, and deliberately never the removed value — but
+ * `GovernanceEvent` does not carry a `redactions[]` array yet, so there is
+ * still nothing to read. When one arrives it is purely additive: see
+ * {@link DiffRow.annotation}, which exists for exactly that.
  */
 
 /** What happened to one leaf of the payload. */
@@ -40,32 +41,38 @@ export interface DiffRow {
   /** What the model actually received here. */
   readonly after: string | null;
   /**
-   * Extension point for #8's `redactions[]`: the `rule_id`/`pattern_id` chip
-   * that names *why* this leaf changed. Always `null` until #8 lands, and the
-   * renderer omits the chip when it is.
+   * Extension point for a `redactions[]` array on `GovernanceEvent`: the
+   * `rule_id`/`pattern_id` chip naming *why* this leaf changed. #8 has landed
+   * the `RedactionRecord` type but the event does not carry them yet, so this
+   * is always `null` and the renderer omits the chip.
    */
   readonly annotation: string | null;
 }
 
-/** Longest mask we will draw. Beyond this the length itself stops being a hint. */
-const MASK_CAP = 12;
-
 /**
- * A stand-in for a value, derived from its type and never its content.
+ * A stand-in for a value, derived from its **type** and never its content.
  *
- * Strings get a run of dots — enough to read as "text was here", capped so a
- * long note does not draw a long ribbon across the projector. Everything else
- * gets a word, because the shape of a boolean or a null is not a secret and
- * `●` would be less informative than `false`.
+ * It is a phrase, not a row of dots. The first cut of this panel drew `●●●●●●`
+ * and a design review caught the problem: at projector distance a run of dots
+ * reads as a value — an account number in a masked font — rather than as the
+ * absence of one. A mask has to be unmistakably a mask, so it says so in
+ * words, and the renderer puts a hatched field behind it.
+ *
+ * Saying only the type also leaks strictly less than the dots did. The dots
+ * were length-proportional up to a cap, so a short PIN and a long note looked
+ * different; these do not.
  */
 function mask(value: unknown): string {
+  // `null` is not a secret and there is nothing to withhold, so it is named.
   if (value === null) return "null";
-  if (typeof value === "string") return "●".repeat(Math.min(Math.max(value.length, 1), MASK_CAP));
-  if (typeof value === "number") return "●●●";
-  if (typeof value === "boolean") return "●●●";
-  if (Array.isArray(value)) return `${value.length} item${value.length === 1 ? "" : "s"}`;
-  if (typeof value === "object") return "{…}";
-  return "●●●";
+  if (typeof value === "string") return "text withheld";
+  if (typeof value === "number") return "number withheld";
+  if (typeof value === "boolean") return "value withheld";
+  if (Array.isArray(value)) {
+    return `${value.length} item${value.length === 1 ? "" : "s"} withheld`;
+  }
+  if (typeof value === "object") return "object withheld";
+  return "value withheld";
 }
 
 /** How a surviving value reads on screen. Only ever applied to `after`. */

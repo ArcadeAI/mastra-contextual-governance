@@ -1,21 +1,29 @@
 /**
- * One control point's column: its key, its plain-language gloss, and its events
- * newest-first so the freshest card is always in the same place on screen.
+ * One control point's column: its name, what it controls, its own tally, and
+ * its events newest-first so the freshest card is always in the same place.
+ *
+ * The lane header is the largest thing on the panel after the title. The three
+ * control points are the structure the audience should find first; a card is a
+ * detail inside one of them.
  *
  * The lane draws at most `visible` cards. Everything the timeline holds beyond
- * that, plus everything it has already let go, is *counted and stated* — an
- * audit surface that quietly discards records would be arguing against the
- * thing this whole project is arguing for.
+ * that, plus everything it has already let go, is *counted and stated* in the
+ * header — an audit surface that quietly discards records would argue against
+ * the thing this project argues for. It sits in the header rather than under
+ * the cards because under them it is the first thing a burst pushes out of a
+ * lane that clips its overflow, so the one line saying "there is more than
+ * this" would disappear exactly when it became true.
  */
-import type { GovernanceEvent, HookPoint } from "@cg/policy-schema";
+import type { Effect, GovernanceEvent, HookPoint } from "@cg/policy-schema";
 
 import { EventCard } from "./EventCard.tsx";
-import { LANES } from "./decisions.ts";
+import { DECISION_ORDER, DECISIONS, LANES } from "./decisions.ts";
 
 export function Lane({
   hook,
   events,
   behind,
+  counts,
   visible,
   flashKey,
   correlatedIds,
@@ -25,6 +33,8 @@ export function Lane({
   events: readonly GovernanceEvent[];
   /** Events this lane received and no longer holds. */
   behind: number;
+  /** This lane's own decisions, over everything it ever received. */
+  counts: Readonly<Record<Effect, number>>;
   /** How many cards to draw. The rest are counted, not dropped. */
   visible: number;
   /**
@@ -38,6 +48,9 @@ export function Lane({
   const lane = LANES[hook];
   const drawn = events.slice(0, visible);
   const notDrawn = events.length - drawn.length + behind;
+  // Only decisions this lane has actually made. A lane that has denied nothing
+  // should not carry a zero for it; the global tally is where totals live.
+  const present = DECISION_ORDER.filter((decision) => counts[decision] > 0);
 
   return (
     <section className="cg-lane" aria-labelledby={`cg-lane-${hook}`}>
@@ -55,12 +68,18 @@ export function Lane({
           {lane.name}
         </h3>
         <p className="cg-lane-gloss">{lane.gloss}</p>
-        {/*
-          In the header, not under the cards. Under them it is the first thing a
-          burst pushes out of a lane that clips its overflow — so the one line
-          saying "there is more than this" would disappear exactly when it
-          became true, which is the silent-drop failure this panel must not have.
-        */}
+
+        {present.length > 0 && (
+          <p className="cg-lane-counts">
+            {present.map((decision) => (
+              <span className="cg-lane-count" data-decision={decision} key={decision}>
+                <span className="cg-lane-count-value">{counts[decision]}</span>
+                <span>{DECISIONS[decision].lane}</span>
+              </span>
+            ))}
+          </p>
+        )}
+
         {notDrawn > 0 && (
           <p className="cg-lane-behind">
             {notDrawn.toLocaleString("en-US")} earlier {notDrawn === 1 ? "decision" : "decisions"}

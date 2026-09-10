@@ -35,7 +35,7 @@ describe("what changed", () => {
     const rows = maskedDiff({ note: "internal", id: "LN-2291" }, { id: "LN-2291" });
 
     expect(rows).toEqual([
-      { path: "note", change: "removed", before: "●●●●●●●●", after: null, annotation: null },
+      { path: "note", change: "removed", before: "text withheld", after: null, annotation: null },
     ]);
   });
 
@@ -101,26 +101,51 @@ describe("the before value is never printed", () => {
       expect(JSON.stringify(rows)).not.toContain(secret);
     });
 
-    test(`${what} is replaced by a mask, not omitted from the diff`, () => {
+    test(`${what} is replaced by a mask that reads as a mask`, () => {
       const row = maskedDiff(before, after)[0];
 
       expect(row?.before).not.toBeNull();
-      expect(row?.before).toMatch(/^(●+|null|\{…\}|\d+ items?)$/);
+      // A phrase, not a row of dots. A design review found dots read as a
+      // value in a masked font from across a room rather than as its absence.
+      expect(row?.before).toMatch(/withheld$/);
     });
   }
 
   test("even a single character is masked rather than shown", () => {
-    expect(maskedDiff({ pin: "7" }, { pin: "[REDACTED]" })[0]?.before).toBe("●");
+    expect(maskedDiff({ pin: "7" }, { pin: "[REDACTED]" })[0]?.before).toBe("text withheld");
   });
 
-  test("a long secret does not draw a mask longer than the cap", () => {
-    const row = maskedDiff({ blob: "x".repeat(4000) }, { blob: "[REDACTED]" })[0];
+  test("the mask does not leak the length of what it covers", () => {
+    // The dots this replaced were length-proportional up to a cap, so a
+    // four-digit PIN and a paragraph looked different. These do not.
+    const short = maskedDiff({ v: "7" }, { v: "[REDACTED]" })[0]?.before;
+    const long = maskedDiff({ v: "x".repeat(4000) }, { v: "[REDACTED]" })[0]?.before;
 
-    expect(row?.before).toBe("●".repeat(12));
+    expect(short).toBe(long);
   });
 
   test("a masked number reveals neither its digits nor its magnitude", () => {
-    expect(maskedDiff({ balance: 4738299104857 }, { balance: 0 })[0]?.before).toBe("●●●");
+    const big = maskedDiff({ balance: 4738299104857 }, { balance: 0 })[0]?.before;
+    const small = maskedDiff({ balance: 2 }, { balance: 0 })[0]?.before;
+
+    expect(big).toBe("number withheld");
+    expect(big).toBe(small);
+  });
+
+  test("the mask names the type, so a reader knows what kind of thing is gone", () => {
+    // Two arrays are walked element by element; an array replaced wholesale is
+    // what gets masked as an array.
+    expect(maskedDiff({ v: ["a", "b"] }, { v: "[REDACTED]" })[0]?.before).toBe("2 items withheld");
+    expect(maskedDiff({ v: { a: 1 } }, { v: null })[0]?.before).toBe("object withheld");
+    expect(maskedDiff({ v: true }, { v: false })[0]?.before).toBe("value withheld");
+  });
+
+  test("two arrays are compared leaf by leaf, so only what changed is masked", () => {
+    const rows = maskedDiff({ v: ["keep", "secret"] }, { v: ["keep", "[REDACTED]"] });
+
+    expect(rows).toEqual([
+      { path: "v[1]", change: "changed", before: "text withheld", after: "[REDACTED]", annotation: null },
+    ]);
   });
 });
 
@@ -172,17 +197,23 @@ describe("payloads the panel might be handed", () => {
     const rows = maskedDiff("secret text", "[REDACTED]");
 
     expect(rows).toEqual([
-      { path: "", change: "changed", before: "●●●●●●●●●●●", after: "[REDACTED]", annotation: null },
+      {
+        path: "",
+        change: "changed",
+        before: "text withheld",
+        after: "[REDACTED]",
+        annotation: null,
+      },
     ]);
   });
 
   test("an object replaced by a scalar is masked, not walked", () => {
     const rows = maskedDiff({ a: 1 }, "[REDACTED]");
 
-    expect(rows[0]?.before).toBe("{…}");
+    expect(rows[0]?.before).toBe("object withheld");
   });
 
-  test("annotation is null everywhere until #8's redactions[] lands", () => {
+  test("annotation is null everywhere until GovernanceEvent carries redactions[]", () => {
     const rows = maskedDiff({ a: "x", b: "y" }, { a: "1", b: "2" });
 
     expect(rows.every((row) => row.annotation === null)).toBe(true);

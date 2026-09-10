@@ -28,16 +28,32 @@
   --deny: #ff0037;
   --modify: #ffb700;
 
-  /* GT Cinetype is Arcade's UI face and GT Cinetype Mono its developer face.
-     Both are licensed, so the files are deliberately not committed to a
-     template anyone can fork — the stack names them first, because they are
-     installed on the machine that presents this, and falls back to the brand
-     kit's own documented websafe fallback everywhere else. GT Sectra is
-     display-only, is not installed system-wide, and a serif fallback in a
-     control plane would read as a mistake rather than a choice, so it is
-     not used here. */
+  /* Arcade's three faces, in the three roles the brand kit assigns them.
+     All are licensed, so the files are deliberately not committed to a
+     template anyone can fork — each stack names the real face first, because
+     they are installed on the machine that presents this, and falls back to
+     the brand kit's own documented websafe fallback everywhere else.
+
+       display  GT Sectra        lane titles, decision labels, the tally
+       ui       GT Cinetype      reasons, glosses, prose
+       mono     GT Cinetype Mono identifiers only — tool, rule, user, time
+
+     Three roles, three faces, and nothing borrows another's job. That is what
+     makes a card's hierarchy readable before any of it has been read: the
+     shape of the type says which kind of thing each line is. */
+  --font-display: "GT Sectra", Cambria, Georgia, "Times New Roman", serif;
   --font-ui: "GT Cinetype", Helvetica, "Helvetica Neue", Arial, sans-serif;
   --font-mono: "GT Cinetype Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  /* Each decision tints its whole card, not just its edge. Alpha over pure
+     black, so the tint deepens the hue rather than greying it, and white body
+     text keeps well over 15:1 on every one of them. */
+  --allow-tint: rgba(0, 255, 103, 0.14);
+  --deny-tint: rgba(255, 0, 55, 0.16);
+  --modify-tint: rgba(255, 183, 0, 0.15);
+  --allow-edge: rgba(0, 255, 103, 0.42);
+  --deny-edge: rgba(255, 0, 55, 0.45);
+  --modify-edge: rgba(255, 183, 0, 0.44);
 
   /* Legacy aliases from the #4 scaffold, kept so the placeholder page and the
      health route styling do not break. */
@@ -59,17 +75,23 @@ body {
   line-height: 1.5;
 }
 
+
 /* ---------------------------------------------------------------------------
  * The control-plane panel (#21)
  *
  * Sized in `em` off `.cg-panel`'s own font-size, which is a `clamp()` on the
  * viewport. The panel is half a screen in the split-screen shell (#22) and a
- * whole one on its own page, and both have to be readable from across a room;
- * scaling the root rather than every rule is what lets it do both.
+ * whole one on its own page, and both are read from across a room; scaling one
+ * root rather than every rule is what lets it do both.
+ *
+ * The structure the eye should find, in order: three lanes, then within a lane
+ * a card, then within a card which tool call, what happened, and which rule.
+ * Type size, weight and face all agree about that order, so it survives being
+ * seen rather than read.
  * ------------------------------------------------------------------------- */
 
 .cg-panel {
-  font-size: clamp(15px, 1.15vw, 22px);
+  font-size: clamp(17px, 1.32vw, 26px);
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -78,7 +100,6 @@ body {
   color: var(--white);
 }
 
-/* The panel fills whatever it is given: this page, or #22's right half. */
 .cg-page {
   height: 100dvh;
   display: flex;
@@ -90,8 +111,7 @@ body {
   min-height: 0;
 }
 
-/* Announced to a screen reader, invisible on the projector. The diff's signs
-   are glyphs; without this a reader hears two bare values and no direction. */
+/* Announced to a screen reader, invisible on the projector. */
 .cg-visually-hidden {
   position: absolute;
   width: 1px;
@@ -112,15 +132,17 @@ body {
   justify-content: space-between;
   gap: 1em;
   flex-wrap: wrap;
-  padding: 1em 1.2em 0.7em;
+  padding: 0.85em 1.1em 0.7em;
   border-bottom: 3px solid var(--chartreuse);
 }
 
 .cg-title {
   margin: 0;
-  font-size: 1.5em;
-  font-weight: 700;
+  font-family: var(--font-display);
+  font-size: 1.75em;
+  font-weight: 400;
   letter-spacing: -0.01em;
+  line-height: 1;
 }
 
 .cg-connection {
@@ -164,12 +186,12 @@ body {
   padding: 0.15em 0.5em;
 }
 
-/* --- the tally ------------------------------------------------------------ */
+/* --- the global tally ----------------------------------------------------- */
 
 .cg-tally {
   display: flex;
-  gap: 2em;
-  padding: 0.8em 1.2em;
+  gap: 2.2em;
+  padding: 0.7em 1.1em 0.8em;
   border-bottom: 1px solid var(--line);
 }
 
@@ -177,17 +199,19 @@ body {
   display: flex;
   align-items: baseline;
   gap: 0.4em;
+  margin: 0;
 }
 
 .cg-stat-value {
-  font-size: 1.9em;
-  font-weight: 700;
+  font-family: var(--font-display);
+  font-size: 2.3em;
+  font-weight: 400;
   font-variant-numeric: tabular-nums;
   line-height: 1;
 }
 
 .cg-stat-label {
-  font-size: 0.85em;
+  font-size: 0.92em;
   color: var(--neutral);
 }
 
@@ -224,63 +248,100 @@ body {
 }
 
 .cg-lane-head {
-  padding: 0.9em 1em 0.7em;
+  padding: 0.85em 0.9em 0.75em;
+  border-bottom: 1px solid var(--line);
 }
 
+/* The largest and heaviest thing on the panel after the title. The three
+   control points are the structure; a card is a detail inside one of them. */
 .cg-lane-name {
   margin: 0;
-  font-size: 1.05em;
-  font-weight: 700;
+  font-family: var(--font-display);
+  font-size: 1.95em;
+  font-weight: 400;
+  line-height: 1;
   color: var(--chartreuse);
 }
 
-/* The plain-language gloss under each lane key. The audience should not have
-   to already know what a pre-execution hook is to follow the demo. */
 .cg-lane-gloss {
-  margin: 0.15em 0 0;
-  font-size: 0.82em;
+  margin: 0.3em 0 0;
+  font-size: 0.9em;
   color: var(--neutral);
+}
+
+/* Per-lane counts, in the decision colours, beside the lane they belong to.
+   Only non-zero ones are drawn: a lane that has denied nothing should not
+   carry a zero for it. */
+.cg-lane-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.9em;
+  margin: 0.5em 0 0;
+  font-size: 0.85em;
+  color: var(--neutral);
+}
+
+.cg-lane-count {
+  display: flex;
+  align-items: baseline;
+  gap: 0.3em;
+}
+
+.cg-lane-count-value {
+  font-family: var(--font-display);
+  font-size: 1.35em;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.cg-lane-count[data-decision="allow"] .cg-lane-count-value {
+  color: var(--allow);
+}
+.cg-lane-count[data-decision="deny"] .cg-lane-count-value {
+  color: var(--deny);
+}
+.cg-lane-count[data-decision="modify"] .cg-lane-count-value {
+  color: var(--modify);
 }
 
 .cg-lane-events {
   flex: 1;
   min-height: 0;
   overflow: hidden;
-  padding: 0 1em 1em;
+  padding: 0.7em 0.9em 1em;
   display: flex;
   flex-direction: column;
-  gap: 0.6em;
+  gap: 0.55em;
   /* A card clipped by the bottom of the lane should read as "there is more",
      not as a rendering fault. The lane's header already says how many more. */
   mask-image: linear-gradient(to bottom, #000 calc(100% - 3em), transparent 100%);
 }
 
 .cg-lane-empty {
-  font-size: 0.85em;
+  font-size: 0.9em;
   color: var(--neutral);
-  padding-top: 0.4em;
 }
 
 .cg-lane-behind {
-  margin: 0.3em 0 0;
-  font-size: 0.8em;
+  margin: 0.45em 0 0;
   font-family: var(--font-mono);
+  font-size: 0.78em;
   color: var(--neutral);
 }
 
 /*
- * The one piece of motion in the panel, and the reason it is here: when an
- * event lands, its lane's edge flashes in the decision's colour. Which control
- * point fired is legible before a single word has been read, which is what
- * makes causality something the room feels rather than reconstructs.
+ * The one piece of motion in the panel: when an event lands, its lane's edge
+ * flashes in the decision's colour. Which control point fired is legible
+ * before a single word has been read, which is what makes causality something
+ * the room feels rather than reconstructs.
  *
- * It is a separate element keyed on the newest event id, so React remounting it
+ * A separate element keyed on the newest event id, so React remounting it
  * restarts the animation — no timers, and no way for it to get stuck lit.
  */
 .cg-flash {
   position: absolute;
   inset: 0 auto 0 0;
-  width: 0.35em;
+  width: 0.3em;
   pointer-events: none;
   animation: cg-flash 900ms ease-out forwards;
 }
@@ -304,37 +365,86 @@ body {
   }
 }
 
-/* --- an event ------------------------------------------------------------- */
+/* --- a card --------------------------------------------------------------- */
 
+/*
+ * The decision tints the whole card, not just its edge. From across a room the
+ * block of colour is what carries; the left bar is the accent that sharpens it
+ * and the word inside it is what removes any doubt.
+ */
 .cg-event {
-  border-left: 0.35em solid var(--line-strong);
-  padding: 0.5em 0 0.5em 0.7em;
+  border-left: 0.4em solid var(--line-strong);
+  background: rgba(255, 255, 255, 0.04);
+  padding: 0.55em 0.75em 0.65em;
   flex: none;
 }
 
 .cg-event[data-decision="allow"] {
   border-left-color: var(--allow);
+  background: var(--allow-tint);
+  box-shadow: inset 0 0 0 1px var(--allow-edge);
 }
 .cg-event[data-decision="deny"] {
   border-left-color: var(--deny);
+  background: var(--deny-tint);
+  box-shadow: inset 0 0 0 1px var(--deny-edge);
 }
 .cg-event[data-decision="modify"] {
   border-left-color: var(--modify);
+  background: var(--modify-tint);
+  box-shadow: inset 0 0 0 1px var(--modify-edge);
 }
 
-/* A correlated event is the one the chat is talking about. Outlined rather
-   than tinted, so the decision colour keeps its meaning. */
+/* The event the chat is talking about. Outlined in the chrome colour, so the
+   decision tint underneath keeps its meaning. */
 .cg-event[data-correlated="true"] {
   outline: 2px solid var(--chartreuse);
-  outline-offset: 0.3em;
+  outline-offset: 0.25em;
 }
 
+/* Time leads the card; the user takes the space at the far end of the same
+   line. Both are identifiers, both are quiet, and neither competes with the
+   tool call underneath. */
+.cg-event-meta {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75em;
+  margin: 0 0 0.2em;
+  font-family: var(--font-mono);
+  font-size: 0.76em;
+  color: var(--neutral);
+}
+
+.cg-event-user {
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+/* Question one: which tool call. Largest thing on the card, and first. */
+.cg-tool {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 1.24em;
+  font-weight: 700;
+  line-height: 1.15;
+  word-break: break-word;
+}
+
+/* Question two: what happened. Display face, so it is a different kind of
+   thing from the identifier above it at a glance. */
 .cg-decision {
   display: flex;
   align-items: baseline;
-  gap: 0.4em;
-  font-size: 1.15em;
-  font-weight: 700;
+  gap: 0.35em;
+  margin: 0.22em 0 0;
+  font-family: var(--font-display);
+  font-size: 1.32em;
+  font-weight: 400;
+  line-height: 1;
 }
 
 .cg-event[data-decision="allow"] .cg-decision {
@@ -349,115 +459,118 @@ body {
 
 /* Every decision carries a glyph and a word as well as a colour, so the state
    is never encoded in hue alone — for colour-blind viewers, for a washed-out
-   projector, and for a phone camera at the back of the room. */
+   projector, and for a phone photo from the back of the room. */
 .cg-glyph {
-  font-size: 1.1em;
+  font-family: var(--font-ui);
+  font-size: 0.85em;
   line-height: 1;
 }
 
-.cg-tool {
-  font-family: var(--font-mono);
-  font-size: 1em;
-  margin: 0.25em 0 0;
-  word-break: break-word;
-}
-
-/* Pushed to the right of the decision row: a presenter points at the decision,
-   and the clock is only ever a cross-reference. */
-.cg-time {
-  margin-left: auto;
-  font-family: var(--font-mono);
-  font-size: 0.72em;
-  font-weight: 400;
-  color: var(--neutral);
-}
-
-/* White, on its own line, in mono. The rule that fired is the answer the panel
-   exists to give; it does not share a line with anything. */
+/*
+ * Question three: which rule. A chip in the chrome colour, which is reserved
+ * and never a decision — so it cannot be misread as a fourth outcome, and it
+ * is unmistakably not the tool name two lines above it.
+ */
 .cg-rule {
-  margin: 0.25em 0 0;
+  display: inline-block;
+  margin: 0.4em 0 0;
+  padding: 0.12em 0.5em;
   font-family: var(--font-mono);
-  font-size: 0.9em;
-  color: var(--white);
-  word-break: break-word;
-}
-
-.cg-meta {
-  margin: 0.15em 0 0;
   font-size: 0.82em;
-  color: var(--neutral);
-  font-family: var(--font-mono);
+  color: var(--chartreuse);
+  /* Punched out on near-black rather than tinted, so the chip reads the same
+     on all three card colours. A chartreuse-on-chartreuse-tint chip would sit
+     too close in hue to the green of an allow. */
+  background: rgba(0, 0, 0, 0.62);
+  box-shadow: inset 0 0 0 1px rgba(195, 255, 0, 0.62);
   word-break: break-word;
 }
 
 .cg-reason {
-  margin: 0.35em 0 0;
-  font-size: 0.9em;
+  margin: 0.4em 0 0;
+  font-size: 0.94em;
+  line-height: 1.4;
   color: var(--white);
+  max-width: 46ch;
 }
 
 /* --- the diff ------------------------------------------------------------- */
 
 .cg-diff {
-  margin: 0.5em 0 0;
-  border-top: 1px solid var(--line);
-  padding-top: 0.4em;
-  font-family: var(--font-mono);
-  font-size: 0.85em;
+  margin: 0.55em 0 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.18);
+  padding-top: 0.5em;
 }
 
 .cg-diff-row + .cg-diff-row {
-  margin-top: 0.45em;
+  margin-top: 0.5em;
 }
 
+/* The field, then what it was, then what it became. */
 .cg-diff-path {
-  color: var(--neutral);
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+  font-weight: 700;
   word-break: break-all;
 }
 
-.cg-diff-before,
-.cg-diff-after {
-  display: flex;
-  gap: 0.45em;
+.cg-diff-pair {
+  display: grid;
+  grid-template-columns: 3.6em minmax(0, 1fr);
+  gap: 0.15em 0.5em;
+  margin-top: 0.2em;
+  align-items: baseline;
+}
+
+.cg-diff-label {
+  font-size: 0.76em;
+  color: var(--neutral);
+}
+
+.cg-diff-value {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
   word-break: break-word;
+  min-width: 0;
 }
 
-.cg-diff-before {
-  color: var(--deny);
-}
-
-.cg-diff-after {
+.cg-diff-value[data-side="after"] {
   color: var(--allow);
 }
 
-.cg-diff-sign {
-  flex: none;
-  font-weight: 700;
+/*
+ * A mask has to be unmistakably a mask. The first cut drew a row of dots and a
+ * design review caught it: at projector distance that reads as a value in a
+ * masked font rather than as the absence of one. So the mask says what it is,
+ * in words, on a hatched field — the visual language of something struck out
+ * of a document, which is exactly what happened to it.
+ */
+.cg-mask {
+  display: inline-block;
+  padding: 0.1em 0.5em;
+  color: var(--deny);
+  font-family: var(--font-mono);
+  font-size: 0.95em;
+  background-color: rgba(255, 0, 55, 0.14);
+  background-image: repeating-linear-gradient(
+    135deg,
+    rgba(255, 0, 55, 0.34) 0,
+    rgba(255, 0, 55, 0.34) 2px,
+    transparent 2px,
+    transparent 7px
+  );
+  box-shadow: inset 0 0 0 1px rgba(255, 0, 55, 0.55);
+}
+
+.cg-diff-absent {
+  color: var(--neutral);
+  font-style: italic;
 }
 
 .cg-diff-empty {
-  color: var(--neutral);
-}
-
-/* --- the footnote --------------------------------------------------------- */
-
-/*
- * `DESIGN.md` open risk 2. Arcade evaluates a tool's auth requirements before
- * `/pre`, so a call refused there fires no hook and reaches nothing on this
- * screen. Without this line an empty lane is ambiguous between "nothing
- * happened" and "refused upstream of everything shown here", and the demo
- * would be claiming completeness it does not have.
- */
-.cg-footnote {
-  padding: 0.8em 1.2em 1em;
-  border-top: 1px solid var(--line);
-  font-size: 0.8em;
-  color: var(--neutral);
   margin: 0;
-  /* Capped rather than run across the full width: a line of eighty characters
-     is the limit of what anybody reads in one pass, and this is the one piece
-     of prose on the panel. */
-  max-width: 72ch;
+  font-size: 0.88em;
+  color: var(--neutral);
 }
 
 @media (prefers-reduced-motion: reduce) {
