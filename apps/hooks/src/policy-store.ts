@@ -224,7 +224,9 @@ const SCHEMA = `
   CREATE TABLE approval_requests (
     id                     TEXT PRIMARY KEY,
     requester_id           TEXT NOT NULL,
+    requester_display_name TEXT NOT NULL,
     approver_id            TEXT NOT NULL,
+    approver_display_name  TEXT NOT NULL,
     candidate_approver_ids TEXT NOT NULL DEFAULT '[]',
     action                 TEXT NOT NULL,
     resource_id            TEXT NOT NULL,
