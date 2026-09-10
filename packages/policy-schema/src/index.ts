@@ -20,6 +20,7 @@
 import type { z } from "zod";
 
 import type {
+  ApprovalRecord as ApprovalRecordSchema,
   ApprovalRequest as ApprovalRequestSchema,
   Grant as GrantSchema,
   OutputRule as OutputRuleSchema,
@@ -28,6 +29,7 @@ import type {
 } from "./domain.ts";
 
 export {
+  ApprovalRecord,
   ApprovalRequest,
   ApprovalStatus,
   Condition,
@@ -99,3 +101,4 @@ export type PolicyRuleInput = z.input<typeof PolicyRuleSchema>;
 export type OutputRuleInput = z.input<typeof OutputRuleSchema>;
 export type GrantInput = z.input<typeof GrantSchema>;
 export type ApprovalRequestInput = z.input<typeof ApprovalRequestSchema>;
+export type ApprovalRecordInput = z.input<typeof ApprovalRecordSchema>;

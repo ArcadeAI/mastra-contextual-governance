@@ -37,6 +37,9 @@ import {
   type PreHookResult,
 } from "@cg/policy-schema";
 
+import { createApprovalControl } from "./approval-governance.ts";
+import { APPROVALS_PREFIX, handleApprovals } from "./approvals-api.ts";
+import { pendingCount } from "./approvals-store.ts";
 import { count as auditCount, newEventId, record } from "./audit-log.ts";
 import type { HooksConfig } from "./config.ts";
 import { withCorrelation } from "./correlation.ts";
@@ -71,15 +74,32 @@ class Timeout extends Error {
 export function createServer(deps: ServerDeps) {
   const { config, db, cache } = deps;
   const log = deps.log ?? ((line: string) => console.log(`[${SERVICE}] ${line}`));
-  const ctx: HandlerContext = { now: () => new Date().toISOString(), newId: newEventId };
+  const ctx: HandlerContext = {
+    now: () => new Date().toISOString(),
+    newId: newEventId,
+    approvals: createApprovalControl(db, {
+      toolkit: config.approvalsToolkit,
+      grantTtlSeconds: config.grantTtlSeconds,
+    }),
+  };
 
-  const authorized = (request: Request): boolean => {
+  /**
+   * Constant-time bearer check against one expected secret.
+   *
+   * Two secrets reach this service and they are deliberately different: Arcade
+   * signs the hooks with one, the deployed approvals toolkit and the approval
+   * page present the other on `/approvals`. Neither can be used in the other's
+   * place, so a leaked store token cannot forge a hook decision.
+   */
+  const bearerIs = (request: Request, expected: string): boolean => {
     const header = request.headers.get("authorization") ?? "";
     const token = header.startsWith("Bearer ") ? header.slice("Bearer ".length).trim() : "";
     // Hash both sides so lengths match, then compare in constant time.
     const digest = (s: string) => createHash("sha256").update(s).digest();
-    return token.length > 0 && timingSafeEqual(digest(token), digest(config.signingSecret));
+    return token.length > 0 && timingSafeEqual(digest(token), digest(expected));
   };
+
+  const authorized = (request: Request): boolean => bearerIs(request, config.signingSecret);
 
   const json = (body: unknown, status = 200): Response => Response.json(body, { status });
 
@@ -234,6 +254,7 @@ export function createServer(deps: ServerDeps) {
       hook_contract: HOOK_CONTRACT_VERSION,
       policy,
       counts: counts(db),
+      pending_approvals: pendingCount(db),
       audit_rows: auditCount(db),
       failure_mode: "fail-closed",
     };
@@ -248,6 +269,22 @@ export function createServer(deps: ServerDeps) {
 
       if (pathname === HOOK_ENDPOINT_PATHS.healthCheck) {
         return request.method === "GET" ? health() : json({ error: "Method not allowed" }, 405);
+      }
+
+      if (pathname === APPROVALS_PREFIX || pathname.startsWith(`${APPROVALS_PREFIX}/`)) {
+        // The store's own bearer, not Arcade's. Refused before the path is
+        // even matched, so an unauthorized caller cannot learn which ids exist
+        // from the difference between a 404 and a 401.
+        if (!bearerIs(request, config.approvalsStoreToken)) {
+          return json({ error: "Unauthorized" }, 401);
+        }
+        const answered = await handleApprovals(request, pathname, {
+          db,
+          cache,
+          now: ctx.now,
+        });
+        if (answered !== null) return answered;
+        return json({ error: "Not found" }, 404);
       }
 
       const hook = HOOK_BY_PATH[pathname as HookPath];

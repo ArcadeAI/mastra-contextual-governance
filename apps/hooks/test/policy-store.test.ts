@@ -69,7 +69,13 @@ describe("the seed", () => {
   test("keys every rule and the catalogue on the configured toolkit names, not on literals", () => {
     const data = loadSeed({ ...OPTIONS, loanToolkit: "LoanBook", approvalsToolkit: "Escalations" });
     expect(Object.keys(data.catalogue).sort()).toEqual(["Escalations", "LoanBook"]);
-    expect(data.policy_rules.every((r) => r.match.toolkit === "LoanBook")).toBe(true);
+    // Every rule is keyed on one of the two configured names and on no
+    // literal: a rule left pointing at "$LOAN", or at the default "Loan" when
+    // the deployment calls it something else, would match nothing.
+    expect([...new Set(data.policy_rules.map((r) => r.match.toolkit))].sort()).toEqual([
+      "Escalations",
+      "LoanBook",
+    ]);
     expect(data.output_rules.every((r) => r.match.toolkit === "LoanBook")).toBe(true);
     const escalation = data.policy_rules.find((r) => r.hook === "pre");
     expect(escalation?.reason).toContain("Escalations.RequestApproval");
@@ -88,7 +94,15 @@ describe("the seed", () => {
 describe("seeding", () => {
   test("bootstraps the fixture into an empty database", () => {
     const db = fresh();
-    expect(counts(db)).toMatchObject({ subjects: 4, catalogue: 6, policy_rules: 2, output_rules: 1, audit_log: 0 });
+    expect(counts(db)).toMatchObject({
+      subjects: 4,
+      catalogue: 6,
+      policy_rules: 6,
+      output_rules: 1,
+      grants: 0,
+      approval_requests: 0,
+      audit_log: 0,
+    });
     expect(readOutputRules(db)).toHaveLength(1);
   });
 
