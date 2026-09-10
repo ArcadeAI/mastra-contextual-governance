@@ -27,6 +27,7 @@ import { createServer } from "../src/server.ts";
 
 const SECRET = "test-secret";
 const DANA = "dana.okafor@bank.example";
+const SAM = "sam.reyes@bank.example";
 
 const config: HooksConfig = {
   port: 0,
@@ -335,6 +336,68 @@ describe("the frame layout #21's adapter reads", () => {
 });
 
 describe("the seam is the audit write", () => {
+  test("every access, pre and post invocation publishes, one frame per audit row", async () => {
+    const reader = await open(base);
+    await reader.settle();
+
+    // /access decides for four tools in one call, so it is four rows and four
+    // frames — the count is the point, not just the presence of an event.
+    const access = await fetch(`${base}/access`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${SECRET}` },
+      body: JSON.stringify({
+        user_id: SAM,
+        toolkits: { Loan: { tools: { SearchLoans: V, GetLoan: V, ApproveLoan: V, DenyLoan: V } } },
+      }),
+    });
+    expect(access.status).toBe(200);
+
+    await denyDana("tc_every_pre");
+
+    const post = await fetch(`${base}/post`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${SECRET}` },
+      body: JSON.stringify({
+        execution_id: "tc_every_post",
+        tool: { name: "GetLoan", toolkit: "Loan", version: "1.0.0" },
+        inputs: { loan_id: "LN-2291" },
+        output: { value: { loan_id: "LN-2291" } },
+        context: { authorization: [{}], user_id: DANA },
+      }),
+    });
+    expect(post.status).toBe(200);
+
+    await reader.untilFrames(6);
+    await reader.settle();
+    reader.abort();
+
+    expect(idsIn(reader)).toEqual(seqOrder());
+    const hooks = reader.frames.map((frame) => dataOf(frame).hook);
+    expect(hooks).toEqual(["access", "access", "access", "access", "pre", "post"]);
+  });
+
+  test("a fail-closed denial publishes too — the panel sees the refusal, not silence", async () => {
+    const reader = await open(base);
+    await reader.settle();
+
+    // An unparseable body: the service fails closed, audits the denial, and
+    // the stream carries it. A control plane that went quiet exactly when it
+    // broke would be the worst thing this panel could do.
+    const response = await fetch(`${base}/pre`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${SECRET}` },
+      body: "{ not json",
+    });
+    expect(response.status).toBe(200);
+
+    await reader.untilFrames(1);
+    reader.abort();
+    const event = dataOf(reader.frames[0]!);
+    expect(event.decision).toBe("deny");
+    expect(event.reason).toStartWith("FAIL-CLOSED:");
+    expect(event.id).toBe(seqOrder()[0]!);
+  });
+
   test("every streamed event exists in the log, in the log's order", async () => {
     const reader = await open(base);
     await reader.settle();
