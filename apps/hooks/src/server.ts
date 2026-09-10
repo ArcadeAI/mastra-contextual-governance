@@ -24,6 +24,7 @@
 import type { Database } from "bun:sqlite";
 import { createHash, timingSafeEqual } from "node:crypto";
 
+import type { EventBus, PublishedEvent } from "@cg/governance-core";
 import {
   AccessHookRequest,
   HOOK_CONTRACT_VERSION,
@@ -43,6 +44,7 @@ import { pendingCount } from "./approvals-store.ts";
 import { count as auditCount, newEventId, record } from "./audit-log.ts";
 import type { HooksConfig } from "./config.ts";
 import { withCorrelation } from "./correlation.ts";
+import { EVENTS_PATH, handleEvents, preflight } from "./events.ts";
 import { handleAccess, handlePost, handlePre, type HandlerContext, type Outcome } from "./handlers.ts";
 import type { PolicyCache } from "./policy-cache.ts";
 import { counts } from "./policy-store.ts";
@@ -53,7 +55,17 @@ export interface ServerDeps {
   config: HooksConfig;
   db: Database;
   cache: PolicyCache;
+  /**
+   * The fan-out for `GET /events`. Optional: a server constructed without one
+   * governs exactly as before and simply has nobody watching, which is what
+   * every test that predates #20 wants.
+   */
+  bus?: EventBus;
   log?: (line: string) => void;
+  /** Overridden in tests so an idle stream's keep-alive is observable. */
+  streamKeepAliveMs?: number;
+  /** Overridden in tests to reach the stream's backlog and replay cap cheaply. */
+  streamBacklogLimit?: number;
 }
 
 type HookPath = (typeof HOOK_ENDPOINT_PATHS)[keyof typeof HOOK_ENDPOINT_PATHS];
@@ -72,8 +84,15 @@ class Timeout extends Error {
 }
 
 export function createServer(deps: ServerDeps) {
-  const { config, db, cache } = deps;
+  const { config, db, cache, bus } = deps;
   const log = deps.log ?? ((line: string) => console.log(`[${SERVICE}] ${line}`));
+  /**
+   * The audit write is the fan-out seam: rows reach the stream only once the
+   * transaction that wrote them has committed. `record` does the publishing
+   * itself, so there is no path that appends a row without announcing it.
+   */
+  const publish =
+    bus === undefined ? undefined : (batch: readonly PublishedEvent[]) => bus.publish(batch);
   const ctx: HandlerContext = {
     now: () => new Date().toISOString(),
     newId: newEventId,
@@ -152,7 +171,7 @@ export function createServer(deps: ServerDeps) {
     });
     const audit = (events: GovernanceEvent[]): void => {
       try {
-        record(db, events);
+        record(db, events, publish);
       } catch (auditCause) {
         log(`AUDIT WRITE FAILED while failing closed (${id}): ${String(auditCause)}`);
       }
@@ -224,7 +243,7 @@ export function createServer(deps: ServerDeps) {
       checkBudget("evaluating the policy");
       // Recorded before the response leaves. A decision that was made but not
       // written is the one thing a reviewer cannot recover later.
-      record(db, evaluated.events);
+      record(db, evaluated.events, publish);
       outcome = evaluated;
       response = json(outcome.response);
     } catch (cause) {
@@ -256,6 +275,9 @@ export function createServer(deps: ServerDeps) {
       counts: counts(db),
       pending_approvals: pendingCount(db),
       audit_rows: auditCount(db),
+      // "Did the panel actually connect?" needs an answer that is not the
+      // panel itself, which is the surface most likely to be lying.
+      stream_clients: bus?.subscribers ?? 0,
       failure_mode: "fail-closed",
     };
     return json(body, policy.status === "ready" ? 200 : 503);
@@ -285,6 +307,22 @@ export function createServer(deps: ServerDeps) {
         });
         if (answered !== null) return answered;
         return json({ error: "Not found" }, 404);
+      }
+
+      if (pathname === EVENTS_PATH) {
+        // No bearer, by decision — see the header comment in `events.ts`. The
+        // preflight matters as much as the GET: the panel's browser asks
+        // before it sends `last-event-id`.
+        if (bus === undefined) return json({ error: "Not found" }, 404);
+        if (request.method === "OPTIONS") return preflight();
+        if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
+        return handleEvents(request, {
+          db,
+          bus,
+          log,
+          ...(deps.streamKeepAliveMs !== undefined && { keepAliveMs: deps.streamKeepAliveMs }),
+          ...(deps.streamBacklogLimit !== undefined && { backlogLimit: deps.streamBacklogLimit }),
+        });
       }
 
       const hook = HOOK_BY_PATH[pathname as HookPath];

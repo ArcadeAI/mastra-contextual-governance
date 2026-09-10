@@ -5,6 +5,7 @@
  *     POST /access   which tools this user may see        → { deny }
  *     POST /pre      may this user make this call          → { code, error_message? }
  *     POST /post     pass-through until #16                → { code }
+ *     GET  /events   the live governance stream, SSE         (no auth)
  *     GET  /health   policy revision, counts, fail-closed  (no auth)
  *
  * Boot order matters: the policy is loaded into memory *before* the port
@@ -14,7 +15,10 @@
  * service from starting; it starts failing closed, says so on `/health` with
  * a 503, and reloads on the next edit.
  */
+import { createEventBus } from "@cg/governance-core";
+
 import { usingDevSecret, readConfig } from "./config.ts";
+import { EVENTS_PATH } from "./events.ts";
 import { createPolicyCache } from "./policy-cache.ts";
 import { counts, openGovernance } from "./policy-store.ts";
 import { createServer, SERVICE } from "./server.ts";
@@ -27,13 +31,20 @@ const cache = createPolicyCache(db, { log, pollMs: config.policyPollMs });
 // Warm before the port opens: Arcade's first /access may be the 1.6 MB one.
 const state = cache.start();
 
-const server = createServer({ config, db, cache, log });
+// The fan-out for GET /events. A subscriber that throws is the panel's
+// problem, never the control plane's, so it is logged and nothing else.
+const bus = createEventBus({
+  onSubscriberError: (cause) => log(`STREAM SUBSCRIBER FAILED: ${String(cause)}`),
+});
+
+const server = createServer({ config, db, cache, bus, log });
 
 const tally = counts(db);
 log(
   `listening on :${server.port} — ${config.dbPath}: ${tally.subjects} subjects, ` +
     `${tally.policy_rules} rules, ${tally.audit_log} audit rows; ` +
-    `toolkits ${config.loanToolkit}, ${config.approvalsToolkit}`,
+    `toolkits ${config.loanToolkit}, ${config.approvalsToolkit}; ` +
+    `streaming on ${EVENTS_PATH}`,
 );
 if (state.status === "failed") log(`STARTED FAIL-CLOSED: ${state.error}`);
 if (usingDevSecret(config)) {

@@ -7,6 +7,7 @@ contextual-access hooks, and records every decision it makes.
 POST /access   which tools this user may see       → { deny: Toolkits }
 POST /pre      may this user make this call         → { code: OK | CHECK_FAILED, error_message? }
 POST /post     pass-through until #16               → { code: OK }
+GET  /events   the live governance stream           → text/event-stream   (no auth)
 GET  /health   policy revision, row counts, 503 while failing closed   (no auth)
 
 GET  /approvals/roster        every subject, so routing can show who was not asked
@@ -35,6 +36,7 @@ rather than a stranger, and that is all it says. Whether the person looking may 
 bun run dev:hooks                       # :8081
 bun run --cwd apps/hooks test
 bun run --cwd apps/hooks bench          # latency, over HTTP, including the 1.6 MB /access
+bun run --cwd apps/hooks interop:21     # the panel's own adapter against /events
 ```
 
 Both bearers fall back to a development value when unset, so a local run needs no
@@ -168,6 +170,101 @@ cache that blocks for longer than the budget.
 A user the roster does not know, a toolkit the catalogue does not govern, a tool name in the
 wrong case, a call missing a required argument: all denied by the engine, all audited.
 
+## The live stream (#20)
+
+`GET /events` is the control-plane panel's feed. One frame per decision, in the log's
+order, and nothing else on it:
+
+```
+retry: 500
+
+: governance stream — live from seq 41
+
+event: governance
+id: evt_4k7xq2m9hz
+data: {"id":"evt_4k7xq2m9hz","ts":"2026-09-09T18:22:41.006Z","hook":"pre",…}
+```
+
+`data:` is one `GovernanceEvent` — the audit row, not a summary of it, so the panel renders
+the audit log rather than a prettier parallel story. `id:` is the audit row's id, which is
+also the correlation token from #6, which is what makes a resume possible. The client is
+`apps/web/lib/governance/subscribe.ts` (#21); it was written to this shape before the server
+existed, and `bun run --cwd apps/hooks interop:21` runs *that module, unmodified* against a
+real server rather than leaving two implementations of a format to agree on paper.
+
+**The audit write is the seam.** `record()` publishes to an in-process bus
+(`createEventBus`, in `@cg/governance-core` — a subscriber registry, deliberately knowing
+nothing about HTTP) *after* the transaction commits, and it does the publishing itself, so
+no code path can append a row without announcing it. The stream may therefore lag the log —
+a slow client, a dropped socket — and resuming is how a client recovers from that. What
+cannot happen is the other direction: a frame the panel renders for which no audit row
+exists. A rolled-back audit write streams nothing.
+
+A subscriber that throws is logged and skipped. The panel is a view; a broken view turning a
+recorded decision into a failed tool call would invert the point of putting the controls
+outside the model.
+
+### Resuming
+
+The client sends `Last-Event-ID` with the last id it actually saw. The server replays the
+rows after it from `audit_log`, oldest first, then hands over to the live stream — and the
+handoff has no seam of its own, because the connection subscribes to the bus *before* it
+reads the log's high-water mark, with no `await` between the two. Publishing is synchronous
+inside another request's `record()`, so nothing can commit in between: every row at or below
+the mark belongs to the replay, every row above it is already queued, and the two sets are
+disjoint. "Exactly the missed rows, in order, nothing duplicated" is a property of that
+construction rather than of the timing.
+
+An id the log cannot place — a panel left open across a `scripts/reset`, a stale tab — is
+not an error and does not replay the whole log. The stream says so in a comment and goes
+live.
+
+### The cap, and what it costs
+
+Both the replay and a live backlog are capped at **25,000 events**, one number for both. It
+is sized above the largest single decision the control plane can make: a whole-project
+`/access` writes one row per tool, measured at 10,844 (`bun run --cwd apps/hooks bench`). A
+cap under that would let one legitimate call truncate a resume.
+
+- **A client that falls further behind than the cap is disconnected, not trimmed.** It
+  reconnects with its own last id and the replay makes it whole — and because the backlog
+  that got it disconnected is no larger than the replay cap, that recovery is lossless.
+  Trimming a live stream would leave the panel quietly short of decisions with nothing on it
+  to say so, which is the failure mode this project exists to avoid.
+- **A gap larger than the cap replays the newest 25,000 rows**, contiguous with the live
+  stream, and the stream carries a `: replay truncated …` comment saying which end was
+  dropped. The hole is at the old end on purpose: the recent story stays intact and joined
+  to what comes next.
+
+A batch is never counted against the cap while the writer is idle and about to take it, so
+watching a big decision does not disconnect a healthy panel.
+
+An idle stream is held open with keep-alive comments every 15 s rather than closed. Closing
+would send the client into its reconnect loop and replay the story on a timer, which looks
+like the same call being decided over and over.
+
+### No bearer on `/events`, deliberately
+
+The panel fetches this endpoint **from the browser** — `ControlPlanePanel` is a client
+component and the URL is `HOOKS_PUBLIC_HOST`, not `apps/web` — so any token that could
+authenticate it would have to be shipped to the browser, where it is not a secret. The
+alternative is a proxy route in `apps/web`. Every field of a `GovernanceEvent` is safe to
+project today: ids, timestamps, persona emails, tool names, decisions, reasons, `rule_id`.
+
+⚠️ **`before` is the exception, and it is not populated yet.** When #16 wires
+`RedactionEngine` into `/post`, the `before` payload of a redaction event will carry the
+unredacted output — `bank_account_number`, `tax_id` — and this endpoint would then serve it
+to anyone who can reach the host. The panel masks every `before` at render time
+(`apps/web/lib/governance/diff.ts`), but that is the renderer, not the wire. **#16 has to
+choose** between proxying the stream through `apps/web` and keeping `before` off it. Nothing
+in this slice makes that choice, and nothing about the endpoint being unauthenticated today
+should be read as having made it.
+
+The CORS preflight is not optional and is not cosmetic: the panel sends `cache-control` on
+its first connect and `last-event-id` on every resume, neither of which is a CORS-safelisted
+request header, so the browser asks first. Without the `OPTIONS` handler the panel cannot
+connect in a browser at all while every server-side test still passes.
+
 ## The correlation token (#6)
 
 Over MCP a denial reaches the agent as text with no execution id. The one thing that crosses
@@ -279,5 +376,7 @@ schema or on the panel should imply otherwise.
 - `RedactionEngine` at `/post` — #16. While the policy is loaded, `/post` returns `OK` and records a
   pass-through; with the cache cold or failed it fails closed like the other two hooks, because
   "allowed unchanged" is a decision and there is no policy to make it against.
-- SSE fan-out — #20. The audit write is the seam.
 - Reset — #23.
+- The other half of #20: the agent ending its turn after `request_approval`, and an
+  `approval.granted` event resuming it. That needs #19 (grants) and #14 (the agent) and
+  lands as a second PR against the same issue. This half is the stream.

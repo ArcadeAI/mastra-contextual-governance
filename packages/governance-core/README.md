@@ -342,3 +342,41 @@ explain an outcome to an auditor (PRD stories 19–22), and "invalid" is not an 
 These are **not** the strings the model reads. A blocked call's remediation instruction is
 the policy rule's `reason`; a grant that fails to lift a denial leaves that denial, and its
 instruction, in place.
+
+## EventBus (`src/event-bus.ts`, #20)
+
+The odd one out: it holds state. No I/O, no HTTP, no SQLite — a subscriber registry the
+audit write fans out through, so that "a decision was recorded" and "somebody is watching"
+are two different concerns.
+
+```ts
+import { createEventBus } from "@cg/governance-core";
+
+const bus = createEventBus({ onSubscriberError: (cause) => log(String(cause)) });
+const off = bus.subscribe((batch) => queue.push(...batch));   // batch: PublishedEvent[]
+bus.publish([{ seq, event }]);                                 // never throws
+```
+
+Everything downstream of this — the socket, the `text/event-stream` frames, replaying the log
+for a `Last-Event-ID` — is `apps/hooks/src/events.ts`, because HTTP does not belong in this
+package. What lives here is only the part a forker keeps.
+
+`PublishedEvent` pairs a `GovernanceEvent` with its position in the log it was read out of.
+The position is what makes a resumed stream exact rather than approximately right: it totally
+orders every event the bus will carry, so a subscriber discards what it has already sent by
+comparing two integers instead of remembering ids.
+
+Three properties, all of them about the bus being unable to damage the thing publishing to
+it — which is a hook request, inside a governance decision:
+
+1. **Batches stay batches.** `publish` takes the whole array a transaction committed. A
+   whole-project `/access` commits ~10,844 rows at once, and a subscriber handed them one at
+   a time cannot tell that they were one decision.
+2. **A subscriber cannot throw at the publisher.** Delivery is wrapped per subscriber and
+   reported through `onSubscriberError`. A broken view must not turn a recorded decision into
+   a failed tool call; that would invert the point of putting the controls outside the model.
+3. **A subscriber may unsubscribe during delivery.** Delivery iterates a snapshot, so a
+   stream that closes itself in response to an event does not skip the subscriber behind it.
+
+Delivery is synchronous, inside the publisher's stack. A subscriber must do no work beyond
+queueing.

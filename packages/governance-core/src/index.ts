@@ -12,6 +12,11 @@
  * The four pure modules: #7 (PolicyEngine, `./policy-engine.ts`), #8
  * (RedactionEngine, `./redaction-engine.ts`), #9 (ApproverRouter,
  * `./approver-router.ts`) and #10 (GrantChecker, `./grant-checker.ts`).
+ *
+ * Plus one that holds state without doing I/O: the event bus (#20,
+ * `./event-bus.ts`), a subscriber registry the audit write fans out through.
+ * It stops at the edge of the process — the socket, the frames and the replay
+ * are `apps/hooks`, because HTTP does not belong in here.
  */
 import { type Decision } from "@cg/policy-schema";
 
@@ -68,6 +73,14 @@ export {
 } from "./redaction-engine.ts";
 
 export { routeApproval, type RoutingResult } from "./approver-router.ts";
+
+export {
+  createEventBus,
+  type EventBus,
+  type EventBusOptions,
+  type EventBusSubscriber,
+  type PublishedEvent,
+} from "./event-bus.ts";
 
 /**
  * Arcade calls hooks over the public internet, so an outage must degrade to

@@ -9,6 +9,7 @@
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "bench": "bun scripts/bench.ts",
+    "interop:21": "bun scripts/interop-21.ts",
     "build": "echo 'no build step — Bun runs TypeScript directly'"
   },
   "dependencies": {
