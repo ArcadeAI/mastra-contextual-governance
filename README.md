@@ -76,7 +76,7 @@ Run a service:
 bun run dev:hooks        # :8081
 bun run dev:loan-app     # :8082, the loan API
 bun run dev:idp          # :8083, the identity provider — OAuth at /oauth2/*
-bun run dev:idp-stub     # :8083 too, a userinfo-only stand-in for apps/idp; tokens are `dev:<email>`
+bun run dev:idp-stub     # a userinfo-only stand-in for apps/idp, on IDP_PUBLIC_HOST's port
 bun run dev:web          # :3000
 ```
 
@@ -84,8 +84,15 @@ Those are the defaults. Each service reads `PORT` from its own `.env.local` when
 is one, so a worktree that runs several checkouts at once can give each of them a
 different port without touching a script — see `scripts/orca-setup.sh`.
 
+The stub is the exception, and has to be: it lives under `apps/loan-app/scripts/`, so the
+`PORT` it would read there is the loan API's. It binds the port in `IDP_PUBLIC_HOST`
+instead — the address the loan API asks for userinfo — which is `:8083` by default and
+whatever `apps/idp` was given in a worktree. Move `IDP_PUBLIC_HOST` and both sides
+follow. See #56.
+
 Every `/loans` call needs a bearer token, and the API asks the identity provider who it
-belongs to. Until `apps/idp` (#36) is running locally, `dev:idp` serves that one endpoint:
+belongs to. Until `apps/idp` (#36) is running locally, `dev:idp-stub` serves that one
+endpoint:
 
 ```sh
 curl -H 'Authorization: Bearer dev:dana@example.test' localhost:8082/loans/LN-2291
