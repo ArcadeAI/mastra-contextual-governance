@@ -80,6 +80,10 @@ bun run dev:idp-stub     # :8083 too, a userinfo-only stand-in for apps/idp; tok
 bun run dev:web          # :3000
 ```
 
+Those are the defaults. Each service reads `PORT` from its own `.env.local` when there
+is one, so a worktree that runs several checkouts at once can give each of them a
+different port without touching a script — see `scripts/orca-setup.sh`.
+
 Every `/loans` call needs a bearer token, and the API asks the identity provider who it
 belongs to. Until `apps/idp` (#36) is running locally, `dev:idp` serves that one endpoint:
 
