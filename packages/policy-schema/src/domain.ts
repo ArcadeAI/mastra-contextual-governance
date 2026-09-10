@@ -412,6 +412,63 @@ export const ApprovalRequest = z
 export type ApprovalRequest = z.infer<typeof ApprovalRequest>;
 
 /**
+ * The **wire record** the approvals store returns — one shape from all three
+ * record-returning endpoints of the contract in `tools/approvals/README.md`.
+ *
+ * Distinct from `ApprovalRequest` above, and deliberately so. That type is the
+ * control plane's internal view: a `ToolMatcher` and the raw `inputs` a grant
+ * is pinned against. This one is what crosses the wire to the Python toolkit
+ * that writes it and the approval page that renders it, and it is sized to
+ * what that page must show from an opaque id alone — display names resolved,
+ * the rule already named, no join left for the reader to make.
+ *
+ * There is deliberately **no `decision` field**: once decided, `status` *is*
+ * the decision. Two fields carrying one fact are two fields that can disagree,
+ * and a page rendering "approved" beside a status of `denied` would be worse
+ * than one rendering nothing.
+ */
+export const ApprovalRecord = z
+  .object({
+    /** Opaque. Minted by the store, never by a caller. */
+    id: z.string().min(1),
+    /** Email. The `context.user_id` of whoever was refused. */
+    requester_id: z.string().min(1),
+    /** From the roster, so the page need not join. */
+    requester_display_name: z.string(),
+    /** Email of the one person routing chose. */
+    approver_id: z.string().min(1),
+    approver_display_name: z.string(),
+    /** Everyone sufficient, lowest clearance first. `[0]` is the approver. */
+    candidate_approver_ids: z.array(z.string()).default([]),
+    /** The refused action as a bare name, e.g. `approve_loan`. */
+    action: z.string().min(1),
+    resource_id: z.string().min(1),
+    amount: z.number(),
+    /** The bar a candidate had to clear: the amount. */
+    required_clearance: z.number().nonnegative(),
+    /**
+     * The policy rule the blocked call tripped, when the control plane can
+     * name it. `null` when it cannot — the page and the DM both still state
+     * the authority that was exceeded.
+     */
+    rule: z
+      .object({ id: z.string().min(1), description: z.string() })
+      .strict()
+      .nullable()
+      .default(null),
+    /** The requester's own words, rendered verbatim. */
+    justification: z.string(),
+    status: ApprovalStatus,
+    created_at: Timestamp,
+    decided_at: Timestamp.nullable().default(null),
+    /** Email of whoever decided. `null` while pending. */
+    decided_by: z.string().nullable().default(null),
+    note: z.string().nullable().default(null),
+  })
+  .strict();
+export type ApprovalRecord = z.infer<typeof ApprovalRecord>;
+
+/**
  * A narrow, expiring permission produced by an approval — the thing the pre-hook
  * looks for on the retry.
  *

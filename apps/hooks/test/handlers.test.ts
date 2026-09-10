@@ -3,9 +3,11 @@
  * them, plus the fail-closed paths and the response shape spike #2 measured.
  */
 import { describe, expect, test } from "bun:test";
+import type { Database } from "bun:sqlite";
 
 import { AccessHookResult, type GovernanceEvent, PostHookResult, PreHookResult } from "@cg/policy-schema";
 
+import { createApprovalControl } from "../src/approval-governance.ts";
 import { CORRELATION_TOKEN, correlationId } from "../src/correlation.ts";
 import { handleAccess, handlePost, handlePre, type HandlerContext } from "../src/handlers.ts";
 import { createPolicyCache, type CacheState } from "../src/policy-cache.ts";
@@ -16,10 +18,23 @@ const SAM = "sam.reyes@bank.example";
 const RILEY = "riley.chen@bank.example";
 const MORGAN = "morgan.ellis@bank.example";
 
-const ready = (): CacheState =>
-  createPolicyCache(
-    openGovernance(":memory:", { loanToolkit: "Loan", approvalsToolkit: "Approvals", personaEmails: {} }),
-  ).reload();
+const governance = (): Database =>
+  openGovernance(":memory:", { loanToolkit: "Loan", approvalsToolkit: "Approvals", personaEmails: {} });
+
+let n = 0;
+
+/**
+ * A context bound to one database. `/pre` reads approvals and grants from it,
+ * so the handler and the store a test inspects have to be looking at the same
+ * file — hence the binding rather than a free-standing object.
+ */
+const contextFor = (db: Database): HandlerContext => ({
+  now: () => "2026-01-01T00:00:00.000Z",
+  newId: () => `evt_${String(++n).padStart(10, "0")}`,
+  approvals: createApprovalControl(db, { toolkit: "Approvals", grantTtlSeconds: 900 }),
+});
+
+const ready = (): CacheState => createPolicyCache(governance()).reload();
 
 const cold: CacheState = { status: "cold" };
 
@@ -30,11 +45,7 @@ const failed: CacheState = {
   error: "Policy failed to compile: rule x",
 };
 
-let n = 0;
-const ctx: HandlerContext = {
-  now: () => "2026-01-01T00:00:00.000Z",
-  newId: () => `evt_${String(++n).padStart(10, "0")}`,
-};
+const ctx: HandlerContext = contextFor(governance());
 
 /**
  * The single audit row a handler wrote.

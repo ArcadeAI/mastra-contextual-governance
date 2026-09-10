@@ -2,18 +2,19 @@
 
 Next.js. Eventually the split screen: a deliberately boring enterprise loan app on the
 left, the Arcade control plane on the right (#22). Today it carries the control-plane
-panel (#21) and the scaffold's placeholder home page.
+panel (#21), the approval page (#19), and the scaffold's placeholder home page.
 
 ```sh
-PORT=4420 bun run --cwd apps/web dev     # then open /panel
+bun run --cwd apps/web dev               # then open /panel or /approvals/<id>
 bun test apps/web
 bun run --cwd apps/web build
 ```
 
-⚠️ `bun run dev:web` binds **3000**, not the `PORT` in this directory's `.env.local`.
-`next dev --port ${PORT:-3000}` is expanded by the shell, which never reads that file —
-unlike the three Bun services, where the runtime loads it. Pass `PORT` explicitly until
-[#50](https://github.com/ArcadeAI/mastra-contextual-governance/issues/50) is fixed.
+`PORT` comes from this directory's own `.env.local`, the way it does for the three Bun
+services: `dev` and `start` go through `scripts/next.ts`, which is a process Bun runs
+directly so the file is loaded before Next starts ([#50](https://github.com/ArcadeAI/mastra-contextual-governance/issues/50),
+fixed in #55). A real environment variable still wins, which is what
+`PORT=4420 bun run --cwd apps/web dev` and Render's injected `PORT` rely on.
 
 ## The control-plane panel
 
@@ -115,3 +116,154 @@ GT Cinetype and GT Cinetype Mono are Arcade's licensed faces and are **not commi
 this is a template anyone can fork. The stack names them first, because they are
 installed on the machine that presents this, and falls back to the brand kit's own
 documented websafe fallback everywhere else.
+
+## `/approvals/{id}` — the approval page
+
+The page the Slack DM links to. It is built on **one** read, `GET /approvals/{id}` on
+`apps/hooks`, because the link carries an opaque id and nothing else: no token, no
+signature, no query string. That response carries everything the page shows — who asked,
+what for, how much, which rule was tripped, why, who it was routed to, and who was
+sufficient and deliberately not asked.
+
+**Opening the page is not permission.** The requester can read the DM she sent, so she can
+open the link too, and the read answers her exactly as it answers the approver. Whether the
+person looking may *decide* is settled when a button is pressed.
+
+### Pressing a button is a governed tool call
+
+Approve and Deny both call `Approvals.Decide` **through Arcade, as the clicking user**, so
+the press passes `/access`, the auth requirements, `/pre` and `/post` like any other tool
+call. There is deliberately no second path: `apps/web` never writes to `governance.db`, never
+calls the approvals store to record a decision, and has no branch that records one when
+Arcade refuses. A privileged path that made the demo work would also make it false.
+
+Three outcomes, and they stay three:
+
+| | what it means | what the page shows |
+|---|---|---|
+| recorded | the tool ran | the decision, and the details above update |
+| refused | `/pre` said no | `CHECK_FAILED`, the hook's own message verbatim, and "the request is unchanged" |
+| failed | Arcade unreachable, misconfigured, unexpected | "no control has spoken" |
+
+Collapsing a failure into a refusal would make an outage look like a control firing. That is
+the comfortable direction to get it wrong, and it is still wrong.
+
+The refusal is styled as a deliberate screen rather than an error page, because it is a beat:
+Dana clicking her own link sees the same `CHECK_FAILED` her agent saw, and there is an audit
+row for it against her identity.
+
+### Acting as
+
+`lib/persona.ts` is the persona switcher, standing in for real login exactly as `DESIGN.md`
+says: each persona is a real Arcade account with a real email, and the switcher chooses which
+of them the tool call is made under. It defaults to the routed approver, so the link works
+straight from Slack, and ignores a cookie naming somebody the control plane has never heard
+of. It is not a permission — choosing the requester and pressing Approve is the beat, not a
+hole.
+
+### Configuration
+
+`lib/config.ts` is the only place this service reads its environment, and
+`APPROVALS_STORE_TOKEN` is the one variable it will not invent. Unset outside
+production it takes the same development fallback `apps/hooks` takes, so a clean
+checkout runs with no configuration at all; unset **under
+`NODE_ENV=production` it throws**, with the same wording the control plane uses:
+
+```
+APPROVALS_STORE_TOKEN is required in production
+```
+
+That fallback is written out in the source, so a production service using it
+would be authenticating to the approvals store with a value anyone can read —
+and doing it quietly, because the fallback works locally. `test/config.test.ts`
+pins both halves of the guard on both sides, and CI hands the token to the
+`build web image` smoke the same way it hands it to `build hooks image`.
+
+`/health` deliberately does not read configuration, so it answers `200` either
+way; the guard fires on the first request that needs the token, which is any
+view of an approval.
+
+## Driving the two beats locally
+
+Three terminals. No Arcade account, no network, no secrets to set: `apps/hooks`
+and the stand-in both fall back to the same development bearers outside
+production.
+
+Pick your own ports — every service reads `PORT` and this worktree owns a block
+of ten. The ports below are examples; substitute yours.
+
+**Terminal 1 — the control plane.** Owns `governance.db`, serves the hooks and
+the four `/approvals` endpoints.
+
+```sh
+PORT=4401 GOVERNANCE_DB_PATH=/tmp/cg/governance.db bun apps/hooks/src/index.ts
+```
+
+**Terminal 2 — the Arcade stand-in.** Prints the port it bound. It is a
+development fixture, and it says so on every boot.
+
+```sh
+PORT=4402 HOOKS_PUBLIC_HOST=localhost:4401 bun run --cwd apps/web arcade-stand-in
+```
+
+Leave `PORT` off and it binds `:0` and tells you what it got.
+
+**Terminal 3 — the web app**, pointed at the stand-in. `ARCADE_API_KEY` must be
+non-empty; the stand-in ignores the value.
+
+```sh
+PORT=4400 HOOKS_PUBLIC_HOST=localhost:4401 \
+  ARCADE_API_URL=http://localhost:4402 ARCADE_API_KEY=offline \
+  bun run --cwd apps/web dev
+```
+
+Now create the escalation act 2 produces — normally `tools/approvals` writes
+this after the pre-hook refuses Dana, and here you write it directly:
+
+```sh
+curl -s -X POST http://localhost:4401/approvals \
+  -H "authorization: Bearer cg-approvals-store-dev-token-not-for-production" \
+  -H 'content-type: application/json' \
+  -d '{"requester_id":"dana.okafor@bank.example","action":"approve_loan",
+       "resource_id":"LN-2291","amount":95000,
+       "justification":"Eleven years in business, 742 credit score.",
+       "approver_id":"riley.chen@bank.example",
+       "candidate_approver_ids":["riley.chen@bank.example","morgan.ellis@bank.example"],
+       "required_clearance":95000}'
+```
+
+It answers with the record; take the `id` and open
+`http://localhost:4400/approvals/<id>`.
+
+**Beat one — Riley approves.** The page opens acting as Riley Chen, the routed
+approver. Press **Approve**. You get *Decision recorded*, the status chip turns
+`approved`, and `governance.db` now holds a grant — `active`, single use,
+pinned to `LN-2291`, ceiling 95,000.
+
+**Beat two — Dana is refused.** Create a second request with the same curl.
+On its page, switch **Act as** to *Dana Okafor* and press **Approve**. You get
+the `CHECK_FAILED` screen carrying the pre-hook's own words —
+*"Dana Okafor raised this approval request, and separation of duties means the
+person who asks cannot also be the person who approves"* — plus the `[ref evt_…]`
+token that joins it to the audit row. The request stays `pending`.
+
+That refusal is the actual policy in `governance.db` refusing, reached through
+the actual `/pre`. The stand-in cannot answer at all without asking first: see
+`scripts/arcade-stand-in.ts`, which the test suite imports rather than
+duplicating, so what you see here and what `bun test` pins are one
+implementation.
+
+To watch the decisions land:
+
+```sh
+sqlite3 /tmp/cg/governance.db \
+  "SELECT hook, user_id, tool, decision, rule_id FROM audit_log ORDER BY seq DESC LIMIT 5;"
+sqlite3 /tmp/cg/governance.db "SELECT id, status, authorizes, uses_remaining FROM grants;"
+```
+
+### Unverified
+
+`lib/arcade.ts` has never spoken to `api.arcade.dev`: #13 registers the gateway and the
+provider. The tests drive the real pre-hook through a stand-in that calls it the way the
+engine does and runs the tool only on `OK`, so the refusals under test are produced by the
+actual policy — but the live round trip is not evidence this slice can offer.

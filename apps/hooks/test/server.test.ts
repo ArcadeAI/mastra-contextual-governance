@@ -21,16 +21,21 @@ const settle = () => Bun.sleep(POLL_MS * 6);
 const DANA = "dana.okafor@bank.example";
 const SAM = "sam.reyes@bank.example";
 const SECRET = "test-secret";
+// A different bearer from the hook secret, as in production: this file's tests
+// only exercise the hooks, but `HooksConfig` requires both.
+const STORE_TOKEN = "test-store-token";
 
 const config: HooksConfig = {
   port: 0,
   dbPath: ":memory:",
   signingSecret: SECRET,
+  approvalsStoreToken: STORE_TOKEN,
   loanToolkit: "Loan",
   approvalsToolkit: "Approvals",
   personaEmails: {},
   deadlineMs: 2500,
   policyPollMs: 250,
+  grantTtlSeconds: 900,
 };
 
 let db: Database;

@@ -16,11 +16,24 @@
  */
 const DEV_SECRET = "cg-hooks-dev-secret-not-for-production";
 
+/** The same, for the approvals store's own bearer. Never equal to `DEV_SECRET`. */
+const DEV_STORE_TOKEN = "cg-approvals-store-dev-token-not-for-production";
+
 export interface HooksConfig {
   port: number;
   dbPath: string;
   /** What `Authorization: Bearer …` must carry on `/access`, `/pre` and `/post`. */
   signingSecret: string;
+  /**
+   * What `Authorization: Bearer …` must carry on the four `/approvals`
+   * endpoints. A *different* secret from `signingSecret` on purpose: Arcade
+   * holds one and the deployed approvals toolkit holds the other, and neither
+   * should be able to present the other's credential. Refused under
+   * NODE_ENV=production when unset — without it the store would accept a
+   * record from anyone on the internet, and that record is what a human then
+   * acts on.
+   */
+  approvalsStoreToken: string;
   /** `tool.toolkit` as Arcade files the deployed `tools/loan`. Measured on #35. */
   loanToolkit: string;
   /** `tool.toolkit` for `tools/approvals`. Derived, not observed — confirm on #18. */
@@ -45,12 +58,27 @@ export interface HooksConfig {
    * path itself never reads the database; this is the only policy read.
    */
   policyPollMs: number;
+  /**
+   * How long a grant issued by an approval stays good, in seconds.
+   *
+   * A grant is single use *and* time-boxed, and the expiry is the half that
+   * still holds when the retry never happens: an approval nobody acted on
+   * stops being authority rather than sitting in the table forever (PRD story
+   * 22). Short enough that a stale approval cannot be replayed after the demo
+   * moves on, long enough for the Slack round trip on stage.
+   */
+  grantTtlSeconds: number;
 }
 
 export function readConfig(env: Record<string, string | undefined> = process.env): HooksConfig {
   const secret = env.ARCADE_HOOK_SIGNING_SECRET?.trim();
   if (!secret && env.NODE_ENV === "production") {
     throw new Error("ARCADE_HOOK_SIGNING_SECRET is required in production");
+  }
+
+  const storeToken = env.APPROVALS_STORE_TOKEN?.trim();
+  if (!storeToken && env.NODE_ENV === "production") {
+    throw new Error("APPROVALS_STORE_TOKEN is required in production");
   }
 
   const personaEmails: Record<string, string> = {};
@@ -63,14 +91,20 @@ export function readConfig(env: Record<string, string | undefined> = process.env
     port: Number(env.PORT ?? 8081),
     dbPath: env.GOVERNANCE_DB_PATH ?? "./governance.db",
     signingSecret: secret || DEV_SECRET,
+    approvalsStoreToken: storeToken || DEV_STORE_TOKEN,
     loanToolkit: env.ARCADE_LOAN_TOOLKIT?.trim() || "Loan",
     approvalsToolkit: env.ARCADE_APPROVALS_TOOLKIT?.trim() || "Approvals",
     personaEmails,
     deadlineMs: Number(env.HOOK_DEADLINE_MS ?? 2500),
     policyPollMs: Number(env.POLICY_POLL_MS ?? 250),
+    grantTtlSeconds: Number(env.GRANT_TTL_SECONDS ?? 900),
   };
 }
 
 export function usingDevSecret(config: HooksConfig): boolean {
   return config.signingSecret === DEV_SECRET;
+}
+
+export function usingDevStoreToken(config: HooksConfig): boolean {
+  return config.approvalsStoreToken === DEV_STORE_TOKEN;
 }

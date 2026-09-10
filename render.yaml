@@ -100,6 +100,15 @@ services:
       # same value on the hook extension in the Arcade dashboard (#13).
       - key: ARCADE_HOOK_SIGNING_SECRET
         sync: false
+      # The bearer the four /approvals endpoints require. A different secret
+      # from the one above on purpose: the deployed approvals toolkit and
+      # cg-web hold this one, Arcade holds that one, and neither is accepted
+      # in the other's place. Set the same value here, on cg-web, and as an
+      # Arcade secret uploaded by `arcade deploy` from tools/approvals.
+      # Without it the store would take an approval record from anyone on the
+      # internet, and that record is what a human then acts on.
+      - key: APPROVALS_STORE_TOKEN
+        sync: false
       # `tool.toolkit` as Arcade files the deployed toolkits — measured on
       # #35 (Loan) and derived for Approvals until #18 deploys it. The seeded
       # rules are keyed on these; a wrong value fails loudly at boot.
@@ -205,6 +214,14 @@ services:
       - key: ARCADE_API_KEY
         sync: false
       - key: ARCADE_GATEWAY_ID
+        sync: false
+      # The approval page reads GET /approvals/{id} from cg-hooks, and presses
+      # Approvals.Decide through Arcade. Both need naming here: the same
+      # shared bearer cg-hooks requires, and the toolkit name the tool is
+      # executed under. A wrong toolkit name calls nothing.
+      - key: APPROVALS_STORE_TOKEN
+        sync: false
+      - key: ARCADE_APPROVALS_TOOLKIT
         sync: false
       - key: PERSONA_DANA_EMAIL
         sync: false

@@ -24,7 +24,18 @@ const db = openGovernance(":memory:", { loanToolkit: "Loan", approvalsToolkit: "
 const cache = createPolicyCache(db);
 cache.start();
 const server = createServer({
-  config: { port: 0, dbPath: ":memory:", signingSecret: SECRET, loanToolkit: "Loan", approvalsToolkit: "Approvals", personaEmails: {}, deadlineMs: 2500, policyPollMs: 250 },
+  config: {
+    port: 0,
+    dbPath: ":memory:",
+    signingSecret: SECRET,
+    approvalsStoreToken: "bench-store-token",
+    loanToolkit: "Loan",
+    approvalsToolkit: "Approvals",
+    personaEmails: {},
+    deadlineMs: 2500,
+    policyPollMs: 250,
+    grantTtlSeconds: 900,
+  },
   db,
   cache,
   log: () => {},

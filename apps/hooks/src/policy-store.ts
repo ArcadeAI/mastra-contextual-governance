@@ -1,7 +1,7 @@
 /**
  * `governance.db` — who may do what, and what happened.
  *
- * Five tables a presenter can read at a glance, because one of them gets
+ * Six tables a presenter can read at a glance, because one of them gets
  * edited live on stage:
  *
  *   subjects        the cast: user_id (email), display_name, role, clearance
@@ -9,7 +9,9 @@
  *   policy_rules    /access and /pre rules — one row each, JSON only where the
  *                   schema is genuinely nested (subjects, conditions)
  *   output_rules    /post redaction rules; stored now, evaluated from #16
- *   grants          narrow permissions produced by approvals; written from #10/#19
+ *   grants          narrow permissions produced by approvals; written at /pre (#19)
+ *   approval_requests  escalations the approvals toolkit writes and the
+ *                   approval page reads; empty on seed (#19)
  *   audit_log       append-only, one row per decision — see `audit-log.ts`
  *
  * Plus `policy_revision`, a single integer that triggers bump on every write to
@@ -184,7 +186,22 @@ const SCHEMA = `
   );
 
   -- Grants: one row per approval outcome, in the shape @cg/policy-schema's
-  -- Grant describes. Written by the approval flow (#10, #19); read at /pre.
+  -- Grant describes, plus the three lifecycle columns below. Written by the
+  -- approval flow (#10, #19); read at /pre.
+  --
+  -- The lifecycle exists because issuing a grant and recording the decision
+  -- that justifies it are two writes, and two writes race. A grant is minted
+  -- 'pending' by /pre and becomes usable only inside the same transaction that
+  -- records the winning decision as 'approved'; a decision that records
+  -- 'denied' voids it in that same transaction. So an approval that loses the
+  -- race leaves a row that never becomes authority, rather than one that is
+  -- authority until somebody notices.
+  --
+  --   pending  minted by /pre, not usable, waiting for a recorded decision
+  --   active   the recorded decision was 'approved'. The only usable state.
+  --   void     the recorded decision was 'denied', or the request settled
+  --            without this grant winning. revoked_at is set too, so
+  --            GrantChecker refuses it even if the status is ignored.
   CREATE TABLE grants (
     id             TEXT PRIMARY KEY,
     subject_id     TEXT NOT NULL,
@@ -198,9 +215,66 @@ const SCHEMA = `
     issued_at      TEXT NOT NULL,
     expires_at     TEXT NOT NULL,
     uses_remaining INTEGER,
-    revoked_at     TEXT
+    revoked_at     TEXT,
+    status         TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending', 'active', 'void')),
+    -- The decision this grant was minted for. Activation matches on it, so a
+    -- grant can only ever be turned on by the outcome it was issued against.
+    authorizes     TEXT NOT NULL DEFAULT 'approved'
+                        CHECK (authorizes IN ('approved', 'denied')),
+    activated_at   TEXT,
+    voided_at      TEXT
   );
-  CREATE INDEX idx_grants_subject_tool ON grants(subject_id, toolkit, tool);
+  CREATE INDEX idx_grants_subject_tool ON grants(subject_id, toolkit, tool, status);
+  -- One approval, one grant, enforced by the database. The /pre handler that
+  -- issues a grant and the store call that flips the request to 'approved'
+  -- are two writes, and only the second one closes the "still pending" rule.
+  -- Without this, a Decide replayed inside that window would issue a second
+  -- grant for the same approval — single use per grant, but two grants.
+  CREATE UNIQUE INDEX idx_grants_request ON grants(request_id);
+
+  -- Approval requests: the escalations the approvals toolkit writes and the
+  -- approval page reads. Empty on seed; every row arrives over
+  -- POST /approvals. The columns up to 'note' are the wire record written out
+  -- in tools/approvals/README.md, one column each so a presenter can read the
+  -- table; the four after it are the control plane's own resolution of the
+  -- bare action name, recorded at creation.
+  --
+  -- Resolving once and storing it is what makes a grant issued minutes later
+  -- match the call that was actually refused: a catalogue edited in between
+  -- cannot silently retarget the approval at a different tool or a different
+  -- argument.
+  CREATE TABLE approval_requests (
+    id                     TEXT PRIMARY KEY,
+    requester_id           TEXT NOT NULL,
+    requester_display_name TEXT NOT NULL,
+    approver_id            TEXT NOT NULL,
+    approver_display_name  TEXT NOT NULL,
+    candidate_approver_ids TEXT NOT NULL DEFAULT '[]',
+    action                 TEXT NOT NULL,
+    resource_id            TEXT NOT NULL,
+    amount                 REAL NOT NULL,
+    required_clearance     REAL NOT NULL,
+    rule_id                TEXT,
+    rule_description       TEXT,
+    justification          TEXT NOT NULL,
+    status                 TEXT NOT NULL DEFAULT 'pending'
+                                CHECK (status IN ('pending','approved','denied','expired')),
+    created_at             TEXT NOT NULL,
+    decided_at             TEXT,
+    decided_by             TEXT,
+    note                   TEXT,
+    -- The control plane's resolution of the action name, pinned at creation time.
+    match_toolkit          TEXT NOT NULL,
+    match_tool             TEXT NOT NULL,
+    -- Which argument of that tool names the resource, and which one carries
+    -- the amount the approver cleared. A grant pins the first and bounds the
+    -- second; amount_input is NULL only for an action with no numeric
+    -- dimension at all.
+    resource_input         TEXT NOT NULL,
+    amount_input           TEXT
+  );
+  CREATE INDEX idx_approval_requests_requester ON approval_requests(requester_id, status);
 
   -- One row per decision the control plane made, in GovernanceEvent's shape.
   --
@@ -493,6 +567,7 @@ export function counts(db: Database): Record<string, number> {
     policy_rules: count("policy_rules"),
     output_rules: count("output_rules"),
     grants: count("grants"),
+    approval_requests: count("approval_requests"),
     audit_log: count("audit_log"),
   };
 }
