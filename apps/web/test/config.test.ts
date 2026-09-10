@@ -12,6 +12,11 @@
  * to decide" — the store answers `401`, and nothing on screen says the cause is
  * an unset variable. With it and a drift that nobody noticed, the same thing
  * happens and the test that should have caught it does not exist.
+ *
+ * The drift that actually happened, on round 3 of #52, was not in the literal
+ * but in the *guard around it*: `apps/hooks` refused to boot in production
+ * without a real token and `apps/web` quietly used the published fallback. So
+ * this file now pins both — the value and the check — on both sides.
  */
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
@@ -22,16 +27,19 @@ import { baseUrl, readWebConfig } from "../lib/config.ts";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 
+const GUARD = 'if (!storeToken && env.NODE_ENV === "production") {\n' +
+  '    throw new Error("APPROVALS_STORE_TOKEN is required in production");';
+
+const sourceOf = (...parts: string[]) => readFileSync(join(REPO_ROOT, ...parts), "utf8");
+
 describe("the approvals store token", () => {
   test("falls back to the same development value apps/hooks falls back to", () => {
     const token = readWebConfig({}).approvalsStoreToken;
-    const hooksConfig = readFileSync(
-      join(REPO_ROOT, "apps", "hooks", "src", "config.ts"),
-      "utf8",
-    );
 
     expect(token).not.toBe("");
-    expect(hooksConfig).toContain(`const DEV_STORE_TOKEN = "${token}"`);
+    expect(sourceOf("apps", "hooks", "src", "config.ts")).toContain(
+      `const DEV_STORE_TOKEN = "${token}"`,
+    );
   });
 
   test("a value in the environment wins, and is trimmed", () => {
@@ -40,20 +48,72 @@ describe("the approvals store token", () => {
     );
   });
 
-  test("apps/hooks refuses to boot in production without a real one", () => {
-    // The fallback above is a local convenience and must never be a production
-    // one. The control plane's own check is the thing that guarantees that, and
-    // CI boots the image under NODE_ENV=production to prove the check fires.
-    const hooksConfig = readFileSync(
-      join(REPO_ROOT, "apps", "hooks", "src", "config.ts"),
-      "utf8",
-    );
-    expect(hooksConfig).toContain("APPROVALS_STORE_TOKEN is required in production");
+  test("outside production, an unset variable takes the development fallback", () => {
+    // The whole point of the fallback: a clean checkout runs the approval page
+    // with no configuration at all.
+    for (const env of [{}, { NODE_ENV: "development" }, { NODE_ENV: "test" }]) {
+      expect(readWebConfig(env).approvalsStoreToken).toBe(
+        "cg-approvals-store-dev-token-not-for-production",
+      );
+    }
+  });
 
-    const workflow = readFileSync(join(REPO_ROOT, ".github", "workflows", "ci.yml"), "utf8");
-    // ...which means the image smoke has to supply one, or the container exits
-    // before /health and the job fails. It did, on round 2 of #52.
-    expect(workflow).toContain("-e APPROVALS_STORE_TOKEN=");
+  test("in production, an unset variable is refused rather than defaulted", () => {
+    // Round 3 of #52. The fallback is published in the source, so a production
+    // service using it would be authenticating to the approvals store with a
+    // token anyone can read — quietly, because the fallback works locally.
+    expect(() => readWebConfig({ NODE_ENV: "production" })).toThrow(
+      "APPROVALS_STORE_TOKEN is required in production",
+    );
+    // Whitespace is not a token either.
+    expect(() => readWebConfig({ NODE_ENV: "production", APPROVALS_STORE_TOKEN: "   " })).toThrow(
+      "APPROVALS_STORE_TOKEN is required in production",
+    );
+  });
+
+  test("in production with a real one, it is read and nothing throws", () => {
+    const config = readWebConfig({
+      NODE_ENV: "production",
+      APPROVALS_STORE_TOKEN: "a-real-production-token",
+    });
+    expect(config.approvalsStoreToken).toBe("a-real-production-token");
+    expect(config.approvalsStoreToken).not.toBe(
+      "cg-approvals-store-dev-token-not-for-production",
+    );
+  });
+});
+
+describe("both services guard production the same way", () => {
+  test("the guard is byte-for-byte the same in apps/web and apps/hooks", () => {
+    // Two copies of one rule, so the drift this test exists to prevent is not
+    // just the literal token but the check around it. Round 3 of #52 was
+    // exactly this drift: the literal matched and the guard did not exist on
+    // one side, so the credential-presenting service silently used a published
+    // value in production while the control plane refused to boot on it.
+    for (const source of [
+      sourceOf("apps", "web", "lib", "config.ts"),
+      sourceOf("apps", "hooks", "src", "config.ts"),
+    ]) {
+      expect(source).toContain(GUARD);
+    }
+  });
+
+  test("apps/hooks refuses to boot in production without a real one", () => {
+    expect(sourceOf("apps", "hooks", "src", "config.ts")).toContain(
+      "APPROVALS_STORE_TOKEN is required in production",
+    );
+  });
+
+  test("every image CI boots under NODE_ENV=production is handed a token", () => {
+    // Which means the image smokes have to supply one, or the container exits
+    // before /health and the job fails. That is what happened to `build hooks
+    // image` on round 2, and it is why `build web image` is given one too.
+    const workflow = sourceOf(".github", "workflows", "ci.yml");
+    const smokes = workflow.match(/-e APPROVALS_STORE_TOKEN=/g) ?? [];
+    expect(smokes.length).toBeGreaterThanOrEqual(2);
+    for (const service of ["hooks", "web"]) {
+      expect(workflow).toContain(`- service: ${service}`);
+    }
   });
 });
 

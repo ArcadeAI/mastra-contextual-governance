@@ -27,8 +27,7 @@ export interface WebConfig {
 /**
  * The value `apps/hooks` falls back to when `APPROVALS_STORE_TOKEN` is unset
  * and it is not running in production — see `DEV_STORE_TOKEN` in
- * `apps/hooks/src/config.ts`, which refuses to boot without a real one under
- * `NODE_ENV=production`.
+ * `apps/hooks/src/config.ts`.
  *
  * Duplicated rather than imported because `apps/web` does not depend on
  * `apps/hooks` in the package graph and should not start to. The cost of a
@@ -38,14 +37,29 @@ export interface WebConfig {
  *
  * Without this fallback a clean checkout renders the approval page as "nothing
  * to decide": the store answers `401`, the page has no request to show, and
- * nothing on screen says the cause is an unset variable.
+ * nothing on screen says the cause is an unset variable. That is the whole of
+ * what it buys, and it must buy nothing in production — see the guard below.
  */
 const DEV_STORE_TOKEN = "cg-approvals-store-dev-token-not-for-production";
 
 export function readWebConfig(env: Record<string, string | undefined> = process.env): WebConfig {
+  const storeToken = env.APPROVALS_STORE_TOKEN?.trim();
+  // Same guard, same wording, as `apps/hooks/src/config.ts`. Round 3 of #52's
+  // review caught it missing here: the control plane refused to boot without a
+  // real token while the service that *presents* it fell back to a value
+  // published in this file, so a production `apps/web` would have gone on
+  // authenticating to the approvals store with a token anyone can read — and
+  // gone on doing it quietly, because the fallback works locally.
+  //
+  // A convenience that only applies outside production is a convenience. One
+  // that survives into production is a credential.
+  if (!storeToken && env.NODE_ENV === "production") {
+    throw new Error("APPROVALS_STORE_TOKEN is required in production");
+  }
+
   return {
     hooksHost: env.HOOKS_PUBLIC_HOST?.trim() || "localhost:8081",
-    approvalsStoreToken: env.APPROVALS_STORE_TOKEN?.trim() || DEV_STORE_TOKEN,
+    approvalsStoreToken: storeToken || DEV_STORE_TOKEN,
     arcadeApiUrl: (env.ARCADE_API_URL?.trim() || "https://api.arcade.dev").replace(/\/+$/, ""),
     arcadeApiKey: env.ARCADE_API_KEY?.trim() ?? "",
     approvalsToolkit: env.ARCADE_APPROVALS_TOOLKIT?.trim() || "Approvals",

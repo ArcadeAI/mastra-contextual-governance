@@ -161,6 +161,28 @@ straight from Slack, and ignores a cookie naming somebody the control plane has 
 of. It is not a permission — choosing the requester and pressing Approve is the beat, not a
 hole.
 
+### Configuration
+
+`lib/config.ts` is the only place this service reads its environment, and
+`APPROVALS_STORE_TOKEN` is the one variable it will not invent. Unset outside
+production it takes the same development fallback `apps/hooks` takes, so a clean
+checkout runs with no configuration at all; unset **under
+`NODE_ENV=production` it throws**, with the same wording the control plane uses:
+
+```
+APPROVALS_STORE_TOKEN is required in production
+```
+
+That fallback is written out in the source, so a production service using it
+would be authenticating to the approvals store with a value anyone can read —
+and doing it quietly, because the fallback works locally. `test/config.test.ts`
+pins both halves of the guard on both sides, and CI hands the token to the
+`build web image` smoke the same way it hands it to `build hooks image`.
+
+`/health` deliberately does not read configuration, so it answers `200` either
+way; the guard fires on the first request that needs the token, which is any
+view of an approval.
+
 ### Unverified
 
 `lib/arcade.ts` has never spoken to `api.arcade.dev`: #13 registers the gateway and the
