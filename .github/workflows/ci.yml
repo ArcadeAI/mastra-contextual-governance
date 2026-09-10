@@ -58,16 +58,58 @@ jobs:
         env:
           NEXT_TELEMETRY_DISABLED: "1"
 
-  toolkits:
-    name: test tools/loan
+  # The toolkits are discovered, never listed. `tools/approvals` is meant to be
+  # deletable — a forker who wants no Python removes it and substitutes their
+  # own tools — and a matrix that named it would turn that supported act into a
+  # job cd-ing into a directory that is not there.
+  discover-toolkits:
+    name: discover toolkits
     runs-on: ubuntu-latest
+    outputs:
+      toolkits: ${{ steps.find.outputs.toolkits }}
+      any: ${{ steps.find.outputs.any }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: find
+        # The script answers `[]` and exits 0 when there is no toolkit, which
+        # matters because this `run:` block is executed under `bash -e -o
+        # pipefail`: a script that printed `[]` and exited 1 would fail the
+        # step rather than reach the empty case. Measured on round 2 of #47.
+        run: |
+          toolkits="$(bash scripts/list-toolkits.sh)"
+          echo "toolkits=$toolkits" >> "$GITHUB_OUTPUT"
+          if [ "$toolkits" = "[]" ]; then echo "any=false" >> "$GITHUB_OUTPUT";
+          else echo "any=true" >> "$GITHUB_OUTPUT"; fi
+          echo "discovered: $toolkits"
+
+  toolkits:
+    name: test tools/${{ matrix.toolkit }}
+    runs-on: ubuntu-latest
+    needs: discover-toolkits
+    # Skipped, not empty. GitHub rejects an empty matrix outright — a job whose
+    # `matrix.toolkit` evaluates to `[]` is a workflow error, not a job with
+    # nothing to do — so the empty case has to be caught here, before the
+    # matrix is constructed. A repo with no Python toolkits left is a forked
+    # template that deleted them on purpose, and it deserves a green run.
+    if: needs.discover-toolkits.outputs.any == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both toolkits are Python `arcade-mcp` packages shipped with
+        # `arcade deploy`, so neither is covered by `bun test` above.
+        toolkit: ${{ fromJSON(needs.discover-toolkits.outputs.toolkits) }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: astral-sh/setup-uv@v6
 
-      # The toolkit's tests boot the real `apps/loan-app` as a subprocess and
-      # drive the four tools through it, so Bun is needed here too.
+      # Bun for every toolkit, not just the one that needs it today.
+      # tools/loan's tests boot the real `apps/loan-app` as a subprocess, and
+      # its conftest *skips* when bun is missing — so a step guarded on a
+      # toolkit name would, the day that name changed, silently stop running
+      # the tests instead of failing. Installing unconditionally costs seconds
+      # and cannot go quiet.
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.3.14
@@ -76,7 +118,7 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Test
-        working-directory: tools/loan
+        working-directory: tools/${{ matrix.toolkit }}
         run: uv run --frozen --extra dev pytest
 
   images:
