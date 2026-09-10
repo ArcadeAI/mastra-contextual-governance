@@ -78,7 +78,11 @@ const cache = createPolicyCache(db, { log: () => {}, pollMs: 20 });
 cache.start();
 const bus = createEventBus({ onSubscriberError: (cause) => console.error("bus:", cause) });
 let server = createServer({ config, db, cache, bus, log: () => {} });
+// Read before any stop(): Bun resets `port` to 0 once the server is stopped,
+// and the whole point below is to bring the service back on the same one so
+// that it is the client's own reconnect that finds it.
 const port = server.port;
+if (typeof port !== "number" || port === 0) throw new Error("the server did not bind a port");
 const base = `http://localhost:${port}`;
 
 /** A `/pre` Dana is refused: one audit row, one event, act 2's first beat. */
