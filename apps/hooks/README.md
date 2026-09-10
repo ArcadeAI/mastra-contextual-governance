@@ -8,12 +8,28 @@ POST /access   which tools this user may see       → { deny: Toolkits }
 POST /pre      may this user make this call         → { code: OK | CHECK_FAILED, error_message? }
 POST /post     pass-through until #16               → { code: OK }
 GET  /health   policy revision, row counts, 503 while failing closed   (no auth)
+
+GET  /approvals/roster        every subject, so routing can show who was not asked
+POST /approvals               create an escalation; the store mints the id and the clock
+GET  /approvals/{id}          read one by opaque id — what the approval page is built on
+POST /approvals/{id}/decision record an outcome
 ```
 
 Every hook endpoint requires `Authorization: Bearer $ARCADE_HOOK_SIGNING_SECRET`. Request and
 response bodies are the generated types in `@cg/policy-schema` — `deny` takes the request's
 `Toolkits` shape down to the innermost array of versions, which spike #2 measured is the one
 shape that does not take every tool in the project down with it.
+
+The four `/approvals` endpoints require a **different** bearer,
+`Authorization: Bearer $APPROVALS_STORE_TOKEN` — the deployed `tools/approvals` worker and the
+approval page hold that one, Arcade holds the other, and neither is accepted in the other's
+place. The contract those four answer to is written out under "The approvals store contract" in
+[`tools/approvals/README.md`](../../tools/approvals/README.md), and is driven from both sides:
+`test/approvals-endpoints.test.ts` here and `tests/test_store_contract.py` there.
+
+**None of the four authorizes anything.** The bearer says the caller is the toolkit or the page
+rather than a stranger, and that is all it says. Whether the person looking may *decide* is a
+`/pre` decision on `Approvals.Decide` — see below.
 
 ```sh
 bun run dev:hooks                       # :8081
@@ -31,7 +47,7 @@ service decides who may do what; if an `if` about that appears here, it belongs 
 
 ## `governance.db`
 
-Five tables you can read at a glance, because one gets edited live on stage:
+Six tables you can read at a glance, because one gets edited live on stage:
 
 | table | what | edited on stage? |
 |---|---|---|
@@ -39,7 +55,8 @@ Five tables you can read at a glance, because one gets edited live on stage:
 | `catalogue` | every governed tool and the arguments a call must supply | rarely |
 | `policy_rules` | `/access` and `/pre` rules, one row each; `enabled = 0` switches one off | yes |
 | `output_rules` | `/post` redaction rules, stored now and evaluated from #16 | — |
-| `grants` | narrow permissions produced by approvals, written from #10/#19 | — |
+| `grants` | narrow permissions produced by approvals, written **only** by `/pre` | — |
+| `approval_requests` | escalations the approvals toolkit writes and the approval page reads; empty on seed | — |
 | `audit_log` | one row per decision, append-only | never |
 
 Seeded from `src/fixtures/governance.json` **only when the database has no schema** (decided on
@@ -141,6 +158,35 @@ id back out and joins on `audit_log.id`. It must fail soft — a message without
 uncorrelated event, never a dropped one — because the prefix Arcade puts ahead of our text is
 theirs and undocumented. Allows carry `execution_id` on the hook payload and need no token.
 
+## The approval action is itself governed
+
+`Approvals.Decide` goes through `/pre` like any other tool call, and four rows in `policy_rules`
+decide it: `pre.decide-needs-a-known-request`, `pre.decide-not-by-the-requester`,
+`pre.decide-within-clearance` and `pre.decide-only-while-pending`. They are policy, editable on
+stage, not `if`s in this service.
+
+The facts they read are not in the call. `Decide` takes `request_id`, `decision` and an optional
+`note`; who asked, for how much, and whether the request is still open live in
+`approval_requests`. So `/pre` resolves the id and writes those facts into a reserved input,
+`approval`, catalogued as an optional argument of `Decide` because a rule condition may only read
+a catalogued argument. **It is overwritten, never merged**: whatever a caller put under that key
+is discarded first, so a model that learned the shape cannot talk its way past separation of
+duties.
+
+A grant is written by the pre-hook, when it allows a `Decide` that approves, and by nothing
+else — not by the toolkit, which has no database, and not by
+`POST /approvals/{id}/decision`, which records an outcome and confers nothing. It is scoped to
+one tool, one resource, one amount ceiling, one use and an expiry (`GRANT_TTL_SECONDS`, default
+900), all resolved from the approval record rather than from the arguments of the call that
+triggered it. `action` is a bare name; `action-binding.ts` turns it into a tool and two argument
+names using the catalogue and the rule that bounds the amount, and **refuses rather than
+guesses** when either is ambiguous.
+
+Consumption happens somewhere else: on the retry, in `handlePre`, when a grant is what turned a
+denial into an allow. The call is evaluated twice — with the grant and without it — so a use is
+spent only when the grant was decisive, and a call policy would have allowed anyway does not
+quietly burn the one use an approval bought.
+
 ## What the audit log is, and is not
 
 `audit_log` is every decision *this service* made — one row per tool at `/access` (allowed or
@@ -149,6 +195,17 @@ fail-closed path where the request could be read. A whole-project `/access` is t
 rows; that is the price of a table from which a reviewer can reconstruct every decision with
 its acting user, tool, effect, reason and `rule_id`, and the bench prices it. Append-only,
 enforced by triggers, not convention.
+
+A row's `reason` may say more than the model was told, and on the approval path it does: which
+grants were examined and rejected and why, who an escalation was routed to and who was
+deliberately not asked, and which grant a decision issued. None of that reaches the
+`error_message` a denied call returns — the model reads the rule author's remediation
+instruction and nothing else.
+
+Writing an approval record or a decision is **not** a decision, so neither appends a row here.
+`GovernanceEvent` is the record of hook decisions, and a row no hook produced would be fiction.
+The routing and the outcome reach the panel through the real `/pre` rows on
+`Approvals.RequestApproval` and `Approvals.Decide`, whose reasons name them.
 
 It is **not** a complete record of every refusal a persona met. Arcade evaluates a tool's auth
 requirements *before* `/pre`: a persona without a token for a tool is refused upstream of every
@@ -160,7 +217,5 @@ schema or on the panel should imply otherwise.
 - `RedactionEngine` at `/post` — #16. While the policy is loaded, `/post` returns `OK` and records a
   pass-through; with the cache cold or failed it fails closed like the other two hooks, because
   "allowed unchanged" is a decision and there is no policy to make it against.
-- Grants at `/pre` — `GrantChecker` (#10) has not landed and the engine only accepts grants
-  that have been through it. Until then a denial stands even after an approval.
 - SSE fan-out — #20. The audit write is the seam.
 - Reset — #23.

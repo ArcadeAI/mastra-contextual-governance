@@ -114,11 +114,12 @@ runs in `apps/web` and has to read the record the tool wrote. So the request is
 persisted where `DESIGN.md` says approvals live: `governance.db`, owned by
 `apps/hooks`, reached over HTTP the same way Arcade reaches the hooks.
 
-⚠️ **`apps/hooks` does not serve these endpoints yet, and storage-A is
-provisional — the human has not ratified it.** #12 is the service and #19 is
-the approval flow. What lands in this slice is the client and the contract
-below, implemented by a stand-in server in `tests/conftest.py` and driven over
-real HTTP by `tests/test_store_contract.py`.
+Storage-A was ratified on #18, and **`apps/hooks` serves these four endpoints
+as of #19**. What landed in this slice is the client and the contract below,
+implemented by a stand-in server in `tests/conftest.py` and driven over real
+HTTP by `tests/test_store_contract.py`; the service side has its own
+counterpart, `apps/hooks/test/approvals-endpoints.test.ts`, driving the same
+contract against the real thing.
 
 ## The approvals store contract
 
@@ -226,6 +227,12 @@ sent, so anyone who has the link can reach this. Whether the person looking may
 
 Recording, not deciding. Whether the caller may decide — role, authority, and
 requester ≠ approver — is answered before this request is ever made.
+
+One thing the service adds that this contract does not require of it: a
+decision is recorded only while the request is `pending`, and a second one
+answers `409`. The pre-hook's "a decision is final" rule is the control that
+normally stops it; refusing in the store as well means a `denied` cannot be
+rewritten to `approved` even by something holding the bearer.
 
 `decided_by` travels in the body, and that is worth being explicit about
 because `apps/loan-app` deliberately does the opposite: there the actor comes

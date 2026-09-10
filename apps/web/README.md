@@ -2,18 +2,19 @@
 
 Next.js. Eventually the split screen: a deliberately boring enterprise loan app on the
 left, the Arcade control plane on the right (#22). Today it carries the control-plane
-panel (#21) and the scaffold's placeholder home page.
+panel (#21), the approval page (#19), and the scaffold's placeholder home page.
 
 ```sh
-PORT=4420 bun run --cwd apps/web dev     # then open /panel
+bun run --cwd apps/web dev               # then open /panel or /approvals/<id>
 bun test apps/web
 bun run --cwd apps/web build
 ```
 
-⚠️ `bun run dev:web` binds **3000**, not the `PORT` in this directory's `.env.local`.
-`next dev --port ${PORT:-3000}` is expanded by the shell, which never reads that file —
-unlike the three Bun services, where the runtime loads it. Pass `PORT` explicitly until
-[#50](https://github.com/ArcadeAI/mastra-contextual-governance/issues/50) is fixed.
+`PORT` comes from this directory's own `.env.local`, the way it does for the three Bun
+services: `dev` and `start` go through `scripts/next.ts`, which is a process Bun runs
+directly so the file is loaded before Next starts ([#50](https://github.com/ArcadeAI/mastra-contextual-governance/issues/50),
+fixed in #55). A real environment variable still wins, which is what
+`PORT=4420 bun run --cwd apps/web dev` and Render's injected `PORT` rely on.
 
 ## The control-plane panel
 
@@ -115,3 +116,54 @@ GT Cinetype and GT Cinetype Mono are Arcade's licensed faces and are **not commi
 this is a template anyone can fork. The stack names them first, because they are
 installed on the machine that presents this, and falls back to the brand kit's own
 documented websafe fallback everywhere else.
+
+## `/approvals/{id}` — the approval page
+
+The page the Slack DM links to. It is built on **one** read, `GET /approvals/{id}` on
+`apps/hooks`, because the link carries an opaque id and nothing else: no token, no
+signature, no query string. That response carries everything the page shows — who asked,
+what for, how much, which rule was tripped, why, who it was routed to, and who was
+sufficient and deliberately not asked.
+
+**Opening the page is not permission.** The requester can read the DM she sent, so she can
+open the link too, and the read answers her exactly as it answers the approver. Whether the
+person looking may *decide* is settled when a button is pressed.
+
+### Pressing a button is a governed tool call
+
+Approve and Deny both call `Approvals.Decide` **through Arcade, as the clicking user**, so
+the press passes `/access`, the auth requirements, `/pre` and `/post` like any other tool
+call. There is deliberately no second path: `apps/web` never writes to `governance.db`, never
+calls the approvals store to record a decision, and has no branch that records one when
+Arcade refuses. A privileged path that made the demo work would also make it false.
+
+Three outcomes, and they stay three:
+
+| | what it means | what the page shows |
+|---|---|---|
+| recorded | the tool ran | the decision, and the details above update |
+| refused | `/pre` said no | `CHECK_FAILED`, the hook's own message verbatim, and "the request is unchanged" |
+| failed | Arcade unreachable, misconfigured, unexpected | "no control has spoken" |
+
+Collapsing a failure into a refusal would make an outage look like a control firing. That is
+the comfortable direction to get it wrong, and it is still wrong.
+
+The refusal is styled as a deliberate screen rather than an error page, because it is a beat:
+Dana clicking her own link sees the same `CHECK_FAILED` her agent saw, and there is an audit
+row for it against her identity.
+
+### Acting as
+
+`lib/persona.ts` is the persona switcher, standing in for real login exactly as `DESIGN.md`
+says: each persona is a real Arcade account with a real email, and the switcher chooses which
+of them the tool call is made under. It defaults to the routed approver, so the link works
+straight from Slack, and ignores a cookie naming somebody the control plane has never heard
+of. It is not a permission — choosing the requester and pressing Approve is the beat, not a
+hole.
+
+### Unverified
+
+`lib/arcade.ts` has never spoken to `api.arcade.dev`: #13 registers the gateway and the
+provider. The tests drive the real pre-hook through a stand-in that calls it the way the
+engine does and runs the tool only on `OK`, so the refusals under test are produced by the
+actual policy — but the live round trip is not evidence this slice can offer.
