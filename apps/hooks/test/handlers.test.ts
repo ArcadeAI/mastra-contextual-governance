@@ -4,7 +4,7 @@
  */
 import { describe, expect, test } from "bun:test";
 
-import { AccessHookResult, PostHookResult, PreHookResult } from "@cg/policy-schema";
+import { AccessHookResult, type GovernanceEvent, PostHookResult, PreHookResult } from "@cg/policy-schema";
 
 import { CORRELATION_TOKEN, correlationId } from "../src/correlation.ts";
 import { handleAccess, handlePost, handlePre, type HandlerContext } from "../src/handlers.ts";
@@ -35,6 +35,23 @@ const ctx: HandlerContext = {
   now: () => "2026-01-01T00:00:00.000Z",
   newId: () => `evt_${String(++n).padStart(10, "0")}`,
 };
+
+/**
+ * The single audit row a handler wrote.
+ *
+ * `events[0]` is `GovernanceEvent | undefined` under `noUncheckedIndexedAccess`,
+ * and the two callers below feed its `id` to `toBe`. `events[0]!.id` would
+ * typecheck and turn "the handler recorded nothing" — the failure these tests
+ * exist to catch — into a `toBe(undefined)` that reads as a mismatched
+ * correlation token. Fail here instead, naming what actually went wrong.
+ */
+function onlyEvent(events: readonly GovernanceEvent[]): GovernanceEvent {
+  const [event, ...rest] = events;
+  if (event === undefined || rest.length > 0) {
+    throw new Error(`expected exactly one audit row, got ${events.length}`);
+  }
+  return event;
+}
 
 const V = [{ version: "1.0.0" }];
 const LOAN_TOOLS = { SearchLoans: V, GetLoan: V, ApproveLoan: V, DenyLoan: V };
@@ -176,7 +193,7 @@ describe("/pre — act 2", () => {
 
     // The token is the audit row's id, so the panel can join exactly.
     expect(events).toHaveLength(1);
-    expect(correlationId(message)).toBe(events[0]?.id);
+    expect(correlationId(message)).toBe(onlyEvent(events).id);
     expect(events[0]).toMatchObject({
       hook: "pre",
       execution_id: "tc_1",
@@ -286,7 +303,7 @@ describe("/post", () => {
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({ hook: "post", execution_id: "tc_9", tool: "Loan.GetLoan", decision: "deny", rule_id: null });
     expect(events[0]?.reason).toContain("FAIL-CLOSED");
-    expect(correlationId(response.error_message ?? "")).toBe(events[0]?.id);
+    expect(correlationId(response.error_message ?? "")).toBe(onlyEvent(events).id);
   });
 
   test("passes the output through unchanged and records that it did", () => {
