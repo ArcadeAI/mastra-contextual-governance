@@ -10,8 +10,8 @@
  * convenience; `@cg/policy-schema` remains the single source.
  *
  * The four pure modules: #7 (PolicyEngine, `./policy-engine.ts`), #8
- * (RedactionEngine), #9 (ApproverRouter, `./approver-router.ts`) and #10
- * (GrantChecker, `./grant-checker.ts`).
+ * (RedactionEngine, `./redaction-engine.ts`), #9 (ApproverRouter,
+ * `./approver-router.ts`) and #10 (GrantChecker, `./grant-checker.ts`).
  */
 import { type Decision } from "@cg/policy-schema";
 
@@ -22,6 +22,8 @@ export {
   GRANT_REJECTION_KINDS,
   GrantRejectionReason,
   HookPoint,
+  RedactionRecord,
+  RedactionStrategy,
 } from "@cg/policy-schema";
 
 export {
@@ -54,6 +56,16 @@ export {
   type GrantRejection,
   type GrantSelection,
 } from "./grant-checker.ts";
+
+export {
+  compileOutputPolicy,
+  OutputPolicyCompileError,
+  redact,
+  type CompiledOutputPolicy,
+  type OutputPolicy,
+  type RedactionInput,
+  type RedactionResult,
+} from "./redaction-engine.ts";
 
 export { routeApproval, type RoutingResult } from "./approver-router.ts";
 

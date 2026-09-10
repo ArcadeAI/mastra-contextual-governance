@@ -135,6 +135,132 @@ All conditions on a rule must hold. `input` is a dot path into the call's inputs
 Numbers are not coerced: `"95"` is malformed, not ninety-five, and the denial says so and
 asks for a number. The limit itself is inclusive — exactly at clearance is allowed.
 
+## RedactionEngine (`src/redaction-engine.ts`, #8)
+
+Pure. No I/O, no clock, no randomness. One question: what may the model *read*
+of what came back.
+
+```ts
+import { compileOutputPolicy, redact } from "@cg/governance-core";
+
+const policy = compileOutputPolicy({
+  catalogue,   // the same catalogue the PolicyEngine compiles against
+  rules,       // OutputRule[] from governance.db
+});
+
+// /post — rewrite the payload before it reaches the model
+redact({ output, subject, tool, policy });   // → { output, redactions[] }
+```
+
+**No model is used to police model output.** Per #1 that is deliberate: asking
+the adversary to guard the gate contradicts the thesis, and it would add a model
+round-trip to every tool result. Everything here is declarative — named field
+paths, and regular expressions over free text.
+
+`redactions[]` is `RedactionRecord[]` from `@cg/policy-schema`: `path`,
+`rule_id`, `pattern_id` and `kind`. There is nowhere in it to put the value that
+was removed, because it is written to the audit log and drawn on a projector
+(#21).
+
+### Field paths
+
+`a.b`, `a[0].b`, `a[].b`, optionally rooted at `$`. `[]` is every element of the
+array at that position — a rule reaches into a history without knowing how long
+it is. A path that runs into the wrong shape, or names a field that is not
+there, matches nothing: tool outputs are heterogeneous (a list endpoint returns
+an array where a detail endpoint returns an object) and a rule written for both
+should redact whichever it finds rather than throwing on the other.
+
+### The three strategies
+
+|  | pattern match | field path |
+|---|---|---|
+| `mask` | the matched substring becomes `replacement`; the text around it survives | the value becomes `replacement` |
+| `replace` | the whole string holding the match becomes `replacement` | the value becomes `replacement` |
+| `remove` | the matched substring is deleted and the text closes up | the key is deleted from its parent |
+
+For a field path `mask` and `replace` coincide: the match *is* the whole value,
+so there is nothing around it to preserve. The distinction pays off on a pattern
+sweep, which is where it is needed — a free-text field commonly holds real work
+*and* something aimed at the model. Nothing is format-preserving; a mask that
+revealed length or shape would teach the model what was taken.
+
+### Order, and why every rule fires
+
+Rules are ordered by ascending `priority`, ties broken by `id`. Unlike the
+PolicyEngine this is **not** first-match-wins: redaction is cumulative, and a
+high-priority rule that stopped evaluation would silently cancel every
+protection below it. Within a rule, `fields` run before `patterns` — what can be
+named is named, so one secret does not produce two records.
+
+### Idempotence
+
+> **The invariant:** for any policy `compileOutputPolicy` accepts, `redact` returns
+> a payload that redacting again leaves identical with an empty `redactions[]` —
+> because every string the engine can write is refused at compile time if any
+> pattern could match it, and the whole transformation is then run to a fixed
+> point.
+
+Three things hold that up.
+
+**The whole transformation runs to a fixed point** — field rules and pattern
+sweeps together, not the sweep alone. Settling half an operation says nothing
+about applying the other half again, so the pair is iterated until a pass leaves
+the payload alone.
+
+**Every string the engine can write is inert to every scanner.** A field's
+marker, a pattern's replacement and the withheld sentinel are all text the engine
+puts into a payload, and a pattern that can match one would rewrite it next time.
+The check is `regex.test(marker)` — a partial match anywhere is enough — and for
+the sentinel it runs against every pattern in the policy, with no tool-overlap
+test, because any rule is applicable on some call.
+
+**Records come from comparing input to output**, not from counting steps. A
+payload that came back as it arrived had nothing removed from it, whatever the
+rules did on the way, and a removal that removed nothing is a lie on the panel
+and in the audit log. When there was nothing to do at all, `output` is the very
+same reference that came in, which is how #12 tells an `allow` from a `modify`
+without a deep compare.
+
+If a string still cannot settle it is withheld and recorded with kind
+`unsettled` and `rule_id: null` — the engine owns that outcome, not a rule.
+Withholding more is the fail-closed direction at `/post`, and the row tells an
+operator their output policy is broken rather than that a secret was found.
+
+This shape was arrived at over three rounds of review, each of which found a
+different string that the previous version left exposed: a pattern's own
+replacement, then another rule's marker, then the sentinel itself. The lesson is
+in the invariant above — it is stated over the *set* of strings the engine can
+write, so it does not need to be restated the next time one is added.
+
+### Fail closed means redact *more*
+
+When the subject cannot be resolved, every subject-conditioned rule applies. At
+`/pre` failing closed means denying; here it means withholding, so the caller
+the control plane cannot name receives the most redacted payload rather than the
+least. Both are fail-closed; they point opposite ways because one gates an
+action and the other gates what comes back.
+
+### Why `compileOutputPolicy` throws
+
+A redaction rule that matches nothing looks exactly like a payload with nothing
+sensitive in it — the demo still runs, the panel still lights up green, and the
+account number is in the model's context. So compilation is loud, and lists
+every problem at once: a toolkit or tool the catalogue does not list (tool names
+are case-sensitive — `Loan.get_loan` is not a tool and is refused), a rule with
+neither fields nor patterns, a malformed field path, a field path repeated
+within a rule, an unparseable regex, a regex that matches the empty string (it
+would rewrite every string it was pointed at), the sticky flag (it would scan
+only from position 0), a marker some co-applicable pattern matches, a pattern
+that can match the withheld sentinel, a duplicate pattern id, a subject matcher that can never match, an empty `reason`, a
+duplicate rule id — and `remove` on an array element addressed by index, which
+renumbers the elements after it and so does not mean the same thing twice.
+
+The same loudness gap the PolicyEngine has applies here: the engine holds no
+roster, so a misspelled *role* or *user id* in `subjects` cannot be caught at
+compile time. Both engines share one definition of subject matching
+(`src/subjects.ts`) so they cannot drift about who a rule governs.
+
 ## GrantChecker (`src/grant-checker.ts`, #10)
 
 Pure, clock injected. Does a grant authorise **this** call?
