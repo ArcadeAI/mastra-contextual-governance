@@ -183,6 +183,84 @@ pins both halves of the guard on both sides, and CI hands the token to the
 way; the guard fires on the first request that needs the token, which is any
 view of an approval.
 
+## Driving the two beats locally
+
+Three terminals. No Arcade account, no network, no secrets to set: `apps/hooks`
+and the stand-in both fall back to the same development bearers outside
+production.
+
+Pick your own ports — every service reads `PORT` and this worktree owns a block
+of ten. The ports below are examples; substitute yours.
+
+**Terminal 1 — the control plane.** Owns `governance.db`, serves the hooks and
+the four `/approvals` endpoints.
+
+```sh
+PORT=4401 GOVERNANCE_DB_PATH=/tmp/cg/governance.db bun apps/hooks/src/index.ts
+```
+
+**Terminal 2 — the Arcade stand-in.** Prints the port it bound. It is a
+development fixture, and it says so on every boot.
+
+```sh
+PORT=4402 HOOKS_PUBLIC_HOST=localhost:4401 bun run --cwd apps/web arcade-stand-in
+```
+
+Leave `PORT` off and it binds `:0` and tells you what it got.
+
+**Terminal 3 — the web app**, pointed at the stand-in. `ARCADE_API_KEY` must be
+non-empty; the stand-in ignores the value.
+
+```sh
+PORT=4400 HOOKS_PUBLIC_HOST=localhost:4401 \
+  ARCADE_API_URL=http://localhost:4402 ARCADE_API_KEY=offline \
+  bun run --cwd apps/web dev
+```
+
+Now create the escalation act 2 produces — normally `tools/approvals` writes
+this after the pre-hook refuses Dana, and here you write it directly:
+
+```sh
+curl -s -X POST http://localhost:4401/approvals \
+  -H "authorization: Bearer cg-approvals-store-dev-token-not-for-production" \
+  -H 'content-type: application/json' \
+  -d '{"requester_id":"dana.okafor@bank.example","action":"approve_loan",
+       "resource_id":"LN-2291","amount":95000,
+       "justification":"Eleven years in business, 742 credit score.",
+       "approver_id":"riley.chen@bank.example",
+       "candidate_approver_ids":["riley.chen@bank.example","morgan.ellis@bank.example"],
+       "required_clearance":95000}'
+```
+
+It answers with the record; take the `id` and open
+`http://localhost:4400/approvals/<id>`.
+
+**Beat one — Riley approves.** The page opens acting as Riley Chen, the routed
+approver. Press **Approve**. You get *Decision recorded*, the status chip turns
+`approved`, and `governance.db` now holds a grant — `active`, single use,
+pinned to `LN-2291`, ceiling 95,000.
+
+**Beat two — Dana is refused.** Create a second request with the same curl.
+On its page, switch **Act as** to *Dana Okafor* and press **Approve**. You get
+the `CHECK_FAILED` screen carrying the pre-hook's own words —
+*"Dana Okafor raised this approval request, and separation of duties means the
+person who asks cannot also be the person who approves"* — plus the `[ref evt_…]`
+token that joins it to the audit row. The request stays `pending`.
+
+That refusal is the actual policy in `governance.db` refusing, reached through
+the actual `/pre`. The stand-in cannot answer at all without asking first: see
+`scripts/arcade-stand-in.ts`, which the test suite imports rather than
+duplicating, so what you see here and what `bun test` pins are one
+implementation.
+
+To watch the decisions land:
+
+```sh
+sqlite3 /tmp/cg/governance.db \
+  "SELECT hook, user_id, tool, decision, rule_id FROM audit_log ORDER BY seq DESC LIMIT 5;"
+sqlite3 /tmp/cg/governance.db "SELECT id, status, authorizes, uses_remaining FROM grants;"
+```
+
 ### Unverified
 
 `lib/arcade.ts` has never spoken to `api.arcade.dev`: #13 registers the gateway and the

@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "bun scripts/next.ts dev",
+    "arcade-stand-in": "bun scripts/arcade-stand-in.ts",
     "build": "next build",
     "start": "bun scripts/next.ts start",
     "typecheck": "tsc --noEmit",

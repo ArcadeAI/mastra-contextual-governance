@@ -23,6 +23,11 @@
  * control that appears to work while doing nothing, and a denial rendered as
  * "something went wrong" would hide the control that did.
  *
+ * A failure whose cause we can name, we name: an unset `ARCADE_API_KEY`
+ * produces a bare `401` that reads like a permissions problem and is not one,
+ * so the message says the key is unset and points at the offline stand-in. See
+ * `explain` below — it touches failures only, never a refusal's wording.
+ *
  * ## What is unverified here
  *
  * #13 registers the gateway and the provider; until it lands, nothing has
@@ -105,7 +110,30 @@ export async function decideThroughArcade(
   const message = error?.message ?? body.error?.message ?? `Arcade answered ${response.status}.`;
   return isCheckFailed(body, message)
     ? { outcome: "refused", message }
-    : { outcome: "failed", message };
+    : { outcome: "failed", message: explain(message, config) };
+}
+
+/**
+ * A failure message with its likeliest cause named, when we can name it.
+ *
+ * Only ever applied to a **failure**. A refusal is the control plane speaking
+ * and its words are the hook author's, untouched; nothing here may edit those
+ * or turn one kind of answer into the other.
+ *
+ * The cause worth naming is an unset `ARCADE_API_KEY`, because it produces a
+ * bare `401` that reads like a permissions problem and is not one. A human
+ * following this repo's own instructions hit exactly that: the page said
+ * "Arcade answered 401" and nothing said the key was empty or that there is an
+ * offline path. It is still a fault — no control has spoken — and the screen
+ * says so.
+ */
+function explain(message: string, config: WebConfig): string {
+  if (config.arcadeApiKey !== "") return message;
+  return (
+    `${message} ARCADE_API_KEY is unset, so this call carried no credential — which is the ` +
+    `likeliest cause. Set it, or run the offline stand-in and point ARCADE_API_URL at it: ` +
+    `see "Driving the two beats locally" in apps/web/README.md. Nothing was decided either way.`
+  );
 }
 
 /**

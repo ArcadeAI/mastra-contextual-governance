@@ -17,6 +17,11 @@
  * by the actual pre-hook against the actual policy — the only fiction is the
  * transport.
  *
+ * That stand-in lives in `scripts/arcade-stand-in.ts` and is imported here
+ * rather than duplicated, because it is also the thing a person runs to drive
+ * the two beats by hand (see `apps/web/README.md`). One implementation means
+ * the demo a human sees and the behaviour this suite pins cannot diverge.
+ *
  * What that leaves unverified is stated plainly and is not pretended away:
  * nothing here has spoken to `api.arcade.dev`. #13 registers the gateway and
  * the provider; until then the live round trip has no test in this repo.
@@ -26,10 +31,12 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { WebConfig } from "../lib/config.ts";
+import { createArcadeStandIn } from "../scripts/arcade-stand-in.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(HERE, "..", "..", "..");
 
+export const REPO = REPO_ROOT;
 export const HOOK_SECRET = "hook-secret-for-web-tests";
 export const STORE_TOKEN = "store-token-for-web-tests";
 
@@ -52,7 +59,15 @@ export interface Harness {
 export async function startHarness(): Promise<Harness> {
   const hooks = await startHooks();
   const preCalls: Harness["preCalls"] = [];
-  const arcade = startArcade(hooks.host, preCalls);
+  // The same stand-in a person runs from `bun run --cwd apps/web arcade-stand-in`,
+  // in process. One implementation, so what the suite proves and what the
+  // README tells someone to do cannot drift apart.
+  const arcade = createArcadeStandIn({
+    hooksHost: hooks.host,
+    hookSigningSecret: HOOK_SECRET,
+    approvalsStoreToken: STORE_TOKEN,
+    onExecute: (call) => preCalls.push(call),
+  });
 
   const config: WebConfig = {
     hooksHost: hooks.host,
@@ -107,12 +122,12 @@ export const ESCALATION = {
 // The real control plane, as a subprocess
 // ---------------------------------------------------------------------------
 
-interface Hooks {
+export interface Hooks {
   host: string;
   process: Subprocess<"ignore", "pipe", "pipe">;
 }
 
-async function startHooks(): Promise<Hooks> {
+export async function startHooks(): Promise<Hooks> {
   const child = spawn({
     cmd: ["bun", join(REPO_ROOT, "apps", "hooks", "src", "index.ts")],
     cwd: REPO_ROOT,
@@ -132,12 +147,20 @@ async function startHooks(): Promise<Hooks> {
     stderr: "pipe",
   });
 
-  const port = await readPort(child);
+  const { port } = await readPort(child);
   return { host: `localhost:${port}`, process: child };
 }
 
-/** Reads `listening on :<port>` off the service's own boot line. */
-async function readPort(child: Subprocess<"ignore", "pipe", "pipe">): Promise<number> {
+/**
+ * Reads `listening on :<port>` off a service's own boot line.
+ *
+ * Every process this suite starts binds `:0` and prints what the OS gave it,
+ * so nothing here picks a number — this worktree owns a block of ten ports and
+ * another worktree owns a different block.
+ */
+export async function readPort(
+  child: Subprocess<"ignore", "pipe", "pipe">,
+): Promise<{ port: number; banner: string }> {
   const decoder = new TextDecoder();
   const reader = child.stdout.getReader();
   let buffered = "";
@@ -149,86 +172,13 @@ async function readPort(child: Subprocess<"ignore", "pipe", "pipe">): Promise<nu
       if (done) break;
       buffered += decoder.decode(value, { stream: true });
       const match = /listening on :(\d+)/.exec(buffered);
-      if (match) return Number(match[1]);
+      // The banner comes back with the port so a caller can assert on what the
+      // process said about itself, without racing the same stream twice.
+      if (match) return { port: Number(match[1]), banner: buffered };
     }
   } finally {
     clearTimeout(deadline);
     reader.releaseLock();
   }
   throw new Error(`apps/hooks did not report a port. Output so far:\n${buffered}`);
-}
-
-// ---------------------------------------------------------------------------
-// Arcade, as the engine behaves for a tool with no auth requirement
-// ---------------------------------------------------------------------------
-
-function startArcade(hooksHost: string, preCalls: Harness["preCalls"]) {
-  return Bun.serve({
-    port: 0,
-    async fetch(request) {
-      const { pathname } = new URL(request.url);
-      if (pathname !== "/v1/tools/execute") {
-        return Response.json({ error: "not found" }, { status: 404 });
-      }
-
-      const body = (await request.json()) as {
-        tool_name: string;
-        input: Record<string, unknown>;
-        user_id: string;
-      };
-      const [toolkit, name] = body.tool_name.split(".");
-      preCalls.push({ user_id: body.user_id, tool: body.tool_name });
-
-      // 1. The pre-execution hook, exactly as the engine calls it.
-      const pre = await fetch(`http://${hooksHost}/pre`, {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: `Bearer ${HOOK_SECRET}` },
-        body: JSON.stringify({
-          execution_id: `tc_${Math.random().toString(36).slice(2, 10)}`,
-          tool: { name, toolkit, version: "1.0.0" },
-          inputs: body.input,
-          context: { authorization: [{}], user_id: body.user_id },
-        }),
-      });
-      const verdict = (await pre.json()) as { code: string; error_message?: string };
-
-      if (verdict.code !== "OK") {
-        return Response.json({
-          success: false,
-          output: {
-            error: {
-              message: verdict.error_message ?? "denied",
-              code: "CHECK_FAILED",
-              can_retry: false,
-            },
-          },
-        });
-      }
-
-      // 2. The tool itself. `Approvals.Decide` is a stateless client of the
-      //    store, so running it is one HTTP call — the same one the deployed
-      //    Python worker makes, with `decided_by` taken from the identity
-      //    Arcade supplies and never from an argument.
-      const recorded = await fetch(
-        `http://${hooksHost}/approvals/${String(body.input.request_id)}/decision`,
-        {
-          method: "POST",
-          headers: { "content-type": "application/json", authorization: `Bearer ${STORE_TOKEN}` },
-          body: JSON.stringify({
-            decision: body.input.decision,
-            note: body.input.note ?? null,
-            decided_by: body.user_id,
-          }),
-        },
-      );
-      const payload = (await recorded.json()) as { request?: unknown; error?: string };
-      if (!recorded.ok) {
-        return Response.json({
-          success: false,
-          output: { error: { message: payload.error ?? "the approvals store refused", can_retry: false } },
-        });
-      }
-      return Response.json({ success: true, output: { value: payload.request } });
-    },
-  });
 }

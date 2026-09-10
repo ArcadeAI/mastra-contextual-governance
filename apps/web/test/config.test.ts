@@ -98,6 +98,22 @@ describe("both services guard production the same way", () => {
     }
   });
 
+  test("the stand-in's copies of both development bearers match the control plane's", () => {
+    // `scripts/arcade-stand-in.ts` calls /pre and the approvals store, so it
+    // carries both development literals for the zero-configuration local run.
+    // Three copies of two strings is drift waiting to happen, and a stand-in
+    // whose hook bearer had drifted would fail with a 401 that looks like a
+    // governance decision and is not one.
+    const hooks = sourceOf("apps", "hooks", "src", "config.ts");
+    const standIn = sourceOf("apps", "web", "scripts", "arcade-stand-in.ts");
+
+    for (const literal of ["DEV_SECRET", "DEV_STORE_TOKEN"] as const) {
+      const value = new RegExp(`const ${literal} = "([^"]+)"`).exec(hooks)?.[1];
+      expect(value, `apps/hooks defines ${literal}`).toBeString();
+      expect(standIn).toContain(`"${value as string}"`);
+    }
+  });
+
   test("apps/hooks refuses to boot in production without a real one", () => {
     expect(sourceOf("apps", "hooks", "src", "config.ts")).toContain(
       "APPROVALS_STORE_TOKEN is required in production",

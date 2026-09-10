@@ -48,6 +48,14 @@ export function DecideControls({
         <select
           id="persona"
           name="persona"
+          // Keyed on the persona so a switch remounts the select. `defaultValue`
+          // is honoured at mount only, and this is a client component that
+          // React reconciles rather than remounts when the server re-renders
+          // with a new cookie — so without the key the dropdown keeps saying
+          // "Riley" while the panel above it says "Acting as Dana Okafor".
+          // Two widgets disagreeing about who you are, in the one demo whose
+          // whole point is who you are.
+          key={actingAs}
           defaultValue={actingAs}
           style={{ ...pageStyles.button, padding: "0.4rem 0.6rem" }}
         >
