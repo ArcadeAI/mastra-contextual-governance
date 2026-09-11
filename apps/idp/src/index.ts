@@ -8,8 +8,8 @@
  * the JSON calls Better Auth expects, and answers `/health`. Nothing here knows
  * what a loan is or who is allowed to do what.
  */
-import { createAuth, CONSENT_PAGE, LOGIN_PAGE } from "./auth.ts";
-import { ensureOAuthClient, findClientName } from "./client.ts";
+import { createAuth, CONSENT_PAGE, ID_TOKEN_ALG, JWKS_PATH, LOGIN_PAGE } from "./auth.ts";
+import { CLIENT_SECRET_STATE_MESSAGE, ensureOAuthClient, findClientName } from "./client.ts";
 import { readConfig, usingDevSecret } from "./config.ts";
 import { countPeople, openPeople } from "./db.ts";
 import { renderConsentPage, renderLoginPage, renderMessagePage } from "./pages.ts";
@@ -198,6 +198,15 @@ const server = Bun.serve({
           authorize: `${config.baseURL}/oauth2/authorize`,
           token: `${config.baseURL}/oauth2/token`,
           userinfo: `${config.baseURL}/oauth2/userinfo`,
+          jwks: `${config.baseURL}${JWKS_PATH}`,
+          id_token_signing_alg: ID_TOKEN_ALG,
+          // What happened to the stored client secret when this process
+          // booted. `rotated` is the one that costs a human a re-registration
+          // in the Arcade dashboard, and #70 exists because that is otherwise
+          // indistinguishable from a service that came up fine (the failure
+          // lands at the authorize step, where no hook fires).
+          client_secret_state: client.secretState,
+          client_secret_note: CLIENT_SECRET_STATE_MESSAGE[client.secretState],
         },
       });
     }
@@ -228,6 +237,15 @@ const server = Bun.serve({
 console.log(
   `[${SERVICE}] listening on :${server.port} — issuer ${config.baseURL}, ` +
     `${countPeople(db)} people in ${config.dbPath}, ` +
-    `OAuth client ${client.clientId} (${client.created ? "created" : "existing"})` +
+    `OAuth client ${client.clientId} (${client.created ? "created" : "existing"}), ` +
+    `JWKS ${config.baseURL}${JWKS_PATH} (${ID_TOKEN_ALG})` +
     (usingDevSecret(config) ? " — using the development secret" : ""),
 );
+
+// Its own line, and on stderr when it is the one that costs a human something,
+// so `render logs` shows it without anyone having to know to look. The secret
+// itself is never printed here, whatever happened to it — `bun run
+// oauth-client --rotate` is the only thing that prints one.
+const secretLine = `[${SERVICE}] OAuth client secret: ${CLIENT_SECRET_STATE_MESSAGE[client.secretState]}`;
+if (client.secretState === "rotated") console.error(secretLine);
+else console.log(secretLine);

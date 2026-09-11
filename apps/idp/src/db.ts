@@ -17,8 +17,10 @@ import fixture from "./fixtures/people.json" with { type: "json" };
 // Generated from the installed Better Auth by `scripts/generate-schema.ts`;
 // `test/schema.test.ts` fails when it is stale. Checked in rather than built
 // at boot because the seed has to create the schema itself, inside the seed
-// transaction — see `seed`.
-import SCHEMA from "./schema.sql" with { type: "text" };
+// transaction — see `seed`. Kept byte-identical to what the library compiles,
+// so `generate:check` stays a real comparison; `idempotentSchema` below is
+// what actually runs.
+import GENERATED_SCHEMA from "./schema.sql" with { type: "text" };
 
 const personSchema = z.object({
   persona: z.enum(["dana", "sam", "riley", "morgan"]),
@@ -70,10 +72,15 @@ export function loadPeople(env: Record<string, string | undefined> = process.env
 
 /**
  * Tables that hold *people and their state*, in an order that respects the
- * foreign keys. `resetPeople` clears exactly these. Not on the list, on
- * purpose: `oauthClient` — the credentials Arcade holds. Rotating them breaks
- * OAuth right after a reset, at the authorize step, where no hook fires and
- * nothing on screen says why.
+ * foreign keys. `resetPeople` clears exactly these. Two tables are off the
+ * list on purpose:
+ *
+ *   - `oauthClient` — the credentials Arcade holds. Rotating them breaks OAuth
+ *     right after a reset, at the authorize step, where no hook fires and
+ *     nothing on screen says why.
+ *   - `jwks` — the ID-token signing keys (#70). Clearing them mints a new key
+ *     pair on the next signature, and an Arcade User Source that had cached
+ *     the old key set would reject the ID token. Same failure, one layer down.
  */
 const PEOPLE_TABLES = [
   "oauthAccessToken",
@@ -86,8 +93,115 @@ const PEOPLE_TABLES = [
 ] as const;
 
 /**
+ * The three statement forms Better Auth's SQLite migration compiler emits,
+ * and the idempotent spelling of each.
+ *
+ * Ordered so the longer prefix is tried first: `create unique index "` also
+ * begins with `create `, and matching the wrong rule would produce SQL that
+ * does not parse.
+ */
+const IDEMPOTENT_FORMS = [
+  ["create table \"", "create table if not exists \""],
+  ["create unique index \"", "create unique index if not exists \""],
+  ["create index \"", "create index if not exists \""],
+] as const;
+
+/**
+ * Rewrites the generated DDL so replaying it against a database that already
+ * holds some of it is a no-op rather than an error.
+ *
+ * `schema.sql` is the library's own output and stays byte-identical to it, so
+ * `generate:check` keeps comparing like with like; `CREATE ... IF NOT EXISTS`
+ * is not something Better Auth's compiler emits, so the idempotent form is
+ * derived here instead of being checked in.
+ *
+ * **Throws on a statement it does not recognise**, at import time. The whole
+ * point of the upgrade path is that a missing table appears; a statement this
+ * function quietly dropped would be a table that never does — a thing that
+ * looks exactly like a schema that is already current. Better a service that
+ * refuses to start and names the statement.
+ *
+ * Exported for the test that feeds it an unrecognised statement.
+ */
+export function idempotentSchema(generated: string): string {
+  const statements = generated
+    // The generated file opens with a `--` comment block, which would
+    // otherwise ride along on the front of the first statement.
+    .replace(/^(?:--[^\n]*\n)+/, "")
+    .split(";")
+    .map((statement) => statement.trim())
+    .filter(Boolean);
+
+  return statements
+    .map((statement) => {
+      const form = IDEMPOTENT_FORMS.find(([prefix]) => statement.startsWith(prefix));
+      if (!form) {
+        throw new Error(
+          `idp.db schema: cannot make this statement idempotent, so the upgrade path ` +
+            `would skip it silently — teach idempotentSchema about it: ${statement.slice(0, 120)}`,
+        );
+      }
+      return `${form[1]}${statement.slice(form[0].length)};`;
+    })
+    .join("\n\n");
+}
+
+/**
+ * The DDL that actually runs, in both bootstrap paths: inside `seed()`'s
+ * transaction on a fresh database, and on its own against a database that
+ * predates a table added since. See `SCHEMA_VERSION`.
+ */
+const SCHEMA = idempotentSchema(GENERATED_SCHEMA);
+
+/**
+ * The schema revision this build writes, recorded in `PRAGMA user_version`.
+ * Bump it in the same commit as any change to `src/schema.sql` or to
+ * `upgradeSchema`.
+ *
+ * Version 1 is the schema at #70 — Better Auth's tables, the OAuth provider
+ * plugin's, and `jwks` from the JWT plugin. A database written before this
+ * existed reads back 0, the SQLite default, which is exactly the "needs the
+ * upgrade path" answer, so no disk has to be touched by hand to adopt this.
+ *
+ * **What this buys: new tables and new indexes.** An added column, a widened
+ * `CHECK`, a renamed index — none of those are expressible as
+ * `CREATE ... IF NOT EXISTS`, none of them happen at boot, and each still
+ * needs a guarded `ALTER TABLE` here (the way `apps/loan-app` does it) or a
+ * reset.
+ */
+export const SCHEMA_VERSION = 1;
+
+/** The schema revision recorded on disk. 0 on anything written before #70. */
+export function readSchemaVersion(db: Database): number {
+  return db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version ?? 0;
+}
+
+/**
+ * Thrown at boot, before the port opens, when `idp.db` is not one this build
+ * can bring forward. Names the file and the way out, because the alternative
+ * is a `SQLiteError: no such table` from the first request that needs the
+ * missing piece, a crash loop, and a Render Shell that will not attach to a
+ * service that keeps exiting (#60, measured on `cg-hooks`).
+ */
+export class SchemaTooNewError extends Error {
+  constructor(
+    readonly path: string,
+    readonly found: number,
+  ) {
+    super(
+      `idp.db at ${path} was written by a newer build (PRAGMA user_version ${found}; ` +
+        `this build understands ${SCHEMA_VERSION}) and cannot be migrated backwards. ` +
+        `Reset it: stop the service, delete ${path} (and its -wal and -shm siblings), ` +
+        `and restart — the fixture reseeds on an empty disk. Note that deleting the file ` +
+        `also rotates the OAuth client, so Arcade has to be re-registered afterwards.`,
+    );
+    this.name = "SchemaTooNewError";
+  }
+}
+
+/**
  * Opens the people database, bootstrapping it from the fixture only when it
- * has no schema.
+ * has no schema, and bringing an older schema forward when it has one.
  *
  * Seed-if-empty rather than seed-on-boot: `idp.db` lives on a Render disk, so
  * a consent granted on stage is still there after a restart. Getting back to a
@@ -101,9 +215,51 @@ export async function openPeople(path: string, people: PersonSeed[] = loadPeople
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
 
-  if (!hasSchema(db)) await seed(db, people);
+  try {
+    if (hasSchema(db)) upgradeSchema(db, path);
+    else await seed(db, people);
+  } catch (cause) {
+    // Leave no half-open handle behind: the caller is about to exit, and a
+    // lingering WAL lock is one more thing between a crash-looping service
+    // and somebody deleting the file.
+    db.close();
+    throw cause;
+  }
 
   return db;
+}
+
+/**
+ * Brings a database created by an earlier schema up to the current one,
+ * keeping every row.
+ *
+ * `hasSchema` only asks whether the `user` table exists, which is the right
+ * question for "is this seeded?" and the wrong one for "is this current?".
+ * Before #70 that was the only question anyone asked, and `seed()` was the
+ * only thing that ran the DDL — so a table added after a disk existed could
+ * never be created on it (#69). The JWT plugin adds exactly such a table,
+ * `jwks`: on the live `cg-idp` disk this code would have come up green and
+ * crash-looped on the first authorize, which is what `cg-hooks` did on #60.
+ * What is "current" is `PRAGMA user_version`, not one table's existence.
+ *
+ * Additive and idempotent, and nothing else: replaying `SCHEMA`, which is
+ * `CREATE ... IF NOT EXISTS` throughout, so a table or index added after this
+ * disk existed simply appears.
+ *
+ * **No inserts.** The rows on this disk are the state the demo is in, and
+ * `resetPeople` is what re-seeds people — deliberately, never at boot.
+ */
+function upgradeSchema(db: Database, path: string): void {
+  const found = readSchemaVersion(db);
+  if (found > SCHEMA_VERSION) throw new SchemaTooNewError(path, found);
+  if (found === SCHEMA_VERSION) return;
+
+  // One transaction, so a half-applied upgrade rolls back to a database that
+  // still reads its old version and tries again on the next boot.
+  db.transaction(() => {
+    db.exec(SCHEMA);
+    db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+  })();
 }
 
 function hasSchema(db: Database): boolean {
@@ -157,6 +313,9 @@ export async function seed(db: Database, people: PersonSeed[]): Promise<void> {
 
   db.transaction(() => {
     db.exec(SCHEMA);
+    // Inside the same transaction as the DDL and the rows, so the version is
+    // recorded if and only if both landed.
+    db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     insertPeople(db, hashed);
   })();
 }
