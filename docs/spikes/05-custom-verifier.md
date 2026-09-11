@@ -1,48 +1,54 @@
 # Spike 05 — one tool call as Dana: the User Source at hop 1, the custom verifier at hop 2
 
-**Status: hop 1 completes. Hop 2's verification works; its token exchange does not, yet.**
+**Status: hop 1 completes. Hop 2 calls the verifier and the verifier works; the
+grant behind it does not store, yet.**
 
 This spike is about **one full tool call as Dana through `cg-demo-us`, with a
 `/pre` payload carrying `user_id` = her lowercase email.** That call has not
-happened. What did happen is that every step before it is now measured, and the
-gap is one field wide.
+happened. Everything in front of it is now measured, and what is left is a
+one-field data-entry error in an Arcade dashboard.
 
-Getting there crosses two hops, governed by two different mechanisms that round 1
-of this spike ran together:
+Two hops, two mechanisms, which round 1 of this spike ran together:
 
 | | Hop | Mechanism | Where it stands |
 |---|---|---|---|
-| **1** | MCP client → gateway `cg-demo-us` | **User Source** `cg-idp` | **measured, and it works.** Dana signs in at our IdP, Arcade issues a gateway token, eight tools list, and every `/access` frame carries her lowercase email. #61 was the fix |
-| **2** | tool-level OAuth, `cg-idp` auth provider | **custom user verifier** | **measured up to Arcade's default verifier.** The IdP session is reused silently; Arcade then routes to `callback_verify`, which without a custom route sends the persona to `account.arcade.dev`. What a *saved* route does is still unmeasured |
+| **1** | MCP client → gateway `cg-demo-us` | **User Source** `cg-idp` | **works.** Dana signs in at our IdP, Arcade issues a gateway token, eight tools list, and all 8278 `/access` frames carry her lowercase email. #61 was the fix |
+| **2** | tool-level OAuth, `cg-idp` auth provider | **custom user verifier** | **half works.** Arcade calls the verifier, the verifier proves who she is, `confirm_user` accepts it. The token exchange behind it fails, so the tool never runs |
 
-Round 1 asked whether a custom verifier moves the *hop 1* login. That question is
-answered — it does not, the User Source does — and it was the wrong question. A
-verifier is what lets someone who is **not an Arcade project member** authorize a
-*tool*. Hop 2's chain now shows that is exactly what our personas are:
+Round 1 asked whether a custom verifier moves the *hop 1* login. It does not — the
+User Source does — and it was the wrong question. A verifier is what lets someone
+who is **not an Arcade project member** authorize a *tool*, and hop 2's chain shows
+that is exactly what our personas are. With no custom route configured:
 
 > ```
 > 302 → cloud.arcade.dev/api/v1/oauth/<provider-id>/callback
-> 303 → cloud.arcade.dev/api/v1/oauth/callback_verify?flow_id=4bb88623-…
+> 303 → cloud.arcade.dev/api/v1/oauth/callback_verify?flow_id=…
 > 303 → auth.arcade.dev/self-service/login/browser
 > 303 → account.arcade.dev/login          ← Arcade's account wall
 > ```
 
-**`callback_verify` is the verifier's hook point**, and the `flow_id` a custom
-verifier is documented to receive is already on its query string. **A User Source
-persona does not bypass it**: hop 1's identity does not carry into hop 2 at all.
-That settles the question this document previously left open as "the verifier may
-turn out to be unnecessary" — it is necessary, and it is load-bearing for #14.
+**`callback_verify` is the verifier's hook point**, and **a User Source persona does
+not bypass it** — hop 1's identity does not carry into hop 2 at all. That settles
+what this document previously left open as "the verifier may turn out to be
+unnecessary": it is necessary, and `apps/web` needs one.
 
-What is left is narrow and one run away:
+Where the four hop-2 questions landed:
 
-- **H2-a** — with the route saved, does `callback_verify` redirect to the verifier
-  instead of to `account.arcade.dev`? **Unmeasured.** The route has never been saved.
+- **H2-a** — with the route saved, does Arcade redirect to the verifier? **Measured,
+  yes.** `303 → <tunnel>/verify?flow_id=…`, with `callback_verify` and
+  `account.arcade.dev` gone from the chain. Arcade sends exactly one parameter.
 - **H2-b** — does `confirm_user` complete the flow and let the tool call through?
-  **Unmeasured.**
-- **H2-c** — is `context.user_id` on the `/pre` payload the exact lowercase email
-  the verifier confirmed? **Unmeasured.** `/access` already carries it; `/pre` needs
-  the tool to actually run.
+  **Half measured.** `confirm_user` returns 200 with no `user_mismatch` for the
+  address our IdP asserted, and the browser reaches `callback_success`. The tool
+  still refuses, because Arcade's own token exchange at our IdP fails. **Three
+  causes found and fixed in sequence; the third is a Client ID field holding a URL.**
+- **H2-c** — is `/pre`'s `context.user_id` the email the verifier confirmed?
+  **Unmeasured.** `/access` carries it on every frame; `/pre` has never fired for a
+  loan tool, because a layer-2 refusal produces no hook.
 - **H2-d** — a second persona without logging the first out? **Unmeasured.**
+
+One answer that came free and matters: **Dana authenticates once.** Hop 2's leg at
+our IdP is a bare `302` — hop 1's session is reused, zero pages rendered.
 
 Resolves [#75](https://github.com/ArcadeAI-labs/mastra-contextual-governance/issues/75).
 Follows [#65](https://github.com/ArcadeAI-labs/mastra-contextual-governance/issues/65)
@@ -57,9 +63,10 @@ Scripts, all discardable, all outside `apps/`:
 | [`evidence/05-verifier-flow.ts`](evidence/05-verifier-flow.ts) | walks a gateway's authorization chain, both hops, and names the host that rendered every page |
 | [`evidence/05-redirect-allowlist.ts`](evidence/05-redirect-allowlist.ts) | reads an OAuth client's redirect-URI allowlist from outside, unauthenticated |
 | [`evidence/05-token-auth-methods.ts`](evidence/05-token-auth-methods.ts) | maps `apps/idp`'s token-endpoint refusals to causes. Self-contained: boots its own IdP, needs no credential |
-| [`evidence/05-drive.ts`](evidence/05-drive.ts) | the browserless user agent, carried forward from spike 04 with two fixes |
+| [`evidence/05-auth-provider-config.ts`](evidence/05-auth-provider-config.ts) | reads an Arcade auth provider's stored configuration back, read-only, secrets scrubbed |
+| [`evidence/05-drive.ts`](evidence/05-drive.ts) | the browserless user agent, carried forward from spike 04 with three fixes |
 
-Two of those are runnable right now from a clean checkout with nothing configured:
+Three of those are runnable right now from a clean checkout with nothing configured:
 
 ```sh
 bun docs/spikes/evidence/05-token-auth-methods.ts        # exits 0, boots and tears down its own IdP
@@ -249,9 +256,10 @@ byte-equal to the address `apps/idp` holds and to the one `loans.db` will record
 **This is layer 1, not layer 3** — `/pre` needs the tool to actually execute, and
 hop 2 is what stands between here and there.
 
-## Hop 2 — the custom verifier. Measured up to Arcade's default
+## Hop 2 — the custom verifier. Called, correct, and one field short
 
-This is what the spike is for, and it is the part that has not happened.
+This is what the spike is for. Arcade calls the verifier, the verifier does its job,
+and the tool still will not run.
 
 ### What exists
 
@@ -280,15 +288,27 @@ already signs Dana in at `cg-idp-or5b.onrender.com`, so the browser arriving at
 again is only answerable on the same origin. A local IdP answers a different
 question.
 
-**The one manual step.** `confirm_user` is authenticated with the Arcade project
-API key, which the implementer of a spike does not hold and must not. With
-`ARCADE_API_KEY` set the verifier makes the call itself — that is the production
-path and the code a real deployment runs. Without one it prints the exact `curl`
-with the real `flow_id` and `user_id`, parks the browser, and resumes when the
-response is posted back to `POST /confirm`. One human action per flow, and the same
-code runs afterwards either way, so the manual path is not a second design. **This
-spike will use the manual path**, and the write-up says so rather than implying an
-automated flow was observed.
+**Who calls `confirm_user`, and why it is not a human.** The call is authenticated
+with the Arcade project API key. The verifier reads it from the same untracked,
+gitignored file as the IdP credentials — written by the human, never opened by the
+implementer, never printed; `/state` reports only `arcade_api_key_present`. With the
+key present the call is one in-flow HTTPS request, which is the production shape and
+the code `apps/web` will run.
+
+The manual alternative is still implemented, and this spike measured that it does
+not reliably work. Run by hand at roughly the same delay twice, `confirm_user`
+returned 200 once and `{"code":400,"msg":"Bad request"}` the next time, for a flow
+Arcade still recognised minutes later. **Arcade accepts the call only while the flow
+awaits verification, and that window is narrower than a human's turnaround.** Two
+related traps came out of the same attempts, both now handled:
+
+- The verifier used to park the *browser* on the request until the answer arrived.
+  It cannot: Bun caps `idleTimeout` at 255s, the user agent gives up first, and the
+  flow is left half-done with nobody holding it. It now answers immediately and
+  `POST /confirm` finishes the job server-side.
+- **Arcade does not finalise the grant until something fetches `next_uri`.** A
+  `confirm_user` that returned 200 with `{auth_id, next_uri}` left the tool
+  unauthorized because nothing landed on `callback_success`.
 
 ### Without a custom verifier: Arcade's account wall
 
