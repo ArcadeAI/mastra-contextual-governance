@@ -66,10 +66,15 @@ client bundle while Render supplies service variables at runtime, so one would b
 | unset (default) | `/api/governance/fixture-stream` — this app, replaying #5's fixture sequence |
 | `hooks` | `http(s)://$HOOKS_PUBLIC_HOST/events` |
 
-**Fixture is the default deliberately.** `apps/hooks` does not serve `/events` yet —
-that is #20 — so defaulting to it would open the panel on a connection that cannot
-succeed, which reads as a broken app rather than an unfinished one. When #20 lands,
-flip the default.
+**Fixture is the default deliberately.** `apps/hooks` *does* serve `/events` — the
+stream half of #20 landed on #54 — but it is a second service with a database of its
+own, and most of the time a fresh clone does not have it running. Defaulting to it would
+open the panel on a connection retrying against nothing, which reads as a broken app
+rather than as a control plane nobody started. Opting in is two variables:
+
+```sh
+GOVERNANCE_STREAM=hooks HOOKS_PUBLIC_HOST=localhost:4411 bun run --cwd apps/web dev
+```
 
 The panel labels which mode it is in. A rehearsal must not mistake a replay for the
 live control plane.
@@ -137,8 +142,9 @@ reconnect timing is the browser's rather than ours — on stage that is an outag
 unpredictable length in the middle of an act. `fetch` over a `ReadableStream` gives both
 back, and makes the whole path testable against a real server instead of a stub.
 
-`lib/governance/subscribe.ts` is the only file that knows the wire contract, so when #20
-settles the endpoint, one file changes.
+`lib/governance/subscribe.ts` is the only file that knows the wire contract, and
+`apps/hooks/src/events.ts` is the only file that writes it — #54 implemented that shape
+rather than negotiating a new one, so the two halves have never had to be reconciled.
 
 ## Fonts
 

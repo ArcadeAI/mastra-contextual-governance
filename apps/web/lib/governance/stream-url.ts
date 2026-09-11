@@ -14,7 +14,7 @@ import { assertPublicHost } from "../public-host.ts";
 /** The no-backend stream, served by this app from #5's fixture sequence. */
 export const FIXTURE_STREAM_PATH = "/api/governance/fixture-stream";
 
-/** The hook server's stream. Owned by #20; see `subscribe.ts` for the frames. */
+/** The hook server's stream, live since #54. See `subscribe.ts` for the frames. */
 export const HOOKS_STREAM_PATH = "/events";
 
 export type StreamMode = "fixture" | "hooks";
@@ -33,12 +33,14 @@ function baseUrl(host: string): string {
 /**
  * Where to point the panel, given the process environment.
  *
- * **Fixture is the default, deliberately.** `apps/hooks` does not serve
- * `/events` yet — that is #20, still open — so defaulting to the hook server
- * would make a fresh clone open on a panel retrying a connection that cannot
- * succeed, which reads as a broken app rather than an unfinished one. Set
- * `GOVERNANCE_STREAM=hooks` to watch the real thing; when #20 lands, that
- * becomes the default and this comment goes with it.
+ * **Fixture is the default, deliberately.** `apps/hooks` does serve `/events`
+ * — the stream half of #20 landed on #54 — but it is a second service with a
+ * database of its own, and most of the time a fresh clone does not have it
+ * running. Defaulting to it would open the panel on a connection retrying
+ * against nothing, which reads as a broken app rather than as a control plane
+ * that has not been started. Opting in is one variable:
+ * `GOVERNANCE_STREAM=hooks` plus `HOOKS_PUBLIC_HOST`, and that is the live
+ * control plane, not a replay.
  */
 export function governanceStreamSource(
   env: Readonly<Record<string, string | undefined>>,

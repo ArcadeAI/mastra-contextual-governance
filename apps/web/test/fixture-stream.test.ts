@@ -149,7 +149,10 @@ describe("the fixture stream", () => {
 });
 
 describe("which stream the panel is pointed at", () => {
-  test("defaults to the fixture, because apps/hooks does not serve /events yet", () => {
+  // `apps/hooks` has served /events since #54. The default is still the
+  // fixture because the hook server is a second process that usually is not
+  // running, not because the endpoint is missing.
+  test("defaults to the fixture, so a clone with no control plane running still plays", () => {
     expect(governanceStreamSource({})).toEqual({
       url: "/api/governance/fixture-stream",
       mode: "fixture",
