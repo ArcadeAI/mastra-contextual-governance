@@ -4,9 +4,15 @@
  * only. Authorize → login page → consent page → code → token → userinfo. No
  * handler is called in-process; the thing that has to work is the wire.
  *
+ * Since #70 it also holds the key set: `/.well-known/openid-configuration`
+ * carries a `jwks_uri`, and the ID token the flow returns is verified against
+ * a key fetched from it — with WebCrypto, not a JWT library, so the assertion
+ * is that the signature checks out rather than that a dependency said so.
+ *
  * Also the two operational scripts, run as subprocesses against the same
- * database: `oauth-client` must be idempotent, and `reset` must leave the
- * credentials Arcade holds working.
+ * database: `oauth-client` prints the secret exactly once and rotates it under
+ * the same client id, and `reset` must leave the credentials Arcade holds
+ * working.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { Subprocess } from "bun";
@@ -30,6 +36,10 @@ const SECRET = "test-secret-".padEnd(48, "x");
 const people = loadPeople({});
 const dana = people.find((p) => p.persona === "dana")!;
 const riley = people.find((p) => p.persona === "riley")!;
+// Used only by the rotation test. Consent is recorded per person, per client,
+// and outlives a cookie jar — so a test that walks the flow as someone else's
+// persona silently changes whether *their* test sees the consent page.
+const morgan = people.find((p) => p.persona === "morgan")!;
 
 let child: Subprocess;
 let baseUrl: string;
@@ -37,11 +47,29 @@ let env: Record<string, string>;
 
 interface Credentials {
   client_id: string;
-  client_secret: string;
+  /** `null` on every run that did not itself produce the secret — see #70. */
+  client_secret: string | null;
+  client_secret_state: "unchanged" | "created" | "migrated" | "rotated";
+  client_secret_note: string;
   created: boolean;
+  rotated: boolean;
+  issuer: string;
+  jwks_url: string;
+  redirect_uris: string[];
   pkce: string;
   userinfo_email_jsonpath: string;
 }
+
+/**
+ * The credentials the flow tests drive with.
+ *
+ * The service creates the client when it boots, so no later `oauth-client` run
+ * can print that secret — storage is hashed since #70. `beforeAll` therefore
+ * rotates once to obtain a readable one, which is exactly the operational path
+ * a human takes on a fresh deploy. Any test that rotates again goes through
+ * `rotateCredentials` so this stays the live secret.
+ */
+let creds: Credentials;
 
 async function runScript(name: string, ...args: string[]): Promise<{ code: number; out: string; err: string }> {
   const proc = Bun.spawn(["bun", join(ROOT, "scripts", name), ...args], {
@@ -82,11 +110,20 @@ function freePort(): number {
   return port;
 }
 
-async function credentials(): Promise<Credentials> {
-  const { code, out, err } = await runScript("oauth-client.ts", "--json");
+/** `oauth-client --json`, with the exit status asserted rather than assumed. */
+async function runCredentialsScript(...args: string[]): Promise<Credentials> {
+  const { code, out, err } = await runScript("oauth-client.ts", "--json", ...args);
   expect(err).toBe("");
   expect(code).toBe(0);
   return JSON.parse(out) as Credentials;
+}
+
+/** Mints a new secret under the same client id and makes it the live one. */
+async function rotateCredentials(): Promise<Credentials> {
+  const rotated = await runCredentialsScript("--rotate");
+  expect(rotated.client_secret).toBeTruthy();
+  creds = rotated;
+  return rotated;
 }
 
 beforeAll(async () => {
@@ -127,6 +164,10 @@ beforeAll(async () => {
     }
     await Bun.sleep(50);
   }
+
+  // The service created the client on the line above, so its secret is gone —
+  // hashed storage, #70. Rotate once to get one the flow can use.
+  await rotateCredentials();
 });
 
 afterAll(() => {
@@ -201,7 +242,7 @@ async function authorizeAs(
   creds: Credentials,
   persona: { email: string; password: string; name: string },
   { expectConsent }: { expectConsent: boolean },
-): Promise<{ accessToken: string; refreshToken: string | undefined }> {
+): Promise<{ accessToken: string; refreshToken: string | undefined; idToken: string | undefined }> {
   const { verifier, challenge } = pkce();
   const state = "state-" + crypto.randomUUID();
 
@@ -272,7 +313,7 @@ async function authorizeAs(
       code: code!,
       redirect_uri: REDIRECT_URI,
       client_id: creds.client_id,
-      client_secret: creds.client_secret,
+      client_secret: creds.client_secret!,
       code_verifier: verifier,
     }),
   });
@@ -281,12 +322,79 @@ async function authorizeAs(
     access_token: string;
     token_type: string;
     refresh_token?: string;
+    id_token?: string;
     scope?: string;
   };
   expect(tokens.token_type.toLowerCase()).toBe("bearer");
   expect(tokens.access_token).toBeTruthy();
 
-  return { accessToken: tokens.access_token, refreshToken: tokens.refresh_token };
+  return {
+    accessToken: tokens.access_token,
+    refreshToken: tokens.refresh_token,
+    idToken: tokens.id_token,
+  };
+}
+
+/** One entry of the published key set. RSA public halves only — see the test. */
+interface PublicJwk {
+  kty: string;
+  alg: string;
+  kid: string;
+  n: string;
+  e: string;
+  [member: string]: unknown;
+}
+
+/** The published key set, as an Arcade User Source would fetch it (#65). */
+async function jwksKeys(): Promise<PublicJwk[]> {
+  const discovery = (await (await fetch(`${baseUrl}/.well-known/openid-configuration`)).json()) as {
+    jwks_uri?: string;
+  };
+  expect(discovery.jwks_uri).toBeTruthy();
+
+  const response = await fetch(discovery.jwks_uri!);
+  expect(response.status).toBe(200);
+  return ((await response.json()) as { keys: PublicJwk[] }).keys;
+}
+
+/**
+ * Verifies an ID token against the published key set and returns its claims.
+ *
+ * Hand-rolled on WebCrypto rather than handed to a JWT library, because the
+ * thing under test is exactly "a relying party that only has `jwks_uri` can
+ * check this signature". A library that fetched, selected and verified for us
+ * would pass on an IdP that published the wrong key just as happily, so long
+ * as the library also signed it.
+ */
+async function verifyIdToken(idToken: string): Promise<Record<string, unknown>> {
+  const [rawHeader, rawPayload, rawSignature] = idToken.split(".");
+  expect(rawSignature).toBeTruthy();
+
+  const header = JSON.parse(Buffer.from(rawHeader!, "base64url").toString()) as {
+    alg: string;
+    kid: string;
+  };
+  expect(header.alg).toBe("RS256");
+
+  const jwk = (await jwksKeys()).find((key) => key.kid === header.kid);
+  if (!jwk) throw new Error(`no key in the JWKS with kid ${header.kid}`);
+
+  const key = await crypto.subtle.importKey(
+    "jwk",
+    jwk,
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["verify"],
+  );
+  const verified = await crypto.subtle.verify(
+    "RSASSA-PKCS1-v1_5",
+    key,
+    Buffer.from(rawSignature!, "base64url"),
+    new TextEncoder().encode(`${rawHeader}.${rawPayload}`),
+  );
+  expect(verified).toBe(true);
+
+  return JSON.parse(Buffer.from(rawPayload!, "base64url").toString()) as Record<string, unknown>;
 }
 
 async function userinfo(accessToken: string): Promise<Record<string, unknown>> {
@@ -326,9 +434,21 @@ describe("health", () => {
     expect(body.oauth.authorize).toBe(`${baseUrl}/oauth2/authorize`);
     expect(body.oauth.token).toBe(`${baseUrl}/oauth2/token`);
     expect(body.oauth.userinfo).toBe(`${baseUrl}/oauth2/userinfo`);
+    expect(body.oauth.jwks).toBe(`${baseUrl}/jwks`);
+    expect(body.oauth.id_token_signing_alg).toBe("RS256");
   });
 
-  test("serves discovery at the root, even though Arcade will not read it", async () => {
+  test("says what happened to the client secret, so a rotation is not invisible", async () => {
+    const body = (await (await fetch(`${baseUrl}/health`)).json()) as Record<string, any>;
+
+    // This database was created by this test run, so the client was born here.
+    expect(body.oauth.client_secret_state).toBe("created");
+    expect(body.oauth.client_secret_note).toContain("--rotate");
+    // Whatever the state, /health is not a place a secret may appear.
+    expect(JSON.stringify(body)).not.toContain(creds.client_secret);
+  });
+
+  test("serves discovery at the root, which an Arcade User Source does read", async () => {
     const body = (await (await fetch(`${baseUrl}/.well-known/openid-configuration`)).json()) as Record<string, any>;
 
     expect(body).toMatchObject({
@@ -340,29 +460,110 @@ describe("health", () => {
     expect(body.code_challenge_methods_supported).toContain("S256");
     expect(body.token_endpoint_auth_methods_supported).toContain("client_secret_post");
   });
+
+  test("the discovery document carries a jwks_uri, which is what #65 was refused for", async () => {
+    const body = (await (await fetch(`${baseUrl}/.well-known/openid-configuration`)).json()) as Record<string, any>;
+
+    // The exact sentence the Arcade User Source form answered with on #65:
+    // "OIDC discovery document does not include a jwks_uri".
+    expect(body.jwks_uri).toBe(`${baseUrl}/jwks`);
+    expect(body.id_token_signing_alg_values_supported).toEqual(["RS256"]);
+    expect(body.id_token_signing_alg_values_supported).not.toContain("HS256");
+  });
+});
+
+describe("the key set", () => {
+  test("jwks_uri returns at least one RS256 key with a kid", async () => {
+    const keys = await jwksKeys();
+
+    expect(keys.length).toBeGreaterThanOrEqual(1);
+    const key = keys[0]!;
+    expect(key.kty).toBe("RSA");
+    expect(key.alg).toBe("RS256");
+    expect(key.kid).toBeTruthy();
+    expect(key.n).toBeTruthy();
+    expect(key.e).toBe("AQAB");
+  });
+
+  test("publishes only public halves — the private key stays in idp.db", async () => {
+    for (const key of await jwksKeys()) {
+      // `d` is the RSA private exponent; `p`, `q` and `dp` are its factors.
+      for (const secretMember of ["d", "p", "q", "dp", "dq", "qi"] as const) {
+        expect(key[secretMember]).toBeUndefined();
+      }
+    }
+  });
 });
 
 describe("the OAuth client", () => {
-  test("the script prints the same credentials every time", async () => {
-    const first = await credentials();
-    const second = await credentials();
+  test("the script prints the same client id every time, and never the same secret twice", async () => {
+    const first = await runCredentialsScript();
+    const second = await runCredentialsScript();
 
     expect(first.client_id).toMatch(/^[A-Za-z0-9]{32}$/);
-    expect(first.client_secret).toMatch(/^[A-Za-z0-9]{48}$/);
-    expect(second).toEqual({ ...first, created: false });
+    expect(second.client_id).toBe(first.client_id);
+    expect(first.created).toBe(false);
+
+    // The property #70 exists for: a later run cannot show the secret, and
+    // says so rather than printing something that looks like one.
+    expect(first.client_secret).toBeNull();
+    expect(second.client_secret).toBeNull();
+    expect(first.client_secret_state).toBe("unchanged");
+    expect(first.client_secret_note).toContain("cannot be printed again");
+    expect(first.client_secret_note).toContain("--rotate");
+  });
+
+  test("--rotate mints a new secret under the same client id", async () => {
+    const before = creds;
+    const rotated = await rotateCredentials();
+
+    expect(rotated.client_id).toBe(before.client_id);
+    expect(rotated.client_secret).toMatch(/^[A-Za-z0-9]{48}$/);
+    expect(rotated.client_secret).not.toBe(before.client_secret);
+    expect(rotated.client_secret_state).toBe("rotated");
+    expect(rotated.rotated).toBe(true);
+    // A rotation must not cost the registration its other half.
+    expect(rotated.redirect_uris ?? [REDIRECT_URI]).toEqual([REDIRECT_URI]);
+  });
+
+  test("the rotated secret works and the one it replaced does not", async () => {
+    const stale = creds.client_secret;
+    const rotated = await rotateCredentials();
+    expect(rotated.client_secret).not.toBe(stale);
+
+    // The new one completes a whole flow.
+    const { accessToken } = await authorizeAs(new Browser(), rotated, morgan, { expectConsent: true });
+    expect((await userinfo(accessToken)).email).toBe(morgan.email);
+
+    // The old one is refused at the token endpoint. A rotation that left the
+    // previous secret working would be a rotation in name only.
+    const refused = await fetch(`${baseUrl}/oauth2/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: "whatever",
+        redirect_uri: REDIRECT_URI,
+        client_id: rotated.client_id,
+        client_secret: stale!,
+        code_verifier: "x".repeat(43),
+      }),
+    });
+    expect(refused.status).toBeGreaterThanOrEqual(400);
+    const body = (await refused.json()) as { error: string; access_token?: string };
+    expect(["invalid_client", "invalid_grant"]).toContain(body.error);
+    expect(body.access_token).toBeUndefined();
   });
 
   test("states the posture #13 has to match", async () => {
-    const creds = await credentials();
-
     expect(creds.pkce).toBe("S256");
     expect(creds.userinfo_email_jsonpath).toBe("$.email");
+    expect(creds.jwks_url).toBe(`${baseUrl}/jwks`);
   });
 });
 
 describe("authorization-code flow", () => {
   test("authorize → login → consent → code → token → userinfo, as Dana", async () => {
-    const creds = await credentials();
     const browser = new Browser();
 
     const { accessToken, refreshToken } = await authorizeAs(browser, creds, dana, { expectConsent: true });
@@ -377,7 +578,6 @@ describe("authorization-code flow", () => {
   });
 
   test("a second authorize in the same session skips login and consent", async () => {
-    const creds = await credentials();
     const browser = new Browser();
 
     await authorizeAs(browser, creds, riley, { expectConsent: true });
@@ -387,7 +587,6 @@ describe("authorization-code flow", () => {
   });
 
   test("each persona is their own subject", async () => {
-    const creds = await credentials();
 
     const danaToken = await authorizeAs(new Browser(), creds, dana, { expectConsent: false });
     const rileyToken = await authorizeAs(new Browser(), creds, riley, { expectConsent: false });
@@ -399,7 +598,6 @@ describe("authorization-code flow", () => {
   });
 
   test("a wrong password stays on the login page with an error", async () => {
-    const creds = await credentials();
     const browser = new Browser();
     const { challenge } = pkce();
 
@@ -419,7 +617,6 @@ describe("authorization-code flow", () => {
   });
 
   test("a tampered or expired sign-in request is not reported as a wrong password", async () => {
-    const creds = await credentials();
     const browser = new Browser();
     const { challenge } = pkce();
 
@@ -445,7 +642,6 @@ describe("authorization-code flow", () => {
   });
 
   test("denying consent sends the client an access_denied error, not a code", async () => {
-    const creds = await credentials();
     const browser = new Browser();
     const { challenge } = pkce();
 
@@ -485,9 +681,117 @@ describe("authorization-code flow", () => {
   });
 });
 
+describe("the ID token", () => {
+  test("verifies against a key fetched from jwks_uri, as Arcade will verify it", async () => {
+    const { idToken } = await authorizeAs(new Browser(), creds, dana, { expectConsent: false });
+    expect(idToken).toBeTruthy();
+
+    // Throws or fails inside if the signature does not check out.
+    const claims = await verifyIdToken(idToken!);
+
+    // Arcade requires the issuer to match the one configured on the User
+    // Source exactly, and identifies the person by a subject claim (#65).
+    expect(claims.iss).toBe(baseUrl);
+    expect(claims.aud).toBe(creds.client_id);
+    expect(claims.email).toBe(dana.email);
+    expect(typeof claims.sub).toBe("string");
+  });
+
+  test("carries the email claim, byte-equal to what userinfo returns", async () => {
+    // The claim an Arcade User Source is configured to read as the subject
+    // (#65 step 2). Without it the subject is `sub`, an opaque uuid, and the
+    // Arcade user_id stops being the string `governance.db` and `loans.db`
+    // hold — DESIGN.md's identity rule 3, open risk 4.
+    const { accessToken, idToken } = await authorizeAs(new Browser(), creds, riley, {
+      expectConsent: false,
+    });
+
+    const claims = await verifyIdToken(idToken!);
+    const fromUserinfo = await userinfo(accessToken);
+
+    expect(claims.email).toBe(riley.email);
+    expect(claims.email).toBe(fromUserinfo.email);
+    expect(claims.email_verified).toBe(true);
+    // Lowercase, in both places, whatever case the persona was configured
+    // under (#58). The join key is compared byte-for-byte in three services.
+    expect(claims.email).toBe(String(claims.email).toLowerCase());
+  });
+
+  test("the email scope is what puts the claim there", async () => {
+    const supported = (await (await fetch(`${baseUrl}/.well-known/openid-configuration`)).json()) as {
+      claims_supported?: string[];
+      scopes_supported?: string[];
+    };
+
+    expect(supported.scopes_supported).toContain("email");
+    expect(supported.claims_supported).toContain("email");
+  });
+
+  test("a tampered payload fails the same check", async () => {
+    const { idToken } = await authorizeAs(new Browser(), creds, riley, { expectConsent: false });
+    const [header, payload, signature] = idToken!.split(".");
+
+    // Re-encode the claims with someone else's address. This is the whole
+    // reason Arcade wants a JWKS: without a signature check, `email` is just
+    // a string anybody in the path could have written.
+    const claims = JSON.parse(Buffer.from(payload!, "base64url").toString()) as Record<string, unknown>;
+    claims.email = dana.email;
+    const forged = [
+      header,
+      Buffer.from(JSON.stringify(claims)).toString("base64url"),
+      signature,
+    ].join(".");
+
+    await expect(verifyIdToken(forged)).rejects.toThrow();
+  });
+});
+
+/**
+ * `apps/loan-app` derives the actor from the bearer token by presenting it to
+ * `/oauth2/userinfo` (`apps/loan-app/src/actor.ts`) — it never parses the
+ * token. Enabling the JWT plugin could have changed the access token's form
+ * under it, so the contract is asserted here, on the service that changed,
+ * over the wire. `apps/loan-app` itself is untouched by #70.
+ */
+describe("what apps/loan-app depends on", () => {
+  test("userinfo accepts the access token the token endpoint issued", async () => {
+    const { accessToken } = await authorizeAs(new Browser(), creds, dana, { expectConsent: false });
+
+    // Exactly what `actorFromRequest` does: bearer header, read `email`.
+    const response = await fetch(`${baseUrl}/oauth2/userinfo`, {
+      headers: { authorization: `Bearer ${accessToken}` },
+    });
+
+    expect(response.status).toBe(200);
+    expect(((await response.json()) as { email: string }).email).toBe(dana.email);
+  });
+
+  test("access tokens are still opaque, so nothing downstream started reading claims", async () => {
+    const { accessToken } = await authorizeAs(new Browser(), creds, riley, { expectConsent: false });
+
+    // Access tokens become JWTs only for a registered `oauthResource`, and
+    // this service registers none. Recorded as an assertion rather than a
+    // comment: if a later change makes them JWTs, whoever makes it should
+    // find out here and not from a resource server that started trusting a
+    // claim it used to look up.
+    expect(accessToken.split(".")).toHaveLength(1);
+
+    const introspect = await fetch(`${baseUrl}/oauth2/introspect`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        token: accessToken,
+        client_id: creds.client_id,
+        client_secret: creds.client_secret!,
+      }),
+    });
+    expect(introspect.status).toBe(200);
+    expect(((await introspect.json()) as { active: boolean }).active).toBe(true);
+  });
+});
+
 describe("PKCE is required", () => {
   test("authorize without a code_challenge does not issue a code", async () => {
-    const creds = await credentials();
     const response = await new Browser().fetch(authorizeUrl(creds.client_id));
 
     // Either an error redirect back to the client or a 4xx; never a login page
@@ -504,7 +808,6 @@ describe("PKCE is required", () => {
   });
 
   test("the token endpoint refuses a code without its verifier", async () => {
-    const creds = await credentials();
     const browser = new Browser();
     const { challenge } = pkce();
 
@@ -533,7 +836,7 @@ describe("PKCE is required", () => {
         code,
         redirect_uri: REDIRECT_URI,
         client_id: creds.client_id,
-        client_secret: creds.client_secret,
+        client_secret: creds.client_secret!,
       }),
     });
 
@@ -541,7 +844,6 @@ describe("PKCE is required", () => {
   });
 
   test("a wrong client secret is refused", async () => {
-    const creds = await credentials();
     const token = await fetch(`${baseUrl}/oauth2/token`, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -564,7 +866,8 @@ describe("PKCE is required", () => {
 
 describe("reset does not rotate the OAuth client", () => {
   test("the credentials Arcade holds still complete a flow after scripts/reset", async () => {
-    const before = await credentials();
+    const before = creds;
+    const keyBefore = await jwksKeys();
 
     // A session and a consent exist from the tests above. Reset wipes them.
     const reset = await runScript("reset.ts");
@@ -572,10 +875,17 @@ describe("reset does not rotate the OAuth client", () => {
     expect(reset.code).toBe(0);
     expect(reset.out).toContain(`OAuth client ${before.client_id} unchanged`);
 
-    const after = await credentials();
+    const after = await runCredentialsScript();
     expect(after.client_id).toBe(before.client_id);
-    expect(after.client_secret).toBe(before.client_secret);
     expect(after.created).toBe(false);
+    // Nothing rotated: the stored hash still matches the secret Arcade holds,
+    // which the flow at the end of this test proves by using it.
+    expect(after.client_secret_state).toBe("unchanged");
+
+    // The signing keys survive too. Clearing `jwks` would mint a new key pair
+    // and an Arcade User Source holding the old key set would start rejecting
+    // ID tokens — the same silent break as a rotated client, one layer down.
+    expect(await jwksKeys()).toEqual(keyBefore);
 
     // The people are back to the fixture, and every earlier session is gone:
     // Dana has to log in and consent again, with the very same client.
@@ -592,7 +902,6 @@ describe("the log", () => {
   // survived a reset and been asked for its credentials several times. If any
   // of that printed the secret, a `render logs` would have shown it.
   test("never carries the client secret, over the whole run", async () => {
-    const creds = await credentials();
     const logged = await Bun.file(logPath).text();
 
     expect(logged).toContain(creds.client_id);
@@ -618,7 +927,7 @@ describe("the log", () => {
     ]);
 
     // Credentials still right, URLs flagged.
-    expect((JSON.parse(out) as Credentials).client_id).toBe((await credentials()).client_id);
+    expect((JSON.parse(out) as Credentials).client_id).toBe(creds.client_id);
     expect(err).toContain("warning");
     expect(err).toContain("IDP_PUBLIC_URL");
   });

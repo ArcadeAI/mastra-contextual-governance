@@ -107,6 +107,39 @@ export function decryptLegacyClientSecret(secret: string, stored: string): Promi
 }
 
 /**
+ * Puts the person's email into the ID token.
+ *
+ * Better Auth blanks every standard profile claim in the ID token on purpose
+ * (`ID_TOKEN_SCOPE_CLAIM_GUARDS`) and points relying parties at
+ * `/oauth2/userinfo` instead, so out of the box the only identity an ID token
+ * carries is `sub` — an opaque uuid. Arcade's User Source identifies the
+ * person from a configured subject claim **on the ID token** (#65), and
+ * DESIGN.md's third identity rule is that the Arcade `user_id`, the OAuth
+ * subject and the loan book's actor column are the same string, joined on
+ * email. A User Source keyed on `sub` would make the Arcade user a uuid while
+ * `governance.db` and `loans.db` hold addresses — open risk 4, which is the
+ * one that leaves every test passing while the audit trail describes two
+ * different people.
+ *
+ * Lowercased here as well as at the seed (#58), because this is the value
+ * Arcade ends up holding and it must be byte-equal to what `/oauth2/userinfo`
+ * returns and to what the loan book records.
+ *
+ * Only when the `email` scope was actually granted: a claim that appears
+ * regardless of scope is a claim the consent screen did not describe.
+ */
+function idTokenIdentityClaims({
+  user,
+  scopes,
+}: {
+  user: { email: string; emailVerified: boolean } & Record<string, unknown>;
+  scopes: readonly string[];
+}): Record<string, unknown> {
+  if (!scopes.includes("email")) return {};
+  return { email: user.email.toLowerCase(), email_verified: user.emailVerified };
+}
+
+/**
  * The options, separately from the instance, because `scripts/generate-schema.ts`
  * derives `src/schema.sql` from exactly these — the table set depends on the
  * plugin list, and a schema generated from a different configuration is how
@@ -148,6 +181,7 @@ export function authOptions({ db, baseURL, secret }: AuthConfig) {
         // `oauthResource`, and this service registers none — so
         // `apps/loan-app` keeps validating them at `/oauth2/userinfo`.
         storeClientSecret: clientSecretStorage(),
+        customIdTokenClaims: idTokenIdentityClaims,
       }),
     ],
   } satisfies BetterAuthOptions;
