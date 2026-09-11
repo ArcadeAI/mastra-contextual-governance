@@ -172,6 +172,8 @@ export interface DriveResult {
   stoppedAt?: string;
   /** Why it stopped, when it stopped early. */
   stoppedBecause?: string;
+  /** The redirect URI the chain landed on, query and all — where the code is. */
+  landedOn?: string;
 }
 
 export interface Persona {
@@ -207,7 +209,7 @@ export async function driveAuthorize(
   for (let i = 0; i < 30; i += 1) {
     if (url.startsWith(redirectUri)) {
       transcript.hop("the chain lands back on the redirect URI", redactQuery(url));
-      return { visited, pagesShown, pageHosts };
+      return { visited, pagesShown, pageHosts, landedOn: url };
     }
 
     const res = await jar.fetch(url, { headers: { accept: "text/html" } });
