@@ -117,9 +117,19 @@ async function readEnvFile(): Promise<Record<string, string>> {
  * even truncated — a client id is not a secret but printing one teaches the habit,
  * and this process has no reason to say more than where it found them.
  */
-async function readCredentials(): Promise<
-  { ok: true; clientId: string; clientSecret: string; source: string } | { ok: false; missing: string[] }
-> {
+interface CredentialsFound {
+  ok: true;
+  clientId: string;
+  clientSecret: string;
+  source: string;
+}
+interface CredentialsMissing {
+  ok: false;
+  missing: string[];
+}
+type Credentials = CredentialsFound | CredentialsMissing;
+
+async function readCredentials(): Promise<Credentials> {
   const fromFile = await readEnvFile();
   const seen: string[] = [];
   const pick = (name: string) => {
@@ -342,6 +352,65 @@ async function callback(url: URL): Promise<Response> {
 }
 
 /**
+ * Trade the code for a token, authenticating the client the way this IdP wants.
+ *
+ * `apps/idp` enforces **one** client-authentication method per client and refuses
+ * the other outright rather than accepting either. This project has now been bitten
+ * by that in both directions within one afternoon: Arcade sent `client_secret_basic`
+ * to a `client_secret_post` registration (#61), and after #61 flipped the client,
+ * this verifier sent `client_secret_post` to a `client_secret_basic` registration
+ * and got `client registered for client_secret_basic cannot use client_secret_post`.
+ *
+ * So it is not hardcoded. The method comes from what the IdP publishes on `/health`,
+ * and if that is wrong or absent the other method is tried once — because the
+ * failure mode otherwise is a relying party that looks correctly configured, fails
+ * at a step no hook observes, and gets blamed on whoever owns the other end.
+ */
+async function exchangeCode(
+  code: string,
+  codeVerifier: string,
+  credentials: { clientId: string; clientSecret: string },
+): Promise<{ res: Response; text: string }> {
+  const advertised = await fetch(`${IDP_ISSUER}/health`)
+    .then((r) => (r.ok ? r.json() : null))
+    .then((b: any) => b?.oauth?.token_endpoint_auth_method as string | undefined)
+    .catch(() => undefined);
+  const order = advertised === "client_secret_post" ? (["post", "basic"] as const) : (["basic", "post"] as const);
+
+  let last!: { res: Response; text: string };
+  for (const method of order) {
+    const headers: Record<string, string> = { "content-type": "application/x-www-form-urlencoded" };
+    const form: Record<string, string> = {
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: redirectUri(),
+      client_id: credentials.clientId,
+      code_verifier: codeVerifier,
+    };
+    if (method === "basic") {
+      headers.authorization = `Basic ${Buffer.from(`${credentials.clientId}:${credentials.clientSecret}`).toString("base64")}`;
+    } else {
+      form.client_secret = credentials.clientSecret;
+    }
+    const res = await fetch(`${IDP_ISSUER}/oauth2/token`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams(form).toString(),
+    });
+    const text = await res.text();
+    note(`IdP token exchange, client_secret_${method} -> ${res.status}`, redact(text).slice(0, 400));
+    last = { res, text };
+    if (res.ok) return last;
+    // Only a method mismatch is worth a second attempt. A wrong secret, a spent code
+    // or an expired one must not be retried — that doubles the noise in the IdP's
+    // log and tells the reader nothing.
+    if (!/cannot use client_secret_(post|basic)/.test(text)) return last;
+    note(`the IdP refuses client_secret_${method} for this client; trying the other`);
+  }
+  return last;
+}
+
+/**
  * The `confirm_user` call, for the case where this process holds the API key.
  *
  * That is the production shape and the code a real deployment runs. This spike does
@@ -516,7 +585,7 @@ async function startNgrok(port: number): Promise<string> {
 }
 
 publicUrl = process.env.VERIFIER_PUBLIC_URL?.replace(/\/+$/, "")
-  ?? (NO_NGROK ? `http://localhost:${server.port}` : await startNgrok(server.port));
+  ?? (NO_NGROK ? `http://localhost:${server.port}` : await startNgrok(server.port!));
 
 const startupCredentials = await readCredentials();
 const CREDENTIAL_BANNER = startupCredentials.ok

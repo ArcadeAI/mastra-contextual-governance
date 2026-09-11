@@ -42,7 +42,7 @@ const IDP_DIR = join(REPO_ROOT, "apps", "idp");
 /** A port this machine is not using, the way `tools/loan/tests/conftest.py::_free_port` does it. */
 function freePort(): number {
   const server = Bun.serve({ port: 0, fetch: () => new Response("") });
-  const { port } = server;
+  const port = server.port!;
   server.stop(true);
   return port;
 }

@@ -53,3 +53,6 @@ for (const uri of CANDIDATES) {
   console.log(`${allowed ? "ALLOWED " : "REJECTED"}  ${uri}`);
   if (!allowed) console.log(`            -> ${location.split("&error_description=").join("\n               ")}`);
 }
+
+// Top-level `await` needs this file to be a module; it exports nothing on purpose.
+export {};
