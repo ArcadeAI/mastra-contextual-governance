@@ -18,7 +18,21 @@
  *   GET  /api/arcade/verify   Arcade's custom user verifier            ← hop 2
  *   POST /api/auth/signout    forget this browser's persona
  */
-import { identityReadiness, readWebConfig, type WebConfig } from "../config.ts";
+/**
+ * The identity routes read `readIdentitySurface`, not `readWebConfig`.
+ *
+ * Nothing in this file touches the approvals store, and `readWebConfig` throws
+ * under `NODE_ENV=production` when `APPROVALS_STORE_TOKEN` is unset. Going
+ * through it would make a missing approvals credential turn every sign-in into
+ * a `500` — measured against the production build before this line existed:
+ *
+ *   GET /api/auth/signin -> 500
+ *   Error: APPROVALS_STORE_TOKEN is required in production
+ *
+ * Same environment, same file reading it; just without a guard that belongs to
+ * a credential these routes do not present.
+ */
+import { identityReadiness, readIdentitySurface, type IdentitySurface } from "../config.ts";
 import { clearLeg, clearSession, GATEWAY_COOKIE, PENDING_FLOW_COOKIE, readLeg, readSession,
   SIGNIN_COOKIE, writeLeg, writeSession, type GatewayLeg, type PendingFlow, type Session,
   type SigninLeg } from "./session.ts";
@@ -58,12 +72,12 @@ export function safeNext(value: string | null, fallback: string): string {
   return value;
 }
 
-function redirectUri(config: WebConfig, path: string): string {
+function redirectUri(config: IdentitySurface, path: string): string {
   return `${config.identity.publicUrl}${path}`;
 }
 
 /** The missing pieces of a capability, named individually so the page can list them. */
-function missingSignin(config: WebConfig): string[] {
+function missingSignin(config: IdentitySurface): string[] {
   const { identity } = config;
   return [
     ...(identity.idpIssuer ? [] : ["IDP_ISSUER"]),
@@ -74,7 +88,7 @@ function missingSignin(config: WebConfig): string[] {
   ];
 }
 
-function missingVerifier(config: WebConfig): string[] {
+function missingVerifier(config: IdentitySurface): string[] {
   const { identity } = config;
   return [
     ...(identity.sessionSecret ? [] : ["SESSION_SECRET"]),
@@ -102,7 +116,7 @@ function missingVerifier(config: WebConfig): string[] {
  * abandoned at the IdP's login page leaves this browser signed in as nobody
  * rather than still signed in as the previous persona.
  */
-export async function signin(request: Request, config: WebConfig = readWebConfig()): Promise<Response> {
+export async function signin(request: Request, config: IdentitySurface = readIdentitySurface()): Promise<Response> {
   const missing = missingSignin(config);
   if (missing.length > 0) return notConfigured("Sign-in", missing);
 
@@ -144,7 +158,7 @@ export async function signin(request: Request, config: WebConfig = readWebConfig
  * Arcade verification, reports that a parked one expired, or carries on to
  * hop 1.
  */
-export async function signinCallback(request: Request, config: WebConfig = readWebConfig()): Promise<Response> {
+export async function signinCallback(request: Request, config: IdentitySurface = readIdentitySurface()): Promise<Response> {
   const missing = missingSignin(config);
   if (missing.length > 0) return notConfigured("Sign-in", missing);
 
@@ -236,7 +250,7 @@ export async function signinCallback(request: Request, config: WebConfig = readW
 }
 
 /** `POST /api/auth/signout` — forget the persona and the gateway token with it. */
-export function signout(request: Request, config: WebConfig = readWebConfig()): Response {
+export function signout(request: Request, config: IdentitySurface = readIdentitySurface()): Response {
   const headers = new Headers();
   clearSession(headers, request, config);
   clearLeg(headers, SIGNIN_COOKIE, config);
@@ -250,7 +264,7 @@ export function signout(request: Request, config: WebConfig = readWebConfig()): 
 // ---------------------------------------------------------------------------
 
 /** `GET /api/arcade/start?next=` — begin the gateway authorization for the signed-in persona. */
-export async function gatewayStart(request: Request, config: WebConfig = readWebConfig()): Promise<Response> {
+export async function gatewayStart(request: Request, config: IdentitySurface = readIdentitySurface()): Promise<Response> {
   if (identityReadiness(config).gateway === "missing") {
     return notConfigured("The gateway hop", [
       ...missingSignin(config),
@@ -288,7 +302,7 @@ export async function gatewayStart(request: Request, config: WebConfig = readWeb
 }
 
 /** `GET /api/arcade/callback?code&state` — store the gateway token on this browser's session. */
-export async function gatewayCallback(request: Request, config: WebConfig = readWebConfig()): Promise<Response> {
+export async function gatewayCallback(request: Request, config: IdentitySurface = readIdentitySurface()): Promise<Response> {
   const url = new URL(request.url);
   const leg = await readLeg<GatewayLeg>(request, GATEWAY_COOKIE, config);
   const headers = new Headers();
@@ -374,7 +388,7 @@ export async function gatewayCallback(request: Request, config: WebConfig = read
  */
 export async function liveGatewayToken(
   session: Session,
-  config: WebConfig = readWebConfig(),
+  config: IdentitySurface = readIdentitySurface(),
   now = Date.now(),
 ): Promise<{ token: string; session: Session } | { token: null; reason: string }> {
   if (!session.gateway) return { token: null, reason: "this browser holds no gateway token" };
@@ -419,7 +433,7 @@ export async function liveGatewayToken(
  * There is no branch in this function that reads a persona from the request,
  * and a request that carries one is refused rather than quietly served.
  */
-export async function verify(request: Request, config: WebConfig = readWebConfig()): Promise<Response> {
+export async function verify(request: Request, config: IdentitySurface = readIdentitySurface()): Promise<Response> {
   const url = new URL(request.url);
 
   const smuggled = IDENTITY_PARAMS.filter((name) => url.searchParams.has(name));
@@ -468,7 +482,7 @@ export async function verify(request: Request, config: WebConfig = readWebConfig
 export async function completeVerification(
   flowId: string,
   email: string,
-  config: WebConfig,
+  config: IdentitySurface,
   headers: Headers,
 ): Promise<Response> {
   const confirmed = await confirmUser({

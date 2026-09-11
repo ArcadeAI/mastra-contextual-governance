@@ -557,4 +557,38 @@ describe("an unconfigured deployment", () => {
     expect(verifyAnswer.status).toBe(503);
     expect(await verifyAnswer.text()).toContain("ARCADE_API_KEY");
   });
+
+  test("a production service with no APPROVALS_STORE_TOKEN still serves the identity routes", async () => {
+    // Not hypothetical. `readWebConfig` throws in production without that
+    // token, the route adapters call these handlers with no config argument, and
+    // against the real production build that turned every sign-in into:
+    //
+    //   GET /api/auth/signin -> 500
+    //   Error: APPROVALS_STORE_TOKEN is required in production
+    //
+    // The identity routes present no approvals credential and must not fail on
+    // one. Called with no config, so the default read is what is under test.
+    const previous = { ...process.env };
+    try {
+      Object.assign(process.env, {
+        NODE_ENV: "production",
+        IDP_ISSUER: harness.idpUrl,
+        IDP_CLIENT_ID: "c",
+        IDP_CLIENT_SECRET: "s",
+        SESSION_SECRET: "x",
+        PUBLIC_URL: harness.webUrl,
+      });
+      delete process.env.APPROVALS_STORE_TOKEN;
+
+      const { signin } = await import("../lib/identity/handlers.ts");
+      const answer = await signin(new Request(`${harness.webUrl}/api/auth/signin?persona=dana`));
+      expect(answer.status).toBe(303);
+      expect(answer.headers.get("location")).toContain(`${harness.idpUrl}/oauth2/authorize`);
+    } finally {
+      for (const key of ["NODE_ENV", "IDP_ISSUER", "IDP_CLIENT_ID", "IDP_CLIENT_SECRET", "SESSION_SECRET", "PUBLIC_URL", "APPROVALS_STORE_TOKEN"]) {
+        if (previous[key] === undefined) delete process.env[key];
+        else process.env[key] = previous[key];
+      }
+    }
+  });
 });
