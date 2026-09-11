@@ -99,6 +99,47 @@ await time("/pre allow", "/pre", {
 }, 200);
 
 console.log(`\naudit rows written: ${db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM audit_log").get()?.n}`);
+
+// ---------------------------------------------------------------------------
+// What the log costs on disk (#62)
+// ---------------------------------------------------------------------------
+//
+// The rows above are real ones, written by the real handlers, so the cheapest
+// honest way to price the table is to vacuum this database into a file and
+// compare it with an empty one. `VACUUM INTO` writes the compacted on-disk
+// form, which is what a Render volume actually holds.
+
+const { statSync, mkdtempSync, rmSync } = await import("node:fs");
+const { tmpdir } = await import("node:os");
+const { join } = await import("node:path");
+
+const dir = mkdtempSync(join(tmpdir(), "cg-audit-bench-"));
+const sizeOf = (source: typeof db, name: string): number => {
+  const path = join(dir, name);
+  source.exec(`VACUUM INTO '${path}'`);
+  return statSync(path).size;
+};
+
+const empty = openGovernance(":memory:", { loanToolkit: "Loan", approvalsToolkit: "Approvals", personaEmails: {} });
+const baseline = sizeOf(empty, "empty.db");
+empty.close();
+
+const rows = db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM audit_log").get()?.n ?? 0;
+const withRows = sizeOf(db, "with-rows.db");
+const perRow = (withRows - baseline) / rows;
+const GB = 1024 ** 3;
+
+console.log(
+  `\naudit_log on disk: ${rows.toLocaleString("en-US")} rows add ` +
+    `${((withRows - baseline) / 1024 / 1024).toFixed(1)} MB over an empty governance.db ` +
+    `(${(baseline / 1024).toFixed(0)} KB)\n` +
+    `  ${perRow.toFixed(0)} bytes/row  →  a 1 GB disk holds ~` +
+    `${Math.floor(GB / perRow).toLocaleString("en-US")} rows, ` +
+    `~${Math.floor(GB / perRow / 10_844).toLocaleString("en-US")} whole-project /access calls, ` +
+    `~${Math.floor(GB / perRow / 8_259).toLocaleString("en-US")} org-admin tools/list bursts`,
+);
+rmSync(dir, { recursive: true, force: true });
+
 cache.stop();
 server.stop(true);
 db.close();

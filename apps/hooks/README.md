@@ -7,6 +7,7 @@ contextual-access hooks, and records every decision it makes.
 POST /access   which tools this user may see       → { deny: Toolkits }
 POST /pre      may this user make this call         → { code: OK | CHECK_FAILED, error_message? }
 POST /post     pass-through until #16               → { code: OK }
+GET  /audit    the audit log, filtered              → { rows, count, total, limit, filters }
 GET  /events   the live governance stream           → text/event-stream   (no auth)
 GET  /health   policy revision, row counts, 503 while failing closed   (no auth)
 
@@ -16,7 +17,8 @@ GET  /approvals/{id}          read one by opaque id — what the approval page i
 POST /approvals/{id}/decision record an outcome
 ```
 
-Every hook endpoint requires `Authorization: Bearer $ARCADE_HOOK_SIGNING_SECRET`. Request and
+Every hook endpoint requires `Authorization: Bearer $ARCADE_HOOK_SIGNING_SECRET`, and so does
+`GET /audit` — same secret, because the rows it returns are the record those three wrote. Request and
 response bodies are the generated types in `@cg/policy-schema` — `deny` takes the request's
 `Toolkits` shape down to the innermost array of versions, which spike #2 measured is the one
 shape that does not take every tool in the project down with it.
@@ -221,8 +223,33 @@ disjoint. "Exactly the missed rows, in order, nothing duplicated" is a property 
 construction rather than of the timing.
 
 An id the log cannot place — a panel left open across a `scripts/reset`, a stale tab — is
-not an error and does not replay the whole log. The stream says so in a comment and goes
-live.
+not an error and does not replay the whole log. The stream says so in a comment, names the
+`seq` it is resuming from and how to ask for everything, and goes live.
+
+### Replaying from the beginning
+
+```sh
+curl -N -H 'last-event-id: 0' "https://$HOOKS_PUBLIC_HOST/events"
+```
+
+`last-event-id: 0` means *from the first row*, as this README always claimed it did. Until
+#62 it fell through the unknown-id path and served live from the current cutoff — a replay
+that looked like it worked and returned nothing.
+
+A `last-event-id` of **all digits is a `seq`**, the unit the preamble and the truncation
+comment already speak in; `0` is then a case of that rule rather than a magic value. The two
+spaces cannot collide, because every audit row id is `evt_` plus ten base32 characters. A seq
+above the high-water mark is as unplaceable as an unknown id, and is answered the same way:
+
+```
+: last-event-id 900 is not in this log; resuming live from seq 41. Send last-event-id: 0 to replay from the beginning.
+```
+
+A fresh connection with no header still replays nothing — history is the log's job — and the
+mark it starts from is on the wire (`: governance stream — live from seq 41`) so the next
+connection can name an exact anchor. The cap applies to a replay from `0` like any other: a
+log longer than 25,000 rows replays its newest 25,000 with the `: replay truncated …`
+comment saying which end was dropped.
 
 ### The cap, and what it costs
 
@@ -269,6 +296,63 @@ The CORS preflight is not optional and is not cosmetic: the panel sends `cache-c
 its first connect and `last-event-id` on every resume, neither of which is a CORS-safelisted
 request header, so the browser asks first. Without the `OPTIONS` handler the panel cannot
 connect in a browser at all while every server-side test still passes.
+
+## Reading the log over HTTP (#62)
+
+`GET /audit` answers "what did the control plane decide, and why" without a shell on the
+Render disk. Before it existed, establishing that an `/access` burst was 8,259 denials for an
+org admin rather than a runaway loop meant hand-writing a `bun:sqlite` query against
+`/data/governance.db`.
+
+```sh
+curl -fsS -H "authorization: Bearer $ARCADE_HOOK_SIGNING_SECRET" \
+  "https://$HOOKS_PUBLIC_HOST/audit?user_id=dana.okafor@bank.example&hook=pre&decision=deny&limit=20"
+```
+
+```json
+{ "rows": [ { "id": "evt_4k7xq2m9hz", "ts": "…", "hook": "pre", "decision": "deny", … } ],
+  "count": 20, "total": 137, "limit": 20, "order": "newest_first",
+  "filters": { "user_id": "dana.okafor@bank.example", "hook": "pre", "decision": "deny" } }
+```
+
+`rows` are `audit_log` rows exactly as the table holds them — the same `GovernanceEvent` the
+stream carries, including `before` and `after`, **not** the panel's derived shape. Someone
+asking what was decided should get the record, not a summary of it.
+
+| filter | matches |
+|---|---|
+| `user_id` | the acting persona, case-insensitively — nothing normalises what Arcade puts on a payload |
+| `tool` | the stored `Toolkit.Tool` exactly: `Loan.GetLoan`, never `get_loan` |
+| `hook` | `access`, `pre` or `post` |
+| `decision` | `allow`, `deny` or `modify` |
+| `since` | rows at or after an ISO 8601 instant; a bare `2026-09-10` is normalised to midnight UTC |
+| `limit` | 1..1000, default 100 |
+
+They are ANDed. `order` is always newest first.
+
+**Three refusals, and they are the same refusal.** A filter that does not do what its author
+thinks it does is this project's recurring failure — a rule keyed on `get_loan` matches
+nothing, and nothing is indistinguishable from permitted — and the trap is one query string
+away here:
+
+- **An unknown query parameter is a `400`**, not an ignored one. `?toolname=…` answered
+  with the unfiltered log is a reviewer concluding the whole log is one tool's decisions.
+- **A `limit` over 1000 is a `400`**, not a clamp. Clamping answers a question nobody asked
+  and looks like an answer to the one they did. So is `hook=preflight` or
+  `decision=denied`: a misspelled value must not come back as an empty page.
+- **`total` is counted without the limit**, so a page that stops at the bound still says how
+  many rows matched. That is the difference between 8,259 denials and a runaway loop.
+
+The bearer is the **hook** secret, not the approvals store's. Reasons on these rows say more
+than the model was told — which grants were examined and rejected, who an escalation was
+routed to and who was not asked — and from #16 a `before` will carry an unredacted account
+number. That is also why this endpoint has a bearer where `/events` deliberately does not:
+nothing here is fetched from a browser, so nothing here has to ship a token to one.
+
+The read goes to the database handle directly and never to the policy cache's. The hook path
+is served from memory and stays that way; `test/audit-api.test.ts` counts zero queries on the
+cache's handle across twenty `/audit` calls, next door to the test that counts zero across
+twenty warm hook calls.
 
 ## The correlation token (#6)
 
@@ -370,6 +454,44 @@ Writing an approval record or a decision is **not** a decision, so neither appen
 `GovernanceEvent` is the record of hook decisions, and a row no hook produced would be fiction.
 The routing and the outcome reach the panel through the real `/pre` rows on
 `Approvals.RequestApproval` and `Approvals.Decide`, whose reasons name them.
+
+### What the log costs, and the bound on it
+
+Nothing prunes `audit_log`. The DELETE trigger refuses one, and a compliance log that can be
+quietly shortened is not one — so the bound is the disk, and it is stated rather than
+enforced at write time.
+
+Measured (`bun run --cwd apps/hooks bench`, the "audit_log on disk" section: 217,280 real
+rows written by the real handlers, vacuumed into a file and compared with an empty
+`governance.db`):
+
+| | |
+|---|---:|
+| bytes per row, on disk | **487** |
+| rows in the 1 GB Render volume | ~2,206,000 |
+| whole-project `/access` calls (10,844 rows each) | ~203 |
+| org-admin `tools/list` bursts (8,259 rows each) | ~267 |
+
+**The stated bound is 2,000,000 rows** (`AUDIT_RETENTION_ROWS`, ~930 MB). At 80% of it —
+1.6 M rows, ~744 MB — the boot log says so, naming the count and the reset, which leaves a
+quarter of the disk to notice it in:
+
+```
+[hooks] RETENTION: audit_log holds 1,600,000 rows, 80% of the 2,000,000-row bound this disk
+        is sized for. Nothing prunes it: run scripts/reset before it fills.
+```
+
+Three things follow, and the third is the one that bites:
+
+- Getting back under the bound is `scripts/reset` (#23), the same deliberate act that resets
+  everything else. There is no truncation endpoint and no rolling window; either would let
+  the log lose decisions without anybody deciding that it should.
+- `/health` reports `audit_rows`, so headroom is one unauthenticated `curl` away.
+- **Never drive the demo from an Arcade org admin.** One `tools/list` from an admin account
+  sent the entire org catalogue to `/access` — 8,259 tools, one audit row each, in a single
+  request (measured on #13). Two hundred of those fill the disk; a hundred of them make
+  `/audit` and the panel unreadable long before that. The demo personas see one gateway and
+  write four rows a call.
 
 It is **not** a complete record of every refusal a persona met. Arcade evaluates a tool's auth
 requirements *before* `/pre`: a persona without a token for a tool is refused upstream of every

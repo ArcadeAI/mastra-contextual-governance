@@ -41,6 +41,7 @@ import {
 import { createApprovalControl } from "./approval-governance.ts";
 import { APPROVALS_PREFIX, handleApprovals } from "./approvals-api.ts";
 import { pendingCount } from "./approvals-store.ts";
+import { AUDIT_PATH, handleAudit } from "./audit-api.ts";
 import { count as auditCount, newEventId, record } from "./audit-log.ts";
 import type { HooksConfig } from "./config.ts";
 import { withCorrelation } from "./correlation.ts";
@@ -287,7 +288,8 @@ export function createServer(deps: ServerDeps) {
     port: config.port,
     idleTimeout: 30,
     async fetch(request) {
-      const { pathname } = new URL(request.url);
+      const url = new URL(request.url);
+      const { pathname } = url;
 
       if (pathname === HOOK_ENDPOINT_PATHS.healthCheck) {
         return request.method === "GET" ? health() : json({ error: "Method not allowed" }, 405);
@@ -307,6 +309,17 @@ export function createServer(deps: ServerDeps) {
         });
         if (answered !== null) return answered;
         return json({ error: "Not found" }, 404);
+      }
+
+      if (pathname === AUDIT_PATH) {
+        // Arcade's bearer, not the store's: these rows are the hooks' own
+        // record, and the secret that writes them is the one that reads them.
+        // The read is `db` directly and never the policy cache's handle — the
+        // cache serves the hot path from memory and a reviewer paging the log
+        // must not put a query back on it.
+        if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
+        if (!authorized(request)) return json({ error: "Unauthorized" }, 401);
+        return handleAudit(url, db);
       }
 
       if (pathname === EVENTS_PATH) {

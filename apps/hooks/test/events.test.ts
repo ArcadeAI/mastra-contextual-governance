@@ -532,6 +532,110 @@ describe("reconnecting with Last-Event-ID", () => {
   });
 });
 
+describe("replaying from the beginning (#62)", () => {
+  /** The `seq` the log gave a row, which is the other name a client may use. */
+  const seqOf = (id: string): number =>
+    db
+      .query<{ seq: number }, { $id: string }>("SELECT seq FROM audit_log WHERE id = $id")
+      .get({ $id: id })!.seq;
+
+  test("last-event-id: 0 replays the whole log, in order, then goes live", async () => {
+    seed(6, "from-the-top");
+    const before = seqOrder();
+
+    const reader = await open(base, "0");
+    await reader.untilFrames(before.length);
+
+    // ...and then it is a live stream like any other.
+    await denyDana("tc_after_full_replay");
+    await reader.untilFrames(before.length + 1);
+    await reader.settle();
+    reader.abort();
+
+    expect(idsIn(reader)).toEqual(seqOrder());
+    expect(reader.comments.join("\n")).not.toInclude("not in this log");
+  });
+
+  test("last-event-id: 0 against an empty log replays nothing and goes live", async () => {
+    const reader = await open(base, "0");
+    await reader.settle();
+    expect(reader.frames).toHaveLength(0);
+
+    await denyDana("tc_empty_then_live");
+    await reader.untilFrames(1);
+    reader.abort();
+    expect(idsIn(reader)).toEqual(seqOrder());
+  });
+
+  test("a numeric last-event-id is a seq: rows after it, nothing before", async () => {
+    const ids = seed(5, "by-seq");
+    const anchor = seqOf(ids[1]!);
+
+    const reader = await open(base, String(anchor));
+    await reader.untilFrames(3);
+    await reader.settle();
+    reader.abort();
+
+    expect(idsIn(reader)).toEqual(ids.slice(2));
+  });
+
+  test("a seq past the end of the log is not a replay, and the first bytes say so", async () => {
+    seed(3, "short-log");
+    const past = seqOrder().length + 500;
+
+    const reader = await open(base, String(past));
+    await reader.settle();
+    // Serving the newest rows for an anchor nobody asked for is the failure
+    // #62 opened on: it looks like a replay and it is not one.
+    expect(reader.frames).toHaveLength(0);
+    const said = reader.comments.join("\n");
+    expect(said).toInclude(`last-event-id ${past} is not in this log`);
+    expect(said).toInclude("last-event-id: 0");
+
+    await denyDana("tc_past_the_end");
+    await reader.untilFrames(1);
+    reader.abort();
+    expect(idsIn(reader)).toEqual([seqOrder().at(-1)!]);
+  });
+
+  test("an unknown id names the mark it resumed from and how to ask for everything", async () => {
+    seed(4, "unplaceable");
+    const reader = await open(base, "evt_nosuchrow0");
+    await reader.settle();
+    reader.abort();
+
+    const said = reader.comments.join("\n");
+    expect(said).toInclude("resuming live from seq 4");
+    expect(said).toInclude("Send last-event-id: 0 to replay from the beginning.");
+  });
+
+  test("a fresh connection still replays nothing: 0 is the way to ask", async () => {
+    seed(3, "not-asked-for");
+    const reader = await open(base);
+    await reader.settle();
+    reader.abort();
+    expect(reader.frames).toHaveLength(0);
+    // The mark is on the wire, so the next connection can name an anchor.
+    expect(reader.comments.join("\n")).toInclude("live from seq 3");
+  });
+
+  test("replaying from 0 past the cap sends the newest rows and announces the hole", async () => {
+    afterEachTeardown();
+    boot(5);
+
+    seed(20, "too-much-history");
+    const order = seqOrder();
+
+    const reader = await open(base, "0");
+    await reader.untilFrames(5);
+    await reader.settle();
+    reader.abort();
+
+    expect(idsIn(reader)).toEqual(order.slice(-5));
+    expect(reader.comments.join("\n")).toInclude("replay truncated at 5 events");
+  });
+});
+
 describe("a burst", () => {
   test("one decision of 2,000 rows arrives complete and in order", async () => {
     const reader = await open(base);

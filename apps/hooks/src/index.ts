@@ -17,6 +17,7 @@
  */
 import { createEventBus } from "@cg/governance-core";
 
+import { retentionWarning } from "./audit-log.ts";
 import { usingDevSecret, readConfig } from "./config.ts";
 import { EVENTS_PATH } from "./events.ts";
 import { createPolicyCache } from "./policy-cache.ts";
@@ -51,6 +52,11 @@ log(
     `streaming on ${EVENTS_PATH}`,
 );
 if (state.status === "failed") log(`STARTED FAIL-CLOSED: ${state.error}`);
+// Nothing prunes `audit_log` — the table is append-only and a compliance log
+// that can be quietly shortened is not one. So the bound is the disk, and the
+// only useful moment to mention it is the boot before it is reached.
+const retention = retentionWarning(tally.audit_log ?? 0);
+if (retention !== null) log(`RETENTION: ${retention}`);
 if (usingDevSecret(config)) {
   log("ARCADE_HOOK_SIGNING_SECRET is unset — using the development token. Not for production.");
 }

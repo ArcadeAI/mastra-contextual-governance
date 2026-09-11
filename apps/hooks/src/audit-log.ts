@@ -238,3 +238,121 @@ function fromRow(row: AuditRow): GovernanceEvent {
     ...(row.after !== null && { after: JSON.parse(row.after) }),
   });
 }
+
+// ---------------------------------------------------------------------------
+// Reading the log as a filtered page (#62)
+// ---------------------------------------------------------------------------
+
+/**
+ * A `GET /audit` filter. Every field is optional except the bound.
+ *
+ * The fields are ANDed. `user_id` is matched case-insensitively — the join key
+ * is one lowercase string across the three databases (#58), but nothing
+ * normalises what Arcade puts on a hook payload, so a filter that differed only
+ * in case would return nothing and read as "no such decisions".
+ */
+export interface AuditFilter {
+  /** Case-insensitive exact match on the acting persona. */
+  readonly user_id?: string;
+  /** Exact match on the stored `Toolkit.Tool`, e.g. `Loan.GetLoan`. */
+  readonly tool?: string;
+  readonly hook?: string;
+  readonly decision?: string;
+  /** ISO 8601 instant; rows at or after it. */
+  readonly since?: string;
+  readonly limit: number;
+}
+
+export interface AuditPage {
+  /** Newest first, at most `filter.limit` of them. */
+  readonly rows: GovernanceEvent[];
+  /** How many rows match the filter in total, before `limit` is applied. */
+  readonly total: number;
+}
+
+/**
+ * One filtered page of the log, newest first.
+ *
+ * `total` is counted with the same predicate and *without* the limit, because
+ * the question this endpoint exists to answer is "was that burst 8259 denials
+ * or a runaway loop" (#62) — and a page that stops at the bound with no count
+ * beside it cannot tell the two apart.
+ */
+export function search(db: Database, filter: AuditFilter): AuditPage {
+  const where: string[] = [];
+  const params: Record<string, string> = {};
+
+  if (filter.user_id !== undefined) {
+    where.push("lower(user_id) = lower($user_id)");
+    params.$user_id = filter.user_id;
+  }
+  if (filter.tool !== undefined) {
+    where.push("tool = $tool");
+    params.$tool = filter.tool;
+  }
+  if (filter.hook !== undefined) {
+    where.push("hook = $hook");
+    params.$hook = filter.hook;
+  }
+  if (filter.decision !== undefined) {
+    where.push("decision = $decision");
+    params.$decision = filter.decision;
+  }
+  if (filter.since !== undefined) {
+    where.push("ts >= $since");
+    params.$since = filter.since;
+  }
+
+  const clause = where.length === 0 ? "" : ` WHERE ${where.join(" AND ")}`;
+
+  const total =
+    db
+      .query<{ n: number }, Record<string, string>>(`SELECT COUNT(*) AS n FROM audit_log${clause}`)
+      .get(params)?.n ?? 0;
+
+  const rows = db
+    .query<AuditRow, Record<string, string | number>>(
+      `SELECT * FROM audit_log${clause} ORDER BY seq DESC LIMIT $limit`,
+    )
+    .all({ ...params, $limit: filter.limit })
+    .map(fromRow);
+
+  return { rows, total };
+}
+
+// ---------------------------------------------------------------------------
+// Retention (#62)
+// ---------------------------------------------------------------------------
+
+/**
+ * The stated bound on `audit_log`, in rows.
+ *
+ * The table is append-only and nothing prunes it — the triggers in
+ * `policy-store.ts` refuse a DELETE, and a compliance log that can be quietly
+ * shortened is not one. So the bound is the disk, expressed in rows: measured
+ * at **487 bytes a row** on disk (`bun run --cwd apps/hooks bench`, the
+ * "audit_log on disk" section), the 1 GB Render volume holds ~2.2 M. Two
+ * million is that rounded down — ~930 MB — and the warning fires at 80% of it,
+ * ~744 MB, which leaves a quarter of the disk to notice it in.
+ *
+ * See "What the log costs, and the bound on it" in README.md.
+ */
+export const AUDIT_RETENTION_ROWS = 2_000_000;
+
+/**
+ * A warning for the boot log once the table is within reach of the bound, or
+ * `null` while it is not.
+ *
+ * Said at boot rather than enforced at write time on purpose: truncating the
+ * log to keep serving is the one repair nobody would see. A demo that is
+ * approaching the disk should be reset (`scripts/reset`, #23), and the run
+ * before that is the moment to say so.
+ */
+export function retentionWarning(rows: number, bound = AUDIT_RETENTION_ROWS): string | null {
+  if (rows < bound * 0.8) return null;
+  return (
+    `audit_log holds ${rows.toLocaleString("en-US")} rows, ` +
+    `${Math.round((rows / bound) * 100)}% of the ${bound.toLocaleString("en-US")}-row bound ` +
+    `this disk is sized for. Nothing prunes it: run scripts/reset before it fills.`
+  );
+}
