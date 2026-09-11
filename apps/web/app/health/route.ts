@@ -14,11 +14,13 @@
  * It still does not read `APPROVALS_STORE_TOKEN`'s production guard, so it
  * answers `200` either way — a health check that fails on a misconfiguration
  * would take the service out of rotation instead of telling anyone what to fix.
+ * That is what `readIdentitySurface` is for: the same environment, read without
+ * the guard that belongs to a credential this endpoint does not use.
  */
-import { identityReadiness, readWebConfig } from "../../lib/config.ts";
+import { identityReadiness, readIdentitySurface } from "../../lib/config.ts";
 
 export const dynamic = "force-dynamic";
 
 export function GET() {
-  return Response.json({ status: "ok", service: "web", ...identityReadiness(readWebConfig()) });
+  return Response.json({ status: "ok", service: "web", ...identityReadiness(readIdentitySurface()) });
 }

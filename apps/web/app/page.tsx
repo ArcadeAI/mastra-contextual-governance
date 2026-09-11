@@ -9,7 +9,7 @@
  */
 import { cookies } from "next/headers";
 
-import { identityReadiness, readWebConfig } from "../lib/config.ts";
+import { identityReadiness, readIdentitySurface } from "../lib/config.ts";
 import { readSessionFromCookies } from "../lib/identity/session.ts";
 import { SignInPanel } from "../components/identity/SignInPanel.tsx";
 
@@ -21,9 +21,18 @@ const SERVICES = [
   ["tools/approvals", "Python arcade-mcp toolkit — ships via arcade deploy"],
 ] as const;
 
+/**
+ * Dynamic, because it reads a session cookie. Saying so explicitly rather than
+ * relying on `cookies()` to infer it keeps `next build` from evaluating this
+ * component at all — a prerender of a page about who is signed in is either
+ * wrong or empty, and it runs under `NODE_ENV=production` with none of the
+ * deployment's environment.
+ */
+export const dynamic = "force-dynamic";
+
 export default async function Home() {
-  const config = readWebConfig();
   const jar = await cookies();
+  const config = readIdentitySurface();
   const session = await readSessionFromCookies(
     new Map(jar.getAll().map((cookie) => [cookie.name, cookie.value])),
     config,

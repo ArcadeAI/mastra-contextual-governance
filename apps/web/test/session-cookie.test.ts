@@ -40,7 +40,10 @@ function requestCarrying(headers: Headers, url = "https://cg-web-sa31.onrender.c
 describe("the seal", () => {
   test("a sealed value opens back to what went in", async () => {
     const sealed = await seal({ email: "dana.okafor@bank.example", n: 1 }, SECRET);
-    expect(await openSealed(sealed, SECRET)).toEqual({ email: "dana.okafor@bank.example", n: 1 });
+    expect(await openSealed<{ email: string; n: number }>(sealed, SECRET)).toEqual({
+      email: "dana.okafor@bank.example",
+      n: 1,
+    });
   });
 
   test("the contents are not readable without the key", async () => {

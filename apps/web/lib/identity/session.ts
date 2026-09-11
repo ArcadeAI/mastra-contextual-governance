@@ -16,7 +16,7 @@
  * session because two of them exist *before* there is a session at all, and
  * because each has its own lifetime measured in minutes.
  */
-import { readWebConfig, cookiesAreSecure, type WebConfig } from "../config.ts";
+import { cookiesAreSecure, readIdentitySurface, type IdentitySurface } from "../config.ts";
 import { appendCookie, expireCookie, readCookies } from "./cookies.ts";
 import { chunk, chunkName, clearedChunks, joinChunks, openSealed, seal } from "./seal.ts";
 
@@ -100,7 +100,7 @@ export interface PendingFlow {
  * a different `SESSION_SECRET`, a tampered byte. All of them mean the same
  * thing to every caller — nobody is signed in — and that state is always safe.
  */
-export async function readSession(request: Request, config: WebConfig = readWebConfig()): Promise<Session | null> {
+export async function readSession(request: Request, config: IdentitySurface = readIdentitySurface()): Promise<Session | null> {
   return readSessionFromCookies(readCookies(request), config);
 }
 
@@ -114,7 +114,7 @@ export async function readSession(request: Request, config: WebConfig = readWebC
  */
 export async function readSessionFromCookies(
   cookies: ReadonlyMap<string, string>,
-  config: WebConfig = readWebConfig(),
+  config: IdentitySurface = readIdentitySurface(),
 ): Promise<Session | null> {
   const joined = joinChunks(SESSION_COOKIE, cookies);
   const session = await openSealed<Session>(joined, config.identity.sessionSecret);
@@ -135,7 +135,7 @@ export async function writeSession(
   headers: Headers,
   request: Request,
   session: Session,
-  config: WebConfig = readWebConfig(),
+  config: IdentitySurface = readIdentitySurface(),
 ) {
   const sealed = await seal(session, config.identity.sessionSecret);
   const pieces = chunk(sealed);
@@ -149,7 +149,7 @@ export async function writeSession(
 }
 
 /** Expire every chunk this browser is carrying. Signing out, and switching persona. */
-export function clearSession(headers: Headers, request: Request, config: WebConfig = readWebConfig()) {
+export function clearSession(headers: Headers, request: Request, config: IdentitySurface = readIdentitySurface()) {
   const secure = cookiesAreSecure(config);
   const cookies = readCookies(request);
   for (const stale of clearedChunks(SESSION_COOKIE, cookies, 0)) expireCookie(headers, stale, secure);
@@ -162,18 +162,18 @@ export function clearSession(headers: Headers, request: Request, config: WebConf
 export async function readLeg<T>(
   request: Request,
   name: string,
-  config: WebConfig = readWebConfig(),
+  config: IdentitySurface = readIdentitySurface(),
 ): Promise<T | null> {
   return openSealed<T>(readCookies(request).get(name), config.identity.sessionSecret);
 }
 
-export async function writeLeg(headers: Headers, name: string, value: unknown, config: WebConfig = readWebConfig()) {
+export async function writeLeg(headers: Headers, name: string, value: unknown, config: IdentitySurface = readIdentitySurface()) {
   appendCookie(headers, name, await seal(value, config.identity.sessionSecret), {
     maxAge: LEG_MAX_AGE,
     secure: cookiesAreSecure(config),
   });
 }
 
-export function clearLeg(headers: Headers, name: string, config: WebConfig = readWebConfig()) {
+export function clearLeg(headers: Headers, name: string, config: IdentitySurface = readIdentitySurface()) {
   expireCookie(headers, name, cookiesAreSecure(config));
 }

@@ -1,8 +1,9 @@
 # apps/web — the demo UI
 
 Next.js. Eventually the split screen: a deliberately boring enterprise loan app on the
-left, the Arcade control plane on the right (#22). Today it carries the control-plane
-panel (#21), the approval page (#19), and the scaffold's placeholder home page.
+left, the Arcade control plane on the right (#22). Today it carries the identity
+(#82), the control-plane panel (#21), the approval page (#19), and the scaffold's
+placeholder home page.
 
 ```sh
 bun run --cwd apps/web dev               # then open /panel or /approvals/<id>
@@ -15,6 +16,183 @@ services: `dev` and `start` go through `scripts/next.ts`, which is a process Bun
 directly so the file is loaded before Next starts ([#50](https://github.com/ArcadeAI-labs/mastra-contextual-governance/issues/50),
 fixed in #55). A real environment variable still wins, which is what
 `PORT=4420 bun run --cwd apps/web dev` and Render's injected `PORT` rely on.
+
+## Identity — sign in, the gateway token, the verifier route
+
+`DESIGN.md` → **Identity** and **Identity and OAuth**. There are two authentication
+hops with two different mechanisms, and this service owns its side of both. Nothing
+here is the agent; #14 puts the agent on top.
+
+```
+Dana, in her own Chrome profile
+  → "Sign in as Dana"        GET /api/auth/signin?persona=dana
+      OIDC code + PKCE against apps/idp as client C, prompt=login
+    → cg-idp's login page, cg-idp's consent page
+  → GET /api/auth/callback   code → token → /oauth2/userinfo → email
+      sealed cookie { email }
+  → hop 1                    GET /api/arcade/start
+      401 on the gateway → resource metadata → authorization-server metadata
+      → dynamic client registration → PKCE authorize → Arcade's consent screen
+  → GET /api/arcade/callback sealed cookie { email, gateway access + refresh }
+  ─── later, on the persona's FIRST tool authorization ───
+  → hop 2                    GET /api/arcade/verify?flow_id=…
+      email from the sealed session, never from the request
+      → POST cloud.arcade.dev/api/v1/oauth/confirm_user   (server-side)
+      → fetch next_uri                                     (server-side)
+      → send the browser on
+```
+
+Five route handlers, and they are the whole of it:
+
+| route | what it does |
+|---|---|
+| `GET /api/auth/signin` | starts sign-in at cg-idp as client C, `prompt=login` |
+| `GET /api/auth/callback` | makes the session; completes a parked verification if there is one |
+| `GET /api/arcade/start` | begins the gateway authorization for the signed-in persona |
+| `GET /api/arcade/callback` | stores the gateway access + refresh token on the session |
+| `GET /api/arcade/verify` | Arcade's custom user verifier |
+| `POST /api/auth/signout` | forgets the persona and the gateway token together |
+
+Each `app/api/**/route.ts` is a wrapper around a plain `(Request) => Promise<Response>`
+in `lib/identity/handlers.ts`. That is what lets `test/identity-flow.test.ts` mount the
+same functions behind a real `Bun.serve` and drive them with a cookie jar over real
+HTTP, against a real `apps/idp` subprocess — so the suite asserts on the `Set-Cookie`
+headers a browser would actually receive rather than on a mock's arguments.
+
+### One sealed cookie, one persona per browser
+
+No fourth database. The persona's email and the gateway access + refresh token live in
+one cookie, **AES-256-GCM under `SESSION_SECRET`**, `HttpOnly; Secure; SameSite=Lax`,
+chunked across `cg_session.0`, `cg_session.1`, … when it exceeds what a browser will
+hold. Two JWTs and an email exceed 4KB comfortably, so chunking is the normal case; a
+browser handed an oversized `Set-Cookie` drops it in silence, and the symptom is a
+sign-in that appears to work and then forgets.
+
+Encrypted rather than merely signed, because the value is a bearer token for the whole
+gateway and a signed-but-readable cookie would put it in the persona's own DevTools.
+There is no development fallback key: an unset `SESSION_SECRET` stops sign-in rather
+than weakening it.
+
+One persona per browser is a design, not a limitation — on stage each persona runs in
+its own Chrome profile. Spike #75 named the trap: a verifier that reads a
+browser-keyed session while four personas share one browser binds every tool call to
+whoever signed in last.
+
+### Switching persona forces a fresh login, and that is measured
+
+`prompt=login` rides on **every** sign-in, not only on a detected switch: a switch that
+has to be detected is a switch that can be missed, and being wrong costs every tool
+call for the rest of the demo being made as the wrong person while the screen says
+otherwise.
+
+Measured against a real `apps/idp`, two sign-ins in one browser:
+
+```
+                              with prompt=login          without
+after "Sign in as Dana"   dana.okafor@bank.example   dana.okafor@bank.example
+after "Sign in as Sam"    sam.reyes@bank.example     dana.okafor@bank.example
+pages shown by the switch                        2                          0
+```
+
+Without it the second authorization continues off the IdP session the first one left
+behind, renders nothing, and the browser comes back as Dana.
+`test/identity-flow.test.ts` pins both halves.
+
+### The verifier never reads identity from the request
+
+Arcade sends a verifier **exactly one** parameter, `flow_id` — measured on #75 by
+recording the whole query string rather than reading the field we expected. So the
+email comes from this browser's sealed session and from nowhere else, and a request
+carrying `user_id`, `email`, `sub` or `login_hint` is refused with `400` rather than
+quietly served. Ignoring them would be correct too; refusing them is testable from
+outside.
+
+Two measured facts shape the rest of it:
+
+- **`confirm_user` is called server-side with `ARCADE_API_KEY`, in-flow.** Run by hand
+  it is unreliable: Arcade accepts it only while the flow is still awaiting
+  verification, and that window is shorter than a human's turnaround — the same call
+  succeeded once at ~8 minutes and returned a bare `{"code":400,"msg":"Bad request"}`
+  the next time, for a flow Arcade still recognised.
+- **`next_uri` is fetched server-side.** Arcade does not finalise the grant until
+  something lands there. A verifier that returns the 303 and trusts the browser to
+  follow it is correct for a browser and wrong for everything else.
+
+A `confirm_user` non-2xx or a `user_mismatch` renders a page carrying Arcade's own
+words and says plainly that nothing was authorized. Nothing fails quietly.
+
+**No session is the expected case**, on every fresh Chrome profile. The flow id is
+parked in a sealed, ten-minute cookie, the browser is sent to sign in, and the same two
+calls run from the sign-in callback. A parked flow that expires renders a page saying
+so and what to do — it is never dropped in silence.
+
+### Configuration, and what `/health` says
+
+```
+curl -s localhost:3000/health
+{"status":"ok","service":"web","signin":"configured","gateway":"configured","verifier":"configured"}
+```
+
+Three capabilities rather than one flag, because they fail independently and the person
+reading this is trying to find out which step is outstanding.
+
+| variable | what it is |
+|---|---|
+| `IDP_ISSUER` | `apps/idp`'s public origin, **as a URL** — not the HOST-form the cross-service keys use |
+| `IDP_CLIENT_ID` / `IDP_CLIENT_SECRET` | client C, this service's own registration at the IdP |
+| `SESSION_SECRET` | seals the session cookie. No fallback. `openssl rand -hex 32` |
+| `PUBLIC_URL` | this service's own origin, with the scheme. Every `redirect_uri` is built from it |
+| `ARCADE_GATEWAY_ID` | `cg-demo-us`, the User Source gateway hop 1 authorizes against |
+| `ARCADE_API_KEY` | the project key `confirm_user` is authenticated with |
+| `IDP_SCOPES` | defaults to `openid email`. `email` is the join key, so it is not optional |
+| `ARCADE_CLOUD_URL` | defaults to `https://cloud.arcade.dev`, which is **not** `ARCADE_API_URL`. A test seam |
+| `ARCADE_MCP_CLIENT_ID` | optional. Pins the gateway's MCP client id instead of registering one per process |
+
+Every one of them is in `.env.example` with where the value comes from, and the first
+six are `sync: false` on `cg-web` in `render.yaml`.
+
+Two steps are not environment variables on this service:
+
+- **Client C must exist on cg-idp**, with `${PUBLIC_URL}/api/auth/callback` allowlisted:
+  `IDP_OAUTH_CLIENTS=web` and `IDP_OAUTH_REDIRECT_URIS_WEB=…` there, then
+  `bun run --cwd apps/idp oauth-client --client web --rotate`, which prints the secret
+  exactly once (#70).
+- **Arcade dashboard → Auth → Settings → Custom verifier route** must be
+  `${PUBLIC_URL}/api/arcade/verify`. Without it Arcade uses its own verifier, which
+  demands an Arcade account that is a project member — our personas are not, the grant
+  binds to whoever is signed in at `account.arcade.dev`, and the tool re-challenges
+  forever with nothing on the panel to say why (`DESIGN.md` open risk 4). Check it
+  through the admin API, not the dashboard label.
+
+### Running the identity locally
+
+Two terminals, plus whatever port this worktree owns. `apps/idp` needs its own install
+(`bun install --cwd apps/idp`) — see `DESIGN.md`.
+
+```sh
+# Terminal 1 — the identity provider, with client C
+PORT=8083 IDP_PUBLIC_URL=http://localhost:8083 \
+  IDP_OAUTH_CLIENTS=web \
+  IDP_OAUTH_REDIRECT_URIS_WEB=http://localhost:3000/api/auth/callback \
+  bun apps/idp/src/index.ts
+
+# then, in the same environment, mint client C's secret (printed once)
+IDP_PUBLIC_URL=http://localhost:8083 IDP_OAUTH_CLIENTS=web \
+  IDP_OAUTH_REDIRECT_URIS_WEB=http://localhost:3000/api/auth/callback \
+  bun run --cwd apps/idp oauth-client --client web --rotate
+
+# Terminal 2 — the web app
+PORT=3000 PUBLIC_URL=http://localhost:3000 \
+  IDP_ISSUER=http://localhost:8083 \
+  IDP_CLIENT_ID=<from above> IDP_CLIENT_SECRET=<from above> \
+  SESSION_SECRET=$(openssl rand -hex 32) \
+  bun run --cwd apps/web dev
+```
+
+Open `/`, press a persona, sign in with the fixture password from
+`apps/idp/src/fixtures/people.json`. `/health` reports `signin: configured`; hop 1 and
+the verifier need `ARCADE_GATEWAY_ID` and a real `ARCADE_API_KEY` and are exercised
+locally by `test/identity-flow.test.ts` against a stand-in.
 
 ## The control-plane panel
 

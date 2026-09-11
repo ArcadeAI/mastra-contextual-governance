@@ -88,6 +88,44 @@ export interface WebConfig {
  */
 const DEV_STORE_TOKEN = "cg-approvals-store-dev-token-not-for-production";
 
+/**
+ * The identity-shaped part of the environment, read **without** the
+ * `APPROVALS_STORE_TOKEN` guard.
+ *
+ * Its own function for one reason. `/health` and the home page both need to
+ * report whether identity is configured, and neither has anything to do with
+ * the approvals store — so going through `readWebConfig` would make a missing
+ * approvals token take down the landing page and the health endpoint of a
+ * production deployment, for a credential neither of them uses. `/health` in
+ * particular must answer `200` whatever else is wrong; a health check that
+ * fails on a misconfiguration removes the service instead of reporting it.
+ *
+ * Still one place reading the environment — this file — and `readWebConfig`
+ * builds on it rather than repeating it.
+ */
+export type IdentitySurface = Pick<WebConfig, "identity" | "arcadeApiUrl" | "arcadeApiKey">;
+
+export function readIdentitySurface(
+  env: Record<string, string | undefined> = process.env,
+): IdentitySurface {
+  return {
+    arcadeApiUrl: trimUrl(env.ARCADE_API_URL) || "https://api.arcade.dev",
+    arcadeApiKey: env.ARCADE_API_KEY?.trim() ?? "",
+    identity: {
+      idpIssuer: trimUrl(env.IDP_ISSUER),
+      idpClientId: env.IDP_CLIENT_ID?.trim() ?? "",
+      idpClientSecret: env.IDP_CLIENT_SECRET?.trim() ?? "",
+      // `openid` for an ID token, `email` because the address is the join key
+      // across Arcade, the OAuth subject and the loan book (DESIGN.md rule 3).
+      idpScopes: env.IDP_SCOPES?.trim() || "openid email",
+      sessionSecret: env.SESSION_SECRET?.trim() ?? "",
+      publicUrl: trimUrl(env.PUBLIC_URL),
+      gatewayId: env.ARCADE_GATEWAY_ID?.trim() ?? "",
+      cloudUrl: trimUrl(env.ARCADE_CLOUD_URL) || "https://cloud.arcade.dev",
+    },
+  };
+}
+
 export function readWebConfig(env: Record<string, string | undefined> = process.env): WebConfig {
   const storeToken = env.APPROVALS_STORE_TOKEN?.trim();
   // Same guard, same wording, as `apps/hooks/src/config.ts`. Round 3 of #52's
@@ -109,21 +147,8 @@ export function readWebConfig(env: Record<string, string | undefined> = process.
     // browser, so a host nothing can resolve fails in a visitor's DevTools.
     hooksHost: publicHost("HOOKS_PUBLIC_HOST", env.HOOKS_PUBLIC_HOST, "localhost:8081"),
     approvalsStoreToken: storeToken || DEV_STORE_TOKEN,
-    arcadeApiUrl: (env.ARCADE_API_URL?.trim() || "https://api.arcade.dev").replace(/\/+$/, ""),
-    arcadeApiKey: env.ARCADE_API_KEY?.trim() ?? "",
     approvalsToolkit: env.ARCADE_APPROVALS_TOOLKIT?.trim() || "Approvals",
-    identity: {
-      idpIssuer: trimUrl(env.IDP_ISSUER),
-      idpClientId: env.IDP_CLIENT_ID?.trim() ?? "",
-      idpClientSecret: env.IDP_CLIENT_SECRET?.trim() ?? "",
-      // `openid` for an ID token, `email` because the address is the join key
-      // across Arcade, the OAuth subject and the loan book (DESIGN.md rule 3).
-      idpScopes: env.IDP_SCOPES?.trim() || "openid email",
-      sessionSecret: env.SESSION_SECRET?.trim() ?? "",
-      publicUrl: trimUrl(env.PUBLIC_URL),
-      gatewayId: env.ARCADE_GATEWAY_ID?.trim() ?? "",
-      cloudUrl: trimUrl(env.ARCADE_CLOUD_URL) || "https://cloud.arcade.dev",
-    },
+    ...readIdentitySurface(env),
   };
 }
 
@@ -152,7 +177,7 @@ export interface IdentityReadiness {
   verifier: "configured" | "missing";
 }
 
-export function identityReadiness(config: WebConfig): IdentityReadiness {
+export function identityReadiness(config: IdentitySurface): IdentityReadiness {
   const { identity } = config;
   const signin = Boolean(
     identity.idpIssuer && identity.idpClientId && identity.idpClientSecret &&
@@ -182,7 +207,7 @@ export function identityReadiness(config: WebConfig): IdentityReadiness {
  * and then forgets. Unset `PUBLIC_URL` means an unconfigured service, which
  * cannot sign anyone in anyway — treat it as the deployed case.
  */
-export function cookiesAreSecure(config: WebConfig): boolean {
+export function cookiesAreSecure(config: IdentitySurface): boolean {
   return !config.identity.publicUrl.startsWith("http://");
 }
 
