@@ -855,3 +855,64 @@ ALLOWED   <tunnel>/callback                                                     
 $ git check-ignore -v docs/spikes/evidence/.env.local
 .gitignore:14:.env.local	docs/spikes/evidence/.env.local
 ```
+
+### 11.10 After the Client ID was corrected — two runs, 17:37Z and 17:38Z
+
+Config re-read first, at 17:37:06Z:
+
+```json
+"client_id": "RskTFjl6AqkUO8FKYWjpDCLd139YE36F"
+```
+
+**Dana, 17:37:14Z — not a valid test of the fix.** Arcade handed back the *same*
+`authorization_url` as the 16:59Z run: same `state=2dfe85b4-d2e3-4ee3-9b68-f27c573912fc`,
+same `code_challenge`, and the old bad `client_id=https%3A%2F%2F…%2Foauth2%2Ftoken` still
+baked into it.
+
+```
+302 GET https://cg-idp-or5b.onrender.com/oauth2/authorize?client_id=https%3A%2F%2F…%2Foauth2%2Ftoken&…
+302 → https://cg-idp-or5b.onrender.com/error?error=invalid_client&error_description=client_id+is+required
+```
+
+**Arcade caches a pending authorization flow, `authorization_url` included**, so a
+provider edit does not reach a flow already minted. A #24 note: after changing a
+provider, existing pending flows are stale and keep failing with the old configuration.
+
+**Sam, 17:38:46Z — a fresh flow, so a clean test, and it doubles as H2-d.**
+
+```
+GET  cg-idp-or5b/oauth2/authorize?client_id=RskTFjl6AqkUO8FKYWjpDCLd139YE36F
+       &redirect_uri=…%2Fapi%2Fv1%2Foauth%2Ff4c6b_ap_1cWxRQzV98W4%2Fcallback
+       &scope=openid+email&state=18175b25-…            (PKCE S256)
+302 → cloud.arcade.dev/api/v1/oauth/f4c6b_ap_1cWxRQzV98W4/callback?code=<redacted>&…
+303 → <tunnel>/verify?flow_id=18175b25-d14a-4cfa-ba45-650a74c0052f
+303 → cg-idp-or5b/oauth2/authorize
+302 → <tunnel>/callback?code=<redacted>&…               ← SILENT, hop 1's session reused
+303 → cloud.arcade.dev/api/v1/oauth/callback_success
+200   callback_success
+```
+
+```
+[verifier] GET /verify — Arcade sent 1 parameter(s) {"flow_id":"18175b25-d14a-4cfa-ba45-650a74c0052f"}
+[verifier] IdP token exchange, client_secret_basic -> 200
+[verifier] IdP /oauth2/userinfo -> 200
+           {"sub":"25bb917b-4a90-4b9f-a18a-e9550b9f3275","email":"sam.reyes@…"}
+[verifier] POST confirm_user -> 200
+           {"auth_id":"ar_3JBxbZokKhznJwgMtAn5R0XfygV","next_uri":".../callback_success"}
+```
+
+Sam's `sub` (`25bb917b-…`) is **different** from Dana's (`9d8c2228-…`) and each email is
+the right one, so the verifier binds two distinct personas correctly. 8280 `/access`
+frames on that run, every one `sam.reyes@…` lowercase.
+
+`Loan_SearchLoans` retried immediately afterwards still returns `isError: true` with a
+new `authorization_url`.
+
+**So the grant does not store even with a correct Client ID, a correct secret, an
+`auth_method` of `client_secret_basic`, a fresh flow and a complete verification.** The
+one step not visible from outside is Arcade's own token exchange at our IdP. For whoever
+picks this up: the window is **2026-09-11T17:38:50Z to 17:40:00Z** on `cg-idp`, and the
+line to find is a `POST /oauth2/token` for client `RskTFjl6…` that is *not* the
+verifier's own 200. Its status says which cause: `401` a method our client refuses, `400
+invalid client_secret` a pre-rotation secret on the provider, `400 invalid code` a code
+our IdP does not recognise, and **no line at all** means Arcade never attempted it.
