@@ -163,11 +163,17 @@ const SCHEMA = idempotentSchema(GENERATED_SCHEMA);
  * existed reads back 0, the SQLite default, which is exactly the "needs the
  * upgrade path" answer, so no disk has to be touched by hand to adopt this.
  *
- * **What this buys: new tables and new indexes.** An added column, a widened
- * `CHECK`, a renamed index — none of those are expressible as
- * `CREATE ... IF NOT EXISTS`, none of them happen at boot, and each still
- * needs a guarded `ALTER TABLE` here (the way `apps/loan-app` does it) or a
- * reset.
+ * **What version 1 does:** replays the idempotent DDL, so a table or index
+ * added since a disk was written simply appears (`jwks`, from the JWT plugin),
+ * and rebuilds `user` so `email` is `COLLATE NOCASE` and every stored address
+ * is lowercase (#58, which only a fresh seed got). The rebuild is not
+ * expressible as DDL replay — see `rebuildUserWithNocaseEmail`.
+ *
+ * **The limit on the replay half: new tables and new indexes.** An added
+ * column, a widened `CHECK`, a renamed index — none of those are expressible
+ * as `CREATE ... IF NOT EXISTS`, none of them happen by replay, and each needs
+ * an explicit step here (a guarded `ALTER TABLE`, the way `apps/loan-app` does
+ * it, or a table rebuild) or a reset.
  */
 export const SCHEMA_VERSION = 1;
 
@@ -254,12 +260,131 @@ function upgradeSchema(db: Database, path: string): void {
   if (found > SCHEMA_VERSION) throw new SchemaTooNewError(path, found);
   if (found === SCHEMA_VERSION) return;
 
-  // One transaction, so a half-applied upgrade rolls back to a database that
-  // still reads its old version and tries again on the next boot.
-  db.transaction(() => {
-    db.exec(SCHEMA);
-    db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
-  })();
+  // `PRAGMA foreign_keys` is a no-op inside a transaction, so it goes here.
+  // The `user` rebuild below drops a table five others reference; with the
+  // constraints live, that drop would cascade every session, account, token
+  // and consent into nothing. Off for the rebuild, checked before the commit,
+  // on again afterwards — SQLite's own documented procedure for changing a
+  // column definition.
+  db.exec("PRAGMA foreign_keys = OFF");
+  try {
+    // One transaction, so a half-applied upgrade rolls back to a database that
+    // still reads its old version and tries again on the next boot.
+    db.transaction(() => {
+      db.exec(SCHEMA);
+      rebuildUserWithNocaseEmail(db, path);
+      db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+
+      // Step 10 of that procedure, inside the transaction so a violation rolls
+      // the whole thing back rather than leaving orphaned rows behind.
+      const orphans = db.query<{ table: string }, []>("PRAGMA foreign_key_check").all();
+      if (orphans.length > 0) {
+        throw new Error(
+          `idp.db at ${path}: rebuilding "user" left ${orphans.length} row(s) with no person ` +
+            `to belong to. Rolled back; the database is untouched.`,
+        );
+      }
+    })();
+  } finally {
+    db.exec("PRAGMA foreign_keys = ON");
+  }
+}
+
+/** The scratch name the rebuilt `user` table is built under. */
+const USER_REBUILD_TABLE = "user_rebuilding_for_nocase_email";
+
+/**
+ * Rebuilds `user` so `email` is `COLLATE NOCASE`, lowercasing every stored
+ * address on the way.
+ *
+ * #58 made `user.email` case-insensitive and lowercased the seed, but only in
+ * `schema.sql` — which **only a fresh seed ever runs**. The deployed `cg-idp`
+ * disk keeps the case-sensitive column it was created with, so a persona whose
+ * `PERSONA_*_EMAIL` carried a capital letter still cannot log in, and the login
+ * page still reports that as "That email and password did not match". #58
+ * survived a whole sitting on exactly that sentence.
+ *
+ * Measured before choosing how to fix it, because the two candidates are not
+ * equivalent. Better Auth's lookup is:
+ *
+ *     select "primary".* from (select * from "user" where "user"."email" = ?) as "primary"
+ *
+ * A bare `=` with **no `COLLATE` clause**, so SQLite takes the collation from
+ * the column's own declaration. A `CREATE UNIQUE INDEX ... COLLATE NOCASE`
+ * therefore changes nothing about what that comparison means: measured on a
+ * pre-#58 schema, the indexed database still answers 401 with the right
+ * password, and only rebuilding the column answers 200. **The table has to be
+ * rebuilt; the index would have been a control that silently does nothing.**
+ *
+ * SQLite's documented procedure for changing a column definition: new table
+ * under a scratch name, copy, drop the old, rename. `ALTER TABLE ... RENAME`
+ * is not used on the *old* table, because with foreign keys enabled that
+ * rewrites the `REFERENCES` clauses in `session`, `account` and the three
+ * OAuth tables to point at the scratch name.
+ *
+ * Unconditional on the 0 → 1 step rather than conditional on detecting the
+ * collation. `PRAGMA user_version` is the gate, it runs exactly once per disk,
+ * and rebuilding a column that was already `NOCASE` reaches the same state —
+ * so there is no detection to get subtly wrong, which is the failure mode this
+ * whole file exists to avoid.
+ */
+function rebuildUserWithNocaseEmail(db: Database, path: string): void {
+  const create = /create table if not exists "user" \([^;]*\)/i.exec(SCHEMA)?.[0];
+  if (!create) {
+    throw new Error(
+      `idp.db schema: no 'create table "user"' statement to rebuild from — Better Auth changed shape`,
+    );
+  }
+  // The same refusal `src/schema.ts` makes when it patches the collation in:
+  // a rebuild that quietly produced a case-sensitive column would leave the
+  // disk exactly as broken as before, and say it had migrated.
+  if (!/collate\s+nocase/i.test(create)) {
+    throw new Error(
+      `idp.db schema: "user"."email" is not 'collate nocase' in the generated schema, so ` +
+        `rebuilding the table would not make the lookup case-insensitive. Refusing to ` +
+        `report a migration that does nothing. See src/schema.ts.`,
+    );
+  }
+
+  const columnsOf = (table: string): string[] =>
+    db
+      .query<{ name: string }, []>(`PRAGMA table_info("${table}")`)
+      .all()
+      .map((column) => column.name);
+
+  const existing = columnsOf("user");
+  db.exec(create.replace(/if not exists "user"/i, `"${USER_REBUILD_TABLE}"`));
+
+  // Only the columns both shapes have. A column the new table requires and the
+  // old one never had is a migration this code cannot do; the insert fails
+  // inside the transaction and the disk is left as it was.
+  const carried = columnsOf(USER_REBUILD_TABLE).filter((column) => existing.includes(column));
+  const target = carried.map((column) => `"${column}"`).join(", ");
+  const source = carried
+    // The other half of #58's rule, applied to the rows already on the disk:
+    // the column is now case-insensitive to *compare*, but the value itself
+    // has to be lowercase, because it is the join key `apps/hooks` and the
+    // loan book hold byte-for-byte.
+    .map((column) => (column === "email" ? `lower("email")` : `"${column}"`))
+    .join(", ");
+
+  try {
+    db.exec(`INSERT INTO "${USER_REBUILD_TABLE}" (${target}) SELECT ${source} FROM "user"`);
+  } catch (cause) {
+    if (/UNIQUE|constraint/i.test(String(cause))) {
+      throw new Error(
+        `idp.db at ${path}: two people differ only by the case of their email, so they ` +
+          `collapse into one row once "user"."email" is case-insensitive. Rolled back. ` +
+          `Decide which row is the person, delete the other, and restart. ` +
+          `Find them with: SELECT lower(email), COUNT(*) FROM "user" GROUP BY 1 HAVING COUNT(*) > 1;`,
+        { cause },
+      );
+    }
+    throw cause;
+  }
+
+  db.exec('DROP TABLE "user"');
+  db.exec(`ALTER TABLE "${USER_REBUILD_TABLE}" RENAME TO "user"`);
 }
 
 function hasSchema(db: Database): boolean {

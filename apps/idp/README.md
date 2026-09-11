@@ -233,22 +233,58 @@ that predates it. The revision lives in `PRAGMA user_version`, the same shape #6
 - **Fresh database** — `seed()`, unchanged: the DDL, the fixture rows *and* the version
   stamp in one transaction, so a half-failed seed leaves no tables at all rather than a
   schema with no people.
-- **Existing database** — idempotent DDL only, no inserts. `src/schema.sql` stays
-  byte-identical to what Better Auth compiles (so `generate:check` compares like with
-  like) and `idempotentSchema` derives the `CREATE ... IF NOT EXISTS` form at runtime. It
-  **throws** on a statement it cannot rewrite rather than skipping it, because a statement
-  that silently does not run looks exactly like a schema that is already current.
+- **Existing database** — idempotent DDL, no inserts, plus the one change that DDL
+  replay cannot express (below). `src/schema.sql` stays byte-identical to what Better Auth
+  compiles (so `generate:check` compares like with like) and `idempotentSchema` derives
+  the `CREATE ... IF NOT EXISTS` form at runtime. It **throws** on a statement it cannot
+  rewrite rather than skipping it, because a statement that silently does not run looks
+  exactly like a schema that is already current.
 - **A database this build cannot read** — `user_version` greater than `SCHEMA_VERSION`
   throws `SchemaTooNewError` from `openPeople`, before the port opens, naming the file.
 
-**The limit:** this buys new tables and new indexes. An added column needs a guarded
-`ALTER TABLE ... ADD COLUMN` here, the way `apps/loan-app` does it, or a reset.
+**The limit on the replay half:** it buys new tables and new indexes. An added column
+needs a guarded `ALTER TABLE ... ADD COLUMN` here, the way `apps/loan-app` does it, or a
+reset.
 
 Before #70 there was no upgrade path at all — `seed()` was the only thing that ran the
 DDL, and it ran only when the `user` table was missing (#69). The JWT plugin adds the
 `jwks` table, so on the live disk the service would have come up green and failed on the
-first ID token. `test/schema-upgrade.test.ts` boots a pre-#70 database, with its encrypted
-client row, and holds both halves.
+first ID token.
+
+### The `user.email` collation, which replay cannot fix
+
+Version 1 also **rebuilds the `user` table**, so `email` is `COLLATE NOCASE`, and
+lowercases every address already stored.
+
+#58 made the column case-insensitive, but in `schema.sql` — and only a fresh seed ever
+runs that. An existing `idp.db` keeps the case-sensitive column it was created with, so a
+persona seeded as `Dana.Okafor@…` still cannot log in, and the login page still reports it
+as "That email and password did not match". SQLite cannot change a column's collation in
+place, and the cheaper-looking remedy does not work:
+
+```
+Better Auth's lookup, measured:
+  select "primary".* from (select * from "user" where "user"."email" = ?) as "primary"
+```
+
+A bare `=` with **no `COLLATE` clause**, so SQLite takes the collation from the column's
+own declaration. Adding a `CREATE UNIQUE INDEX ... COLLATE NOCASE` therefore changes
+nothing about what that comparison means — measured on a pre-#58 schema, the indexed
+database still answers `401` to the correct password, and only rebuilding the column
+answers `200`. An index here would have been a control that silently does nothing.
+
+So version 1 follows SQLite's documented procedure: foreign keys off, new table under a
+scratch name, copy with `lower(email)`, drop, rename, `PRAGMA foreign_key_check`, foreign
+keys on. The `session`, `account` and OAuth rows that reference `user` survive it — with
+the constraints live, dropping `user` would cascade every one of them into nothing.
+
+If two people differ only by the case of their address they would collapse into one row,
+so the boot **refuses and rolls back** rather than picking a winner, and prints the query
+that finds them.
+
+`test/schema-upgrade.test.ts` holds all of it, including the fixture built from
+`git show 3d2dd9d^:apps/idp/src/schema.sql` — the real pre-#58 schema, read out of git
+rather than transcribed, so it cannot drift into agreeing with the code it tests.
 
 ### Why it is not a workspace member
 

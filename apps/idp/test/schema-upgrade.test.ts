@@ -20,7 +20,7 @@
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import type { Subprocess } from "bun";
 import { Database } from "bun:sqlite";
-import { symmetricEncrypt } from "better-auth/crypto";
+import { hashPassword, symmetricEncrypt } from "better-auth/crypto";
 import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -38,6 +38,10 @@ import {
 } from "../src/db.ts";
 
 const ROOT = join(import.meta.dir, "..");
+const REPO_ROOT = join(ROOT, "..", "..");
+
+/** The commit that merged #58; its parent is the last case-sensitive schema. */
+const SLICE_58 = "3d2dd9d";
 const SECRET = "test-secret-".padEnd(48, "x");
 const OTHER_SECRET = "a-different-secret-".padEnd(48, "y");
 const REDIRECT_URI = "http://127.0.0.1:9/callback";
@@ -110,6 +114,71 @@ function tables(db: Database): string[] {
 function storedSecret(db: Database): string {
   return db.query<{ clientSecret: string }, []>('SELECT "clientSecret" FROM "oauthClient"').get()!
     .clientSecret;
+}
+
+/** A port the OS says is free — several worktrees run `bun test` at once. */
+function freePort(): number {
+  const probe = Bun.serve({ port: 0, fetch: () => new Response(null, { status: 404 }) });
+  const { port } = probe;
+  probe.stop(true);
+  if (typeof port !== "number") throw new Error("Bun.serve({ port: 0 }) reported no port");
+  return port;
+}
+
+interface Booted {
+  child: Subprocess;
+  baseUrl: string;
+  log: string;
+  health: Record<string, any>;
+}
+
+/** Starts the service on `path`, waits for /health, and returns both plus the log. */
+async function boot(path: string, secret: string): Promise<Booted> {
+  const port = freePort();
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const logPath = join(dirname(path), `stdout-${port}.log`);
+
+  const inherited = Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([key, value]) => value !== undefined && !key.startsWith("PERSONA_") && !key.startsWith("IDP_"),
+    ),
+  ) as Record<string, string>;
+
+  const child = Bun.spawn(["bun", join(ROOT, "src", "index.ts")], {
+    env: {
+      ...inherited,
+      PORT: String(port),
+      IDP_DB_PATH: path,
+      IDP_PUBLIC_URL: baseUrl,
+      IDP_OAUTH_REDIRECT_URIS: REDIRECT_URI,
+      BETTER_AUTH_SECRET: secret,
+    },
+    // stderr into the same file: a rotation is loud on stderr, and "the log"
+    // is what `render logs` shows, which does not separate the two.
+    stdout: Bun.file(logPath),
+    stderr: Bun.file(logPath),
+  });
+
+  const deadline = Date.now() + 20_000;
+  for (;;) {
+    try {
+      if ((await fetch(`${baseUrl}/health`)).ok) break;
+    } catch {
+      // Not listening yet.
+    }
+    if (Date.now() > deadline) {
+      child.kill();
+      throw new Error(`idp did not come up:\n${await Bun.file(logPath).text()}`);
+    }
+    await Bun.sleep(50);
+  }
+
+  return {
+    child,
+    baseUrl,
+    log: await Bun.file(logPath).text(),
+    health: (await (await fetch(`${baseUrl}/health`)).json()) as Record<string, any>,
+  };
 }
 
 describe("idempotentSchema", () => {
@@ -283,70 +352,6 @@ describe("the client secret on a pre-#70 disk", () => {
 describe("a pre-#70 disk, booted the way Render boots it", () => {
   const dana = loadPeople({}).find((person) => person.persona === "dana")!;
 
-  /** A port the OS says is free — several worktrees run `bun test` at once. */
-  function freePort(): number {
-    const probe = Bun.serve({ port: 0, fetch: () => new Response(null, { status: 404 }) });
-    const { port } = probe;
-    probe.stop(true);
-    if (typeof port !== "number") throw new Error("Bun.serve({ port: 0 }) reported no port");
-    return port;
-  }
-
-  interface Booted {
-    child: Subprocess;
-    baseUrl: string;
-    log: string;
-    health: Record<string, any>;
-  }
-
-  /** Starts the service on `path`, waits for /health, and returns both plus the log. */
-  async function boot(path: string, secret: string): Promise<Booted> {
-    const port = freePort();
-    const baseUrl = `http://127.0.0.1:${port}`;
-    const logPath = join(dirname(path), `stdout-${port}.log`);
-
-    const inherited = Object.fromEntries(
-      Object.entries(process.env).filter(
-        ([key, value]) => value !== undefined && !key.startsWith("PERSONA_") && !key.startsWith("IDP_"),
-      ),
-    ) as Record<string, string>;
-
-    const child = Bun.spawn(["bun", join(ROOT, "src", "index.ts")], {
-      env: {
-        ...inherited,
-        PORT: String(port),
-        IDP_DB_PATH: path,
-        IDP_PUBLIC_URL: baseUrl,
-        IDP_OAUTH_REDIRECT_URIS: REDIRECT_URI,
-        BETTER_AUTH_SECRET: secret,
-      },
-      // stderr into the same file: a rotation is loud on stderr, and "the log"
-      // is what `render logs` shows, which does not separate the two.
-      stdout: Bun.file(logPath),
-      stderr: Bun.file(logPath),
-    });
-
-    const deadline = Date.now() + 20_000;
-    for (;;) {
-      try {
-        if ((await fetch(`${baseUrl}/health`)).ok) break;
-      } catch {
-        // Not listening yet.
-      }
-      if (Date.now() > deadline) {
-        child.kill();
-        throw new Error(`idp did not come up:\n${await Bun.file(logPath).text()}`);
-      }
-      await Bun.sleep(50);
-    }
-
-    return {
-      child,
-      baseUrl,
-      log: await Bun.file(logPath).text(),
-      health: (await (await fetch(`${baseUrl}/health`)).json()) as Record<string, any>,
-    };
-  }
 
   /** Authorize → login → consent → token, with the credentials Arcade holds. */
   async function completeFlow(
@@ -473,4 +478,198 @@ describe("a pre-#70 disk, booted the way Render boots it", () => {
       await booted.child.exited;
     }
   }, 40_000);
+});
+
+/**
+ * The other thing a disk written before this slice carries: a `user.email`
+ * column with SQLite's default **case-sensitive** collation.
+ *
+ * #58 made the column `COLLATE NOCASE` and lowercased the seed, but it did so
+ * in `schema.sql`, which only a fresh seed ever runs. The deployed `cg-idp`
+ * disk kept the column it was born with, so a persona seeded as
+ * `Dana.Okafor@…` still could not log in — and the login page still called
+ * that "That email and password did not match", the same sentence it gives a
+ * wrong password. That is the failure #58 spent a whole sitting on, still live
+ * on the one database that matters.
+ *
+ * The fixture is the real pre-#58 schema, read out of git rather than
+ * transcribed, so it cannot drift into agreeing with the code under test.
+ */
+describe("a disk written before #58 made user.email case-insensitive", () => {
+  const dana = loadPeople({}).find((person) => person.persona === "dana")!;
+  /** As `PERSONA_DANA_EMAIL` was set on `cg-idp` during the #13 sitting. */
+  const CAPITALISED = "Dana.Okafor@Bank.Example";
+
+  /** `git show 3d2dd9d^:apps/idp/src/schema.sql` — the last case-sensitive schema. */
+  function schemaBefore58(): string {
+    const shown = Bun.spawnSync(["git", "show", `${SLICE_58}^:apps/idp/src/schema.sql`], {
+      cwd: REPO_ROOT,
+    });
+    if (shown.exitCode !== 0) {
+      throw new Error(
+        `could not read the pre-#58 schema from git (exit ${shown.exitCode}): ` +
+          new TextDecoder().decode(shown.stderr),
+      );
+    }
+    const sql = new TextDecoder().decode(shown.stdout);
+
+    // If this ever stops holding, the fixture is no longer the thing the test
+    // claims to be, and a green run would mean nothing.
+    expect(sql).toContain('"email" text not null unique');
+    expect(sql.toLowerCase()).not.toContain("collate nocase");
+    expect(sql).not.toContain('create table "jwks"');
+    return sql;
+  }
+
+  /** That schema, with one capitalised persona who can sign in with a password. */
+  async function pre58Db(dir: string): Promise<string> {
+    const path = join(dir, "idp.db");
+    const db = new Database(path, { create: true });
+    db.exec("PRAGMA journal_mode = WAL");
+    db.exec(schemaBefore58());
+
+    const id = crypto.randomUUID();
+    const now = new Date().toISOString();
+    db.query(
+      `INSERT INTO "user" ("id", "name", "email", "emailVerified", "createdAt", "updatedAt")
+       VALUES ($id, $name, $email, 1, $now, $now)`,
+    ).run({ $id: id, $name: dana.name, $email: CAPITALISED, $now: now });
+    db.query(
+      `INSERT INTO "account" ("id", "issuer", "accountId", "providerId", "userId", "password", "createdAt", "updatedAt")
+       VALUES ($aid, 'local:credential', $id, 'credential', $id, $password, $now, $now)`,
+    ).run({
+      $aid: crypto.randomUUID(),
+      $id: id,
+      $password: await hashPassword(dana.password),
+      $now: now,
+    });
+
+    // A session and a consent, so the rebuild has children to keep: dropping
+    // `user` with foreign keys live would cascade both into nothing.
+    db.query(
+      `INSERT INTO "session" ("id", "expiresAt", "token", "createdAt", "updatedAt", "userId")
+       VALUES ('s1', $now, 't1', $now, $now, $id)`,
+    ).run({ $now: now, $id: id });
+    db.query(
+      `INSERT INTO "oauthClient"
+         ("id", "clientId", "clientSecret", "name", "redirectUris", "createdAt", "updatedAt")
+       VALUES ('arcade', $clientId, 'x', 'Arcade', '[]', $now, $now)`,
+    ).run({ $clientId: REGISTERED_CLIENT_ID, $now: now });
+    db.query(
+      `INSERT INTO "oauthConsent" ("id", "clientId", "userId", "scopes", "createdAt", "updatedAt")
+       VALUES ('c1', $clientId, $id, 'openid', $now, $now)`,
+    ).run({ $clientId: REGISTERED_CLIENT_ID, $id: id, $now: now });
+
+    db.close();
+    return path;
+  }
+
+  test("the fixture really is broken before the upgrade runs", async () => {
+    // Otherwise every assertion below could pass on a database that never had
+    // the problem. Better Auth lowercases the address before it looks the row
+    // up, and a case-sensitive `=` finds nothing.
+    const path = await pre58Db(tempDir());
+    const db = new Database(path);
+
+    const found = db
+      .query('select * from (select * from "user" where "user"."email" = ?) as p')
+      .get(dana.email);
+    expect(found).toBeNull();
+    expect(db.query('SELECT "email" AS e FROM "user"').get()).toEqual({ e: CAPITALISED });
+
+    db.close();
+  });
+
+  test("the upgrade rebuilds the column and lowercases the row, keeping the children", async () => {
+    const path = await pre58Db(tempDir());
+    const db = await openPeople(path);
+
+    // The stored value is now the join key `apps/hooks` and the loan book hold.
+    expect(db.query('SELECT "email" AS e FROM "user"').get()).toEqual({ e: dana.email });
+    // And the comparison itself is case-insensitive, which is what the lookup
+    // relies on — asserted with the exact query Better Auth runs.
+    expect(
+      db.query('select * from (select * from "user" where "user"."email" = ?) as p').get(CAPITALISED),
+    ).not.toBeNull();
+
+    // The rebuild dropped a table five others reference. Nothing cascaded.
+    expect(db.query('SELECT COUNT(*) AS n FROM "account"').get()).toEqual({ n: 1 });
+    expect(db.query('SELECT COUNT(*) AS n FROM "session"').get()).toEqual({ n: 1 });
+    expect(db.query('SELECT COUNT(*) AS n FROM "oauthConsent"').get()).toEqual({ n: 1 });
+    expect(db.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    // Foreign keys are back on for everything after the upgrade.
+    expect(db.query<{ foreign_keys: number }, []>("PRAGMA foreign_keys").get()).toEqual({
+      foreign_keys: 1,
+    });
+
+    // Both migrations came from the one user_version step.
+    expect(tables(db)).toContain("jwks");
+    expect(readSchemaVersion(db)).toBe(SCHEMA_VERSION);
+    db.close();
+  });
+
+  test("running it again changes nothing", async () => {
+    const path = await pre58Db(tempDir());
+    const first = await openPeople(path);
+    const rows = first.query('SELECT "id", "email" FROM "user"').all();
+    first.close();
+
+    const second = await openPeople(path);
+    expect(second.query('SELECT "id", "email" FROM "user"').all()).toEqual(rows);
+    // The scratch table is not left lying about.
+    expect(tables(second)).not.toContain("user_rebuilding_for_nocase_email");
+    second.close();
+  });
+
+  test("the capitalised persona can sign in, over HTTP, on the booted branch", async () => {
+    // The reviewer's check on round 1, which this branch answered 401 to:
+    // build the pre-#58 schema, insert a capitalised row, boot the service the
+    // way Render boots it, and post the right password.
+    const path = await pre58Db(tempDir());
+    const booted = await boot(path, SECRET);
+
+    try {
+      expect(booted.health.status).toBe("ok");
+
+      const signIn = await fetch(`${booted.baseUrl}/sign-in/email`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: booted.baseUrl },
+        body: JSON.stringify({ email: dana.email, password: dana.password }),
+      });
+
+      expect(signIn.status).toBe(200);
+
+      // And through the login page a human actually uses, which is where the
+      // misleading "did not match" came from.
+      const page = await fetch(`${booted.baseUrl}/login`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded", accept: "text/html" },
+        body: new URLSearchParams({ email: CAPITALISED, password: dana.password }).toString(),
+        redirect: "manual",
+      });
+      expect(page.status).toBe(303);
+    } finally {
+      booted.child.kill();
+      await booted.child.exited;
+    }
+  }, 40_000);
+
+  test("refuses, and rolls back, when two people differ only by case", async () => {
+    const path = await pre58Db(tempDir());
+    const seeded = new Database(path);
+    const now = new Date().toISOString();
+    seeded.query(
+      `INSERT INTO "user" ("id", "name", "email", "emailVerified", "createdAt", "updatedAt")
+       VALUES ($id, 'Dana Okafor', $email, 1, $now, $now)`,
+    ).run({ $id: crypto.randomUUID(), $email: dana.email, $now: now });
+    seeded.close();
+
+    // Which of the two is the person is not something a boot may decide.
+    await expect(openPeople(path)).rejects.toThrow(/differ only by the case of their email/);
+
+    const after = new Database(path);
+    expect(after.query('SELECT COUNT(*) AS n FROM "user"').get()).toEqual({ n: 2 });
+    expect(readSchemaVersion(after)).toBe(0);
+    after.close();
+  });
 });
