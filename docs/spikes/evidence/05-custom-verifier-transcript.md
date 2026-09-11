@@ -553,3 +553,305 @@ the tunnel has to exist before the human can paste its URL into the dashboard, a
 the human writes `.env.local` in the same sitting. Demanding credentials before
 binding would force a restart, and a restart on ngrok's free tier means a new
 hostname and a dashboard field that is now wrong.
+
+---
+
+## 11. Round 2, the measurement sitting — 2026-09-11, 15:25Z to 17:00Z
+
+Timestamps are UTC and exact. Tokens, codes, `state` and PKCE values are redacted by
+`05-drive.ts:redact` or by hand; the persona domain is redacted throughout.
+
+### 11.1 Hop 1 completes, once #61 lands
+
+`/health` on the live IdP after `aa98780` deployed:
+
+```json
+{ "oauth": { "client_id": "RskTFjl6AqkUO8FKYWjpDCLd139YE36F",
+             "token_endpoint_auth_method": "client_secret_basic",
+             "client_secret_state": "unchanged",
+             "id_token_signing_alg": "RS256" } }
+```
+
+15:25:40Z, as Dana against `cg-demo-us`:
+
+```
+302 GET  https://cloud.arcade.dev/oauth2/authorize
+302 GET  https://cg-idp-or5b.onrender.com/oauth2/authorize
+200 GET  https://cg-idp-or5b.onrender.com/login                  ← page 1, ours
+303 POST https://cg-idp-or5b.onrender.com/login
+200 GET  https://cloud.arcade.dev/oauth2/intermediate_callback   ← page 2, Arcade's
+303 POST https://cloud.arcade.dev/oauth2/consent
+→ callback: code, iss, state — state matches, no error
+token exchange -> 200 {"access_token":"<redacted>","expires_in":900,
+                       "refresh_token":"<redacted>","scope":"mcp offline_access"}
+```
+
+Seven runs between 14:24Z and 14:41Z had ended `access_denied / "Token exchange with
+identity provider failed"`. Nothing changed but the client's registered auth method.
+
+`tools/list -> 200`:
+
+```
+System_ManageAuthorization  Arcade_ListApps
+Loan_GetLoan  Loan_SearchLoans  Loan_ApproveLoan  Loan_DenyLoan
+Approvals_RequestApproval  Approvals_Decide
+```
+
+### 11.2 Arcade's gateway consent screen, which is new
+
+`cloud.arcade.dev/oauth2/intermediate_callback` used to be a redirect. Its form:
+
+```html
+<form method="POST" action="/oauth2/consent" class="consent-form">
+    <input type="hidden" name="flow_state" value="<redacted>" />
+    <button type="submit" name="action" value="deny">Deny</button>
+    <button type="submit" name="action" value="allow">Allow</button>
+</form>
+```
+
+Headings: *"Authorize access"*, *"Allow this application to access your Arcade.dev
+account?"*, the MCP client's name, and a *"Development Mode"* warning because the
+redirect URI is a loopback.
+
+Two buttons on one form is why `05-drive.ts` now chooses a consent value explicitly:
+
+```
+─── 10 page 2: consent at https://cloud.arcade.dev/oauth2/intermediate_callback
+       (cloud.arcade.dev, not our IdP — no credential asked for)
+{ "action": "https://cloud.arcade.dev/oauth2/consent",
+  "fields": ["flow_state","action"],
+  "offered": { "action": ["deny","allow"] },
+  "chosen":  { "action": "allow" } }
+```
+
+### 11.3 The join key
+
+One `tools/list` produced **8278** `/access` frames on `cg-hooks`. Every one:
+
+```
+access | dana.okafor@… | Approvals.Decide            | allow | reason "No rule matched."
+access | dana.okafor@… | Approvals.RequestApproval   | allow
+access | dana.okafor@… | Loan.ApproveLoan            | allow
+access | dana.okafor@… | Loan.DenyLoan               | allow
+access | dana.okafor@… | Loan.GetLoan                | allow
+access | dana.okafor@… | Loan.SearchLoans            | allow
+access | dana.okafor@… | AirtableApi.AddBaseCollaborator | deny
+…8272 more, all deny, all the same user_id
+```
+
+Exact and lowercase, no exceptions. **No `/pre` frame for a loan tool was produced by
+this spike at any point**, because the tool never executed and a layer-2 refusal fires
+no hook.
+
+### 11.4 Hop 2 with no custom verifier: Arcade's account wall
+
+15:29:21Z. `Loan_GetLoan` returns `isError: true` with a JSON text block
+`{authorization_url, llm_instructions, message}` — *"The tool was not executed because
+it requires authorization."* Walking it with hop 1's cookie jar:
+
+```
+GET  cg-idp-or5b.onrender.com/oauth2/authorize?client_id=RskTFjl6…&scope=openid+email
+       &redirect_uri=…%2Fapi%2Fv1%2Foauth%2Ff4c6b_ap_GvSAhPpynQRj%2Fcallback
+302 → cloud.arcade.dev/api/v1/oauth/f4c6b_ap_GvSAhPpynQRj/callback?code=<redacted>&…
+303 → cloud.arcade.dev/api/v1/oauth/callback_verify?flow_id=<redacted>
+303 → auth.arcade.dev/self-service/login/browser
+303 → account.arcade.dev/login          ← stopped here, typed nothing
+```
+
+`account.arcade.dev/login` is a form with **no password field**: one control, `provider`,
+offering `github-…`, `google-…`, `microsoft-…`. An earlier revision of the guard only
+refused password forms, submitted this one, and ended up on
+`login.microsoftonline.com`'s sign-in page — no credential was typed and the chain
+stopped there, but cookies for that host appear in one transcript and this is why. The
+rule is now: on a host we did not name, the form must offer an explicit yes/no consent
+decision, and an identity-provider chooser is not one.
+
+### 11.5 Hop 2 with the verifier saved: Arcade calls it
+
+16:47:01Z, flow `9d80728c-4b82-46c6-9784-8c22fd4da762`:
+
+```
+302 GET  cg-idp-or5b.onrender.com/oauth2/authorize
+303 GET  cloud.arcade.dev/api/v1/oauth/f4c6b_ap_GvSAhPpynQRj/callback
+303 GET  <tunnel>/verify?flow_id=9d80728c-…          ← OURS
+302 GET  cg-idp-or5b.onrender.com/oauth2/authorize   ← the verifier's own leg, SILENT
+303 GET  <tunnel>/callback
+200 GET  cloud.arcade.dev/api/v1/oauth/callback_success
+```
+
+`callback_verify` and `account.arcade.dev` are gone. The verifier's own log for the
+same flow:
+
+```
+[verifier] GET /verify — Arcade sent 1 parameter(s) {"flow_id":"9d80728c-4b82-46c6-9784-8c22fd4da762"}
+[verifier] 303 to the IdP for flow 9d80728c-…
+           {"issuer":"https://cg-idp-or5b.onrender.com",
+            "redirect_uri":"<tunnel>/callback","scope":"openid email"}
+[verifier] IdP token exchange, client_secret_basic -> 200
+           {"access_token":"<redacted>","expires_in":3600,"token_type":"Bearer",
+            "scope":"openid email","id_token":"<redacted>"}
+[verifier] IdP /oauth2/userinfo -> 200
+           {"sub":"9d8c2228-039e-4dac-87a8-f210fd3e31e8","email":"dana.okafor@…"}
+[verifier] POST confirm_user -> 200
+           {"auth_id":"ar_3JBpvQoFcPv8Pyb1mgAuz5smr8B",
+            "next_uri":"https://cloud.arcade.dev/api/v1/oauth/callback_success"}
+[verifier] 303 to Arcade's next_uri
+```
+
+**One parameter.** `flow_id` and nothing else. **A silent IdP leg** — line 4 is a bare
+302, so the persona is not asked to log in again. **`confirm_user` 200, not
+`user_mismatch`**, for the address our own IdP put on `/oauth2/userinfo`.
+
+### 11.6 `confirm_user` by hand is unreliable
+
+Two attempts, same shape, same persona, same roughly-8-minute delay:
+
+```
+flow 4bb88623-…  -> 200 {"auth_id":"ar_3JBhPrH06i8jjUEt4lzSCawNVLR",
+                         "next_uri":"https://cloud.arcade.dev/api/v1/oauth/callback_success"}
+flow b56507af-…  -> 400 {"code":400,"msg":"Bad request","data":null}
+```
+
+The 400 carries no `error` field, so it is not the documented `user_mismatch`; and
+`b56507af` was not unknown to Arcade, which kept handing back that same id on fresh
+tool calls twenty minutes later. Reading, labelled an inference: Arcade accepts
+`confirm_user` only while the flow is awaiting verification, and that window is
+narrower than a human's turnaround.
+
+Two related measurements:
+
+- `confirm_user` **401s on the key before it reads the body** — an unset
+  `$ARCADE_API_KEY` in the shell returned `{"code":401,"msg":"Unauthorized"}`.
+- **Arcade does not finalise the grant until something fetches `next_uri`.** The 200
+  above left the tool unauthorized, because the browser had already given up: the
+  verifier used to park the browser on the request, and Bun caps `idleTimeout` at
+  255s. Both fixed — the verifier answers immediately and `POST /confirm` follows
+  `next_uri` server-side — and the whole problem disappears when the verifier holds
+  the key, which is the production shape.
+
+### 11.7 Why the tool still does not execute: three causes, in sequence
+
+Every line below is from `apps/idp`'s request log, which #61 added and which is the
+only reason any of this was diagnosable.
+
+**Cause 1 — the provider sent `client_secret_post` to a `client_secret_basic` client.**
+
+```
+2026-09-11T16:35:45.537Z [idp] POST /oauth2/token rejected: status=400
+  error=invalid_grant error_description="invalid code"
+  client_auth="client_secret_post" client_id=RskTFjl6AqkUO8FKYWjpDCLd139YE36F
+```
+
+Not the verifier — the verifier is in the same window sending `client_secret_basic`
+and getting 200. The `invalid_grant` is in front of the method problem because the
+IdP validates the code before the client.
+
+The dashboard, meanwhile, showed an Authentication Method dropdown reading *"Client
+Secret Basic"*, greyed out, tooltip *"Currently, client secret basic is the only
+supported authentication method."* The actual mechanism was Request Parameters rows
+carrying `client_id={{client_id}}` and `client_secret={{client_secret}}` on both Token
+Settings and Refresh Token Settings, left over from the #13 sitting's template.
+
+**Cause 2 — with those rows removed, the provider sent nothing.**
+
+```
+2026-09-11T16:48:41.847Z [idp] POST /oauth2/token rejected: status=400
+  error=invalid_request error_description="client_id is required"
+  client_auth="absent" client_id=(not the registered client)
+```
+
+The greyed label does not produce a Basic header. Credentials only ever travelled in
+the parameter rows.
+
+**Cause 3 — the recreated provider's Client ID held a URL.**
+
+```
+302 GET https://cg-idp-or5b.onrender.com/oauth2/authorize
+          ?client_id=https%3A%2F%2Fcg-idp-or5b.onrender.com%2Foauth2%2Ftoken&…
+302 → https://cg-idp-or5b.onrender.com/error
+        ?error=invalid_client&error_description=client_id+is+required
+```
+
+Hop 2 now fails at our *authorize* endpoint, one step earlier than before.
+
+Two of my own failures belong in this list, for symmetry:
+
+```
+15:57:10Z  client_auth="client_secret_post"    -> my verifier, before it learned to read
+                                                  the method off the IdP's /health
+16:19:02Z  invalid_grant "invalid code"
+           client_auth="client_secret_basic"   -> my walker replaying a spent code
+```
+
+Single-use codes behaving exactly as they should; the client was wrong, not the server.
+
+### 11.8 The provider's stored configuration, read back
+
+`evidence/05-auth-provider-config.ts`, GETs only, secrets scrubbed before printing.
+
+**Created 2026-09-10** — no `auth_method` on the token request at all:
+
+```json
+"token_request": {
+  "endpoint": "https://cg-idp-or5b.onrender.com/oauth2/token",
+  "method": "POST",
+  "params": { "grant_type": "authorization_code", "redirect_uri": "{{redirect_uri}}" },
+  "request_content_type": "application/x-www-form-urlencoded",
+  "response_content_type": "application/json"
+},
+"user_info_request": {
+  "endpoint": "https://cg-idp-or5b.onrender.com/oauth2/userinfo",
+  "method": "GET",
+  "auth_method": "bearer_access_token",
+  "response_map": { "email": "$.email", "name": "$.name", "sub": "$.sub" },
+  "triggers": { "on_token_grant": true, "on_token_refresh": false }
+},
+"pkce": { "enabled": true, "code_challenge_method": "S256" },
+"redirect_uri": "https://cloud.arcade.dev/api/v1/oauth/f4c6b_ap_GvSAhPpynQRj/callback",
+"client_secret": { "binding": "project", "editable": true, "exists": true }
+```
+
+**Recreated 2026-09-11T16:55:22Z** — `auth_method` present:
+
+```json
+"token_request": {
+  "endpoint": "https://cg-idp-or5b.onrender.com/oauth2/token",
+  "method": "POST",
+  "auth_method": "client_secret_basic",
+  "params": { "client_id": "{{client_id}}", "client_secret": "<redacted>",
+              "grant_type": "authorization_code", "redirect_uri": "{{redirect_uri}}" }
+},
+"client_id": "https://cg-idp-or5b.onrender.com/oauth2/token",
+"redirect_uri": "https://cloud.arcade.dev/api/v1/oauth/f4c6b_ap_1cWxRQzV98W4/callback"
+```
+
+Note the callback path changed, so the URI allowlisted at the IdP had to change with
+it — confirmed from outside before running anything:
+
+```
+ALLOWED   https://cloud.arcade.dev/api/v1/oauth/f4c6b_ap_1cWxRQzV98W4/callback
+REJECTED  https://cloud.arcade.dev/api/v1/oauth/f4c6b_ap_GvSAhPpynQRj/callback   (old)
+ALLOWED   https://cloud.arcade.dev/oauth2/intermediate_callback                  (User Source)
+ALLOWED   <tunnel>/callback                                                      (verifier)
+```
+
+### 11.9 Operational notes worth keeping
+
+- **`ngrok` must not be a child of the verifier.** It was, at first; restarting the
+  verifier tore the endpoint down (`ERR_NGROK_3200`), the free-tier hostname changed,
+  and a human had to re-paste a dashboard field. Running `ngrok` as its own process and
+  giving the verifier `PORT` and `VERIFIER_PUBLIC_URL` makes a restart free. Verified:
+  the verifier was restarted three times afterwards on one tunnel.
+- **Credentials are read per flow, not at startup**, so the tunnel can exist before the
+  human writes `.env.local` and no restart is needed afterwards.
+- **A placeholder is worse than an absence.** The credentials file arrived with the
+  angle-bracket prompts still in it, and the verifier forwarded
+  `client_id=<the cg-idp client id>` to our IdP, which answered *"client_id is
+  required"* — a failure that reads as the counterparty's. The verifier now refuses
+  placeholder-shaped values by shape, and defaults the client id from the IdP's own
+  `/health`, which publishes it.
+
+```console
+$ git check-ignore -v docs/spikes/evidence/.env.local
+.gitignore:14:.env.local	docs/spikes/evidence/.env.local
+```
