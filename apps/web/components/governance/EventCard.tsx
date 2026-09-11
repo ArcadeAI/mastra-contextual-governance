@@ -20,6 +20,14 @@
  * Nothing is behind a hover. The panel is watched from across a room by people
  * who cannot reach the trackpad, and half of them are looking at a photograph
  * of it.
+ *
+ * One card can stand for several decisions. `/access` fans out — one
+ * `tools/call` produced three access decisions for one tool when it was
+ * measured (#64) — so the access lane hands this a whole run of them. The
+ * count is stated in words on the face of the card, where the rest of the
+ * panel's claims are; only the individual event ids sit behind a disclosure,
+ * because a column of opaque identifiers at projector distance is noise and
+ * the one person who wants them is holding the trackpad.
  */
 import type { GovernanceEvent } from "@cg/policy-schema";
 
@@ -35,14 +43,23 @@ function timeOf(ts: string): string {
 
 export function EventCard({
   event,
+  members = [],
   correlated = false,
 }: {
   event: GovernanceEvent;
+  /**
+   * Every decision this card stands for, newest first, `event` among them.
+   * Empty or a single entry means an ordinary one-decision card. See
+   * `lib/governance/grouping.ts` for what is allowed to share a card.
+   */
+  members?: readonly GovernanceEvent[];
   /** This is the decision the chat is currently showing. Outlined, not tinted. */
   correlated?: boolean;
 }) {
   const decision = DECISIONS[event.decision];
   const showDiff = event.decision === "modify" || event.before !== undefined;
+  const count = members.length;
+  const grouped = count > 1;
 
   return (
     <article
@@ -55,6 +72,7 @@ export function EventCard({
         <time className="cg-event-time" dateTime={event.ts}>
           {timeOf(event.ts)}
         </time>
+        {grouped && <span className="cg-event-count">{count} decisions</span>}
         <span className="cg-event-user">{event.user_id}</span>
       </p>
 
@@ -72,6 +90,19 @@ export function EventCard({
       {event.reason !== "" && <p className="cg-reason">{event.reason}</p>}
 
       {showDiff && <MaskedDiff before={event.before} after={event.after} />}
+
+      {grouped && (
+        <details className="cg-event-members">
+          <summary>{count} decisions, this tool and this person</summary>
+          <ul className="cg-event-ids">
+            {members.map((member) => (
+              <li key={member.id}>
+                <time dateTime={member.ts}>{timeOf(member.ts)}</time> {member.id}
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
     </article>
   );
 }

@@ -25,6 +25,35 @@ Three lanes — Access, Pre, Post — fed by a `text/event-stream` of `Governanc
 (#5). Green allow, red deny with the rule that fired, amber modify with a before/after
 diff. Newest at the top of each lane, so the freshest card never moves.
 
+**`/access` is called on `tools/list` for every tool in the gateway and again on each
+call, so access rows outnumber pre rows by design.** That is the hook doing its job, not
+a leak.
+
+### Repeated access decisions share a row
+
+Arcade calls `/access` once per tool-schema resolution, so one `tools/call` fans out
+into several decisions about the same person and the same tool. Measured at the #13
+sitting with retry off: one `Loan.GetLoan` produced **three** access rows and one
+`Loan.ApproveLoan` produced **two** (#64).
+
+The Access lane collapses **adjacent** decisions that share `user_id`, `tool` and
+`decision` and land within `ACCESS_GROUP_WINDOW_MS` (three seconds,
+`lib/governance/grouping.ts`) into one card carrying their count; the individual event
+ids are on the card behind a disclosure. Three limits, all deliberate:
+
+- **Presentation only.** Nothing is deduplicated in `audit_log` or in the stream, the
+  timeline still holds every event, and both tallies still count every one of them. A
+  card saying *3 decisions* is a claim that three were made.
+- **Only adjacent decisions group.** Reaching past an intervening event to merge two
+  matching ones would reorder the lane, and not reordering is the timeline's first
+  property. A fan-out that arrives interleaved with something else stays several rows.
+- **A row spans at most the window, measured from its newest member.** Chaining
+  neighbour to neighbour would let a slow drip of matching decisions collapse into one
+  row claiming they arrived together.
+
+`/panel?fanout=1` replays the measured shape through the fixture stream, so the two
+rows and their counts are something to look at rather than read about.
+
 ### Which stream it watches
 
 Read in the **server** component and passed down as a prop. Never a `NEXT_PUBLIC_`
@@ -37,10 +66,15 @@ client bundle while Render supplies service variables at runtime, so one would b
 | unset (default) | `/api/governance/fixture-stream` — this app, replaying #5's fixture sequence |
 | `hooks` | `http(s)://$HOOKS_PUBLIC_HOST/events` |
 
-**Fixture is the default deliberately.** `apps/hooks` does not serve `/events` yet —
-that is #20 — so defaulting to it would open the panel on a connection that cannot
-succeed, which reads as a broken app rather than an unfinished one. When #20 lands,
-flip the default.
+**Fixture is the default deliberately.** `apps/hooks` *does* serve `/events` — the
+stream half of #20 landed on #54 — but it is a second service with a database of its
+own, and most of the time a fresh clone does not have it running. Defaulting to it would
+open the panel on a connection retrying against nothing, which reads as a broken app
+rather than as a control plane nobody started. Opting in is two variables:
+
+```sh
+GOVERNANCE_STREAM=hooks HOOKS_PUBLIC_HOST=localhost:4411 bun run --cwd apps/web dev
+```
 
 The panel labels which mode it is in. A rehearsal must not mistake a replay for the
 live control plane.
@@ -53,6 +87,7 @@ hypothetical. In fixture mode the page's own query string tunes the replay:
 ```
 /panel?repeat=2000&delayMs=0     # 10,000 events, as fast as the socket carries them
 /panel?delayMs=300               # the four acts, faster than the default 900ms pacing
+/panel?fanout=1                  # the acts, then the measured /access fan-out (#64)
 ```
 
 Lanes are bounded **separately** — one shared window would let an `/access` sweep evict
@@ -107,8 +142,9 @@ reconnect timing is the browser's rather than ours — on stage that is an outag
 unpredictable length in the middle of an act. `fetch` over a `ReadableStream` gives both
 back, and makes the whole path testable against a real server instead of a stub.
 
-`lib/governance/subscribe.ts` is the only file that knows the wire contract, so when #20
-settles the endpoint, one file changes.
+`lib/governance/subscribe.ts` is the only file that knows the wire contract, and
+`apps/hooks/src/events.ts` is the only file that writes it — #54 implemented that shape
+rather than negotiating a new one, so the two halves have never had to be reconciled.
 
 ## Fonts
 

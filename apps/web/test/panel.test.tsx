@@ -296,21 +296,26 @@ describe("nothing is hidden behind a hover", () => {
 });
 
 describe("a lane past what it can draw counts the rest", () => {
-  test("the overflow is stated, not silently dropped", () => {
-    const events = Array.from({ length: 20 }, (_, index) =>
-      aGovernanceEvent({ id: `evt_${index}`, hook: "access" }),
+  /**
+   * A whole-project `/access` sweep, which is what overflows this lane: one
+   * decision per tool, so 10,844 of them are 10,844 *different* tools. Each
+   * one is its own row — #64's grouping joins decisions about the same tool,
+   * and this shape has none to join. (An earlier version of these two tests
+   * repeated one tool, which the grouping now correctly collapses into a
+   * single row; a sweep never looks like that.)
+   */
+  const sweep = (count: number): GovernanceEvent[] =>
+    Array.from({ length: count }, (_, index) =>
+      aGovernanceEvent({ id: `evt_${index}`, hook: "access", tool: `Widgets.tool_${index}` }),
     );
 
-    expect(render(events)).toContain("14 earlier decisions");
+  test("the overflow is stated, not silently dropped", () => {
+    expect(render(sweep(20))).toContain("14 earlier decisions");
   });
 
   test("the count includes what the timeline itself let go", () => {
-    const events = Array.from({ length: 10_000 }, (_, index) =>
-      aGovernanceEvent({ id: `evt_${index}`, hook: "access" }),
-    );
-
     // 10,000 received, 6 drawn — every one of the rest is accounted for.
-    expect(render(events)).toContain("9,994 earlier decisions");
+    expect(render(sweep(10_000))).toContain("9,994 earlier decisions");
   });
 
   test("one is singular", () => {
