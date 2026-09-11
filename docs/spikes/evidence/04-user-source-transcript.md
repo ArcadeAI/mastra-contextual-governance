@@ -1,7 +1,8 @@
 # Spike 04 — raw transcripts
 
-Both runs are against the live services on **2026-09-11**, from the worktree for
-issue #65. The persona's email domain is replaced with `<persona-domain>`
+Everything here is against the live services on **2026-09-11**, from the worktree
+for issue #65. Sections 1 to 3 are the first pass; section 4 is a second pass,
+after the human recreated the `cg-demo-us` gateway mid-spike. The persona's email domain is replaced with `<persona-domain>`
 throughout — the four addresses live in Render environment variables and are
 deliberately not in git. Authorization codes, tokens and login/consent challenges
 are redacted by the scripts themselves (`redact` and `redactQuery` in
@@ -302,3 +303,183 @@ UI MESSAGES []
 
 Arcade resolves the persona as one of its own accounts. No user-source redirect
 is offered at any point in the chain.
+
+
+---
+
+## 4. Second pass, after the gateway was recreated
+
+The human confirmed the original `cg-demo-us` was not using the User Source at all
+and recreated it. Everything below is from after that.
+
+### The protected-resource document gained a field
+
+```
+$ curl -s https://api.arcade.dev/.well-known/oauth-protected-resource/mcp/cg-demo-us
+{"resource":"https://api.arcade.dev/mcp/cg-demo-us","authorization_servers":["https://cloud.arcade.dev/oauth2"],"bearer_methods_supported":["header"],"scopes_supported":["mcp"],"resource_name":"contextual-governance (user source)","urn:arcade:oauth:user_source_id":"us_3JA8GcvHfT17WNnnRazx6FZpxeg"}
+
+$ curl -s https://api.arcade.dev/.well-known/oauth-protected-resource/mcp/cg-demo
+{"resource":"https://api.arcade.dev/mcp/cg-demo","authorization_servers":["https://cloud.arcade.dev/oauth2"],"bearer_methods_supported":["header"],"scopes_supported":["mcp"],"resource_name":"contextual-governance"}
+```
+
+`urn:arcade:oauth:user_source_id` was absent from `cg-demo-us` before the
+recreation and is absent from `cg-demo` throughout. The MCP slug did not change.
+
+### `04-user-source-flow.ts`, second run
+
+Still exit **1**, still stopped at `account.arcade.dev`.
+
+```
+spike 04 — https://api.arcade.dev/mcp/cg-demo-us as dana.okafor@<persona-domain>
+  expected user source issuer: https://cg-idp-or5b.onrender.com
+
+─── 01 MCP initialize with no token -> 401
+{
+  "body": "{\"name\":\"invalid_authorization\",\"message\":\"Missing Authorization header\"}",
+  "www-authenticate": "Bearer resource_metadata=\"https://api.arcade.dev/.well-known/oauth-protected-resource/mcp/cg-demo-us\", scope=\"mcp\", error=\"invalid_token\""
+}
+
+─── 02 protected-resource metadata
+{
+  "resource": "https://api.arcade.dev/mcp/cg-demo-us",
+  "authorization_servers": [
+    "https://cloud.arcade.dev/oauth2"
+  ],
+  "bearer_methods_supported": [
+    "header"
+  ],
+  "scopes_supported": [
+    "mcp"
+  ],
+  "resource_name": "contextual-governance (user source)",
+  "urn:arcade:oauth:user_source_id": "us_3JA8GcvHfT17WNnnRazx6FZpxeg"
+}
+
+─── 03 authorization server metadata
+{
+  "issuer": "https://cloud.arcade.dev/oauth2",
+  "authorization_endpoint": "https://cloud.arcade.dev/oauth2/authorize",
+  "token_endpoint": "https://cloud.arcade.dev/oauth2/token",
+  "registration_endpoint": "https://cloud.arcade.dev/oauth2/register",
+  "jwks_uri": "https://cloud.arcade.dev/.well-known/jwks/oauth2",
+  "scopes_supported": [
+    "mcp",
+    "offline_access"
+  ],
+  "response_types_supported": [
+    "code"
+  ],
+  "grant_types_supported": [
+    "authorization_code",
+    "refresh_token"
+  ],
+  "token_endpoint_auth_methods_supported": [
+    "none",
+    "private_key_jwt"
+  ],
+  "code_challenge_methods_supported": [
+    "S256"
+  ],
+  "client_id_metadata_document_supported": true,
+  "authorization_response_iss_parameter_supported": true
+}
+
+─── 04 dynamic client registration
+{
+  "client_id": "0033cb90-038b-49e8-9f9e-5d84fe68205b",
+  "client_id_issued_at": 1789134593,
+  "redirect_uris": [
+    "http://localhost:64265/callback"
+  ],
+  "scope": "mcp offline_access",
+  "token_endpoint_auth_method": "none",
+  "grant_types": [
+    "authorization_code",
+    "refresh_token"
+  ],
+  "response_types": [
+    "code"
+  ],
+  "client_name": "cg-spike-65",
+  "application_type": "web"
+}
+
+─── 05 authorize URL
+https://cloud.arcade.dev/oauth2/authorize?response_type=code&client_id=0033cb90-038b-49e8-9f9e-5d84fe68205b&redirect_uri=http%3A%2F%2Flocalhost%3A64265%2Fcallback&scope=mcp+offline_access&state=HhGcn6jAiwbRXHev3oGQcw&code_challenge=M8GTikurTmFLo_2Rff9sRA2rIbeYQGV-roSkJJDd_c0&code_challenge_method=S256&resource=https%3A%2F%2Fapi.arcade.dev%2Fmcp%2Fcg-demo-us
+
+─── 06 302 https://cloud.arcade.dev/oauth2/authorize -> https://auth.arcade.dev/oauth2/auth
+https://auth.arcade.dev/oauth2/auth?response_type=code&client_id=4eabdfa1-482e-4296-ba72-ba5fde2a3812&redirect_uri=https%3A%2F%2Fcloud.arcade.dev%2Foauth2%2Fintermediate_callback&scope=openid+profile+email&state=5xfeuaKfN-vskUlSWUOo0QQSkTyNEOrQDuBrLqmSIRE&code_challenge=j12qQAPsXuOghVelKBMjKEvbZUKflHb4FvsGMcDp5-I&code_challenge_method=S256
+
+─── 07 302 https://auth.arcade.dev/oauth2/auth -> https://auth.arcade.dev/ui/login
+https://auth.arcade.dev/ui/login?login_challenge=<redacted>
+
+─── 08 303 https://auth.arcade.dev/ui/login -> https://auth.arcade.dev/self-service/login/browser
+https://auth.arcade.dev/self-service/login/browser?aal=&refresh=&return_to=&organization=&via=&login_challenge=<redacted>
+
+─── 09 303 https://auth.arcade.dev/self-service/login/browser -> https://account.arcade.dev/login
+https://account.arcade.dev/login?flow=73f7a763-6eda-4e12-bfeb-b243a024ac4b
+
+─── 10 page 1: account.arcade.dev rendered the login, not cg-idp-or5b.onrender.com — stopping
+{
+  "action": "https://auth.arcade.dev/self-service/login?flow=73f7a763-6eda-4e12-bfeb-b243a024ac4b",
+  "fields": [
+    "provider"
+  ]
+}
+
+─── 11 hosts that rendered a page
+{
+  "pageHosts": [
+    "account.arcade.dev"
+  ],
+  "pagesShown": 1,
+  "expected": "cg-idp-or5b.onrender.com",
+  "authenticatedAgainstTheUserSource": false
+}
+
+─── 12 redirect chain
+[
+  "302 GET https://cloud.arcade.dev/oauth2/authorize",
+  "302 GET https://auth.arcade.dev/oauth2/auth",
+  "303 GET https://auth.arcade.dev/ui/login",
+  "303 GET https://auth.arcade.dev/self-service/login/browser",
+  "200 GET https://account.arcade.dev/login"
+]
+[0m[31m
+FAILED: the chain stopped at https://account.arcade.dev/login?flow=73f7a763-6eda-4e12-bfeb-b243a024ac4b instead of reaching the redirect URI — the pages were served by account.arcade.dev, not cg-idp-or5b.onrender.com[0m
+```
+
+### The upstream is the same for both gateways, and `resource` is validated
+
+Each row is one `GET /oauth2/authorize` with only `resource` changed, reporting
+the `Location` host and path plus the `client_id` on that redirect.
+
+```
+https://api.arcade.dev/mcp/cg-demo-us          302 -> auth.arcade.dev/oauth2/auth  upstream client_id=4eabdfa1-482e-4296-ba72-ba5fde2a3812
+https://api.arcade.dev/mcp/cg-demo             302 -> auth.arcade.dev/oauth2/auth  upstream client_id=4eabdfa1-482e-4296-ba72-ba5fde2a3812
+https://api.arcade.dev/mcp/does-not-exist-65   302 -> localhost:64998/callback  upstream client_id=null
+https://example.com/nope                       302 -> localhost:64998/callback  upstream client_id=null
+```
+
+The full error for an unknown gateway:
+
+```
+302 http://localhost:64997/callback?error=server_error&iss=https%3A%2F%2Fcloud.arcade.dev%2Foauth2&error_description=Could+not+retrieve+protected+resource+metadata+for+the+gateway.+Verify+that+the+gateway+is+reachable+and+configured+correctly.&state=p
+```
+
+### Ten authorize parameters, in case the client must name the source
+
+Same request each time, one extra parameter, reporting the `Location`.
+
+```
+(baseline, resource only)              302 -> auth.arcade.dev/oauth2/auth 
+user_source_id                         302 -> auth.arcade.dev/oauth2/auth 
+user_source                            302 -> auth.arcade.dev/oauth2/auth 
+urn:arcade:oauth:user_source_id        302 -> auth.arcade.dev/oauth2/auth 
+connection                             302 -> auth.arcade.dev/oauth2/auth 
+idp_hint                               302 -> auth.arcade.dev/oauth2/auth 
+kc_idp_hint                            302 -> auth.arcade.dev/oauth2/auth 
+login_hint                             302 -> auth.arcade.dev/oauth2/auth 
+user_source_id=cg-idp (name not id)    302 -> auth.arcade.dev/oauth2/auth 
+audience                               302 -> auth.arcade.dev/oauth2/auth 
+```
