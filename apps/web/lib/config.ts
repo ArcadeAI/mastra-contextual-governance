@@ -16,6 +16,46 @@
  */
 import { publicHost } from "./public-host.ts";
 
+/**
+ * Who the browser is signed in as, and the two OAuth hops that follow from it.
+ *
+ * `DESIGN.md` → **Identity** and **Two hops, two mechanisms**. Everything here
+ * is read from the environment and none of it has a development fallback: an
+ * identity provider you can reach without configuring one is a fixture that
+ * would eventually be mistaken for a login. `/health` reports which of the
+ * three capabilities the environment actually configured, so an unset variable
+ * is visible before somebody discovers it mid-rehearsal.
+ *
+ * `idpIssuer` and `publicUrl` are **URLs**, not the HOST-form the cross-service
+ * keys above use. They are origins a browser is redirected to and an OAuth
+ * `redirect_uri` that has to match an allowlist byte for byte, so the scheme is
+ * part of the value rather than something a consumer adds.
+ */
+export interface IdentityConfig {
+  /** `IDP_ISSUER` — `apps/idp`'s public origin, no trailing slash. */
+  idpIssuer: string;
+  /** Client C: this service's own registration at the IdP, separate from the two Arcade holds. */
+  idpClientId: string;
+  idpClientSecret: string;
+  /** What sign-in asks for. `email` is the join key, so it is not optional. */
+  idpScopes: string;
+  /** Seals the session cookie. No fallback — see `lib/identity/seal.ts`. */
+  sessionSecret: string;
+  /** This service's own public origin, no trailing slash. Every redirect_uri is built from it. */
+  publicUrl: string;
+  /** `ARCADE_GATEWAY_ID` — `cg-demo-us`, the User Source gateway hop 1 authorizes against. */
+  gatewayId: string;
+  /**
+   * Arcade Cloud, which is a different host from `arcadeApiUrl`.
+   *
+   * `confirm_user` is `https://cloud.arcade.dev/api/v1/oauth/confirm_user`
+   * (measured, spike #75) while tools execute against `api.arcade.dev`. One
+   * variable for each, because pointing a test at a stand-in has to move the
+   * verifier's calls without moving the gateway's.
+   */
+  cloudUrl: string;
+}
+
 export interface WebConfig {
   /** `apps/hooks`, which owns `governance.db` and the approvals store. */
   hooksHost: string;
@@ -26,6 +66,8 @@ export interface WebConfig {
   arcadeApiKey: string;
   /** `tool.toolkit` as Arcade files the deployed approvals toolkit. */
   approvalsToolkit: string;
+  /** Sign-in, the gateway hop, and the custom verifier route. */
+  identity: IdentityConfig;
 }
 
 /**
@@ -70,7 +112,78 @@ export function readWebConfig(env: Record<string, string | undefined> = process.
     arcadeApiUrl: (env.ARCADE_API_URL?.trim() || "https://api.arcade.dev").replace(/\/+$/, ""),
     arcadeApiKey: env.ARCADE_API_KEY?.trim() ?? "",
     approvalsToolkit: env.ARCADE_APPROVALS_TOOLKIT?.trim() || "Approvals",
+    identity: {
+      idpIssuer: trimUrl(env.IDP_ISSUER),
+      idpClientId: env.IDP_CLIENT_ID?.trim() ?? "",
+      idpClientSecret: env.IDP_CLIENT_SECRET?.trim() ?? "",
+      // `openid` for an ID token, `email` because the address is the join key
+      // across Arcade, the OAuth subject and the loan book (DESIGN.md rule 3).
+      idpScopes: env.IDP_SCOPES?.trim() || "openid email",
+      sessionSecret: env.SESSION_SECRET?.trim() ?? "",
+      publicUrl: trimUrl(env.PUBLIC_URL),
+      gatewayId: env.ARCADE_GATEWAY_ID?.trim() ?? "",
+      cloudUrl: trimUrl(env.ARCADE_CLOUD_URL) || "https://cloud.arcade.dev",
+    },
   };
+}
+
+/** A configured origin with any trailing slashes removed, so concatenation is safe. */
+function trimUrl(value: string | undefined): string {
+  return (value?.trim() ?? "").replace(/\/+$/, "");
+}
+
+/**
+ * What `/health` reports, and what each route refuses to run without.
+ *
+ * Three capabilities rather than one flag, because they fail independently and
+ * the person reading `/health` is trying to find out which human step is
+ * outstanding. Sign-in needs client C; the gateway hop needs a gateway id on
+ * top of a signed-in person; the verifier needs the Arcade project API key,
+ * which nothing else here uses.
+ *
+ * A control that silently does nothing is worse than no control, and a
+ * half-configured identity is exactly that: the browser gets a persona label
+ * and every tool call is made as somebody else. So each of these is checked at
+ * the edge of the route that needs it and reported as `missing` here.
+ */
+export interface IdentityReadiness {
+  signin: "configured" | "missing";
+  gateway: "configured" | "missing";
+  verifier: "configured" | "missing";
+}
+
+export function identityReadiness(config: WebConfig): IdentityReadiness {
+  const { identity } = config;
+  const signin = Boolean(
+    identity.idpIssuer && identity.idpClientId && identity.idpClientSecret &&
+      identity.sessionSecret && identity.publicUrl,
+  );
+  return {
+    signin: signin ? "configured" : "missing",
+    // The gateway hop is driven by this service after sign-in, so it needs
+    // everything sign-in needs plus the gateway to authorize against.
+    gateway: signin && identity.gatewayId && config.arcadeApiUrl ? "configured" : "missing",
+    // The verifier reads the session and calls `confirm_user` with the project
+    // API key. It does not need client C — a browser that already has a session
+    // never reaches the IdP — but with no session it starts a sign-in, so in
+    // practice both matter and `/health` reports them separately.
+    verifier: identity.sessionSecret && identity.publicUrl && config.arcadeApiKey && identity.cloudUrl
+      ? "configured"
+      : "missing",
+  };
+}
+
+/**
+ * Whether cookies this service writes carry `Secure`.
+ *
+ * Derived from `PUBLIC_URL` rather than configured: a browser silently drops a
+ * `Secure` cookie that arrives over plain http, so a local run on
+ * `http://localhost:4400` with `Secure` set looks like a sign-in that succeeds
+ * and then forgets. Unset `PUBLIC_URL` means an unconfigured service, which
+ * cannot sign anyone in anyway — treat it as the deployed case.
+ */
+export function cookiesAreSecure(config: WebConfig): boolean {
+  return !config.identity.publicUrl.startsWith("http://");
 }
 
 /** HOST-form to URL: http for a local address, https everywhere else. */

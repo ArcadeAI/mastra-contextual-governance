@@ -1,0 +1,259 @@
+/**
+ * Hop 1: the gateway token.
+ *
+ * `DESIGN.md` → **Two hops, two mechanisms**. Hop 1 is MCP client → gateway,
+ * governed by the User Source gateway `cg-demo-us`. Arcade brokers the login to
+ * `apps/idp`, and the token that comes back is the bearer every later tool call
+ * carries — the one whose identity the `/access` and `/pre` hooks see.
+ *
+ * **`apps/web` drives this flow itself.** Mastra's `MCPClient.authenticate()`
+ * refuses a non-loopback redirect URI, and this service is deployed at an
+ * HTTPS origin, so the alternative would be a loopback listener on a Render
+ * instance nobody's browser can reach. `MCPClient` is handed a static token
+ * instead (#14). Every step below is the one spike #04 measured against the
+ * live gateway; nothing here is inferred from a specification.
+ *
+ *   POST <mcp>            no token  -> 401 + WWW-Authenticate: resource_metadata="…"
+ *   GET  <resource metadata>        -> authorization_servers[0]
+ *   GET  /.well-known/oauth-authorization-server<path>
+ *   POST <registration_endpoint>    -> client_id for our HTTPS redirect
+ *   GET  <authorization_endpoint>   -> Arcade's consent screen, then our callback
+ *   POST <token_endpoint>           -> access + refresh token
+ *
+ * The `resource` parameter rides on both the authorize and the token request,
+ * as RFC 8707 asks and as the measured flow sent it.
+ */
+
+/** What the authorization server publishes. Only the three endpoints are used. */
+export interface GatewayMetadata {
+  authorization_endpoint: string;
+  token_endpoint: string;
+  registration_endpoint: string;
+}
+
+/** Everything hop 1 needs to start, discovered once and then held. */
+export interface GatewayClient {
+  metadata: GatewayMetadata;
+  clientId: string;
+  /** Present only if the authorization server issued one; `none` is what we register for. */
+  clientSecret?: string;
+}
+
+/** `mcp offline_access` — `offline_access` is what makes a refresh token possible. */
+export const GATEWAY_SCOPE = "mcp offline_access";
+
+/**
+ * Registration is cached **per process**, keyed by gateway URL and redirect URI.
+ *
+ * Arcade renders its gateway consent screen once per persona per MCP client id,
+ * so a fresh dynamic registration on every sign-in would mean a consent screen
+ * on every sign-in. A process-lifetime cache is the cheapest thing that avoids
+ * that without a fourth database: one registration per deploy, shared by every
+ * persona, and a restart costs one extra consent click per persona — which is
+ * the same click a new browser profile costs anyway.
+ *
+ * `ARCADE_MCP_CLIENT_ID` overrides it for a deployment that would rather pin a
+ * registration than let one be minted; nothing in this repo requires it.
+ */
+const registrations = new Map<string, Promise<GatewayClient>>();
+
+/** The gateway's MCP endpoint: `https://api.arcade.dev/mcp/cg-demo-us`. */
+export function mcpUrl(arcadeApiUrl: string, gatewayId: string): string {
+  return `${arcadeApiUrl}/mcp/${gatewayId}`;
+}
+
+/**
+ * Discovery, as the 401 drives it.
+ *
+ * The unauthenticated `initialize` is not a formality — it is where the
+ * resource metadata URL comes from. Guessing `/.well-known/…` off the MCP URL
+ * would be a second source of truth for something Arcade already states.
+ */
+export async function discoverGateway(url: string): Promise<GatewayMetadata> {
+  const probe = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "cg-web", version: "0.1.0" } },
+    }),
+  });
+  if (probe.status !== 401) {
+    throw new Error(`${url} answered ${probe.status} to an unauthenticated initialize, expected 401`);
+  }
+
+  const resourceMetadata = /resource_metadata="([^"]+)"/.exec(probe.headers.get("www-authenticate") ?? "")?.[1];
+  if (!resourceMetadata) throw new Error("no resource_metadata in the gateway's WWW-Authenticate header");
+
+  const resource = (await (await fetch(resourceMetadata)).json()) as { authorization_servers?: string[] };
+  const server = resource.authorization_servers?.[0];
+  if (!server) throw new Error(`${resourceMetadata} named no authorization_servers`);
+
+  // RFC 8414 §3.1: the well-known segment goes after the origin and before the
+  // issuer's path, which is not where a naive join would put it.
+  const issuer = new URL(server);
+  const metadataUrl = `${issuer.origin}/.well-known/oauth-authorization-server${issuer.pathname.replace(/\/+$/, "")}`;
+  const metadata = (await (await fetch(metadataUrl)).json()) as Partial<GatewayMetadata>;
+  if (!metadata.authorization_endpoint || !metadata.token_endpoint || !metadata.registration_endpoint) {
+    throw new Error(`${metadataUrl} did not publish the three endpoints hop 1 needs`);
+  }
+  return metadata as GatewayMetadata;
+}
+
+/**
+ * Discover and register, once per process per (gateway, redirect URI).
+ *
+ * `token_endpoint_auth_method: "none"` — a public client, because this
+ * registration is minted at runtime and there is nowhere durable to keep a
+ * secret for it. PKCE is what protects the code, and that is on every leg.
+ */
+export function gatewayClient(
+  url: string,
+  redirectUri: string,
+  pinnedClientId?: string,
+): Promise<GatewayClient> {
+  const key = `${url}|${redirectUri}|${pinnedClientId ?? ""}`;
+  const held = registrations.get(key);
+  if (held) return held;
+
+  const minted = (async () => {
+    const metadata = await discoverGateway(url);
+    if (pinnedClientId) return { metadata, clientId: pinnedClientId };
+
+    const response = await fetch(metadata.registration_endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        client_name: "Contextual Governance — apps/web",
+        redirect_uris: [redirectUri],
+        grant_types: ["authorization_code", "refresh_token"],
+        response_types: ["code"],
+        token_endpoint_auth_method: "none",
+        scope: GATEWAY_SCOPE,
+      }),
+    });
+    const body = await response.text();
+    if (!response.ok) throw new Error(`dynamic client registration -> ${response.status} ${body}`);
+    const registered = JSON.parse(body) as { client_id?: string; client_secret?: string };
+    if (!registered.client_id) throw new Error("the registration response carried no client_id");
+    const client: GatewayClient = { metadata, clientId: registered.client_id };
+    if (registered.client_secret) client.clientSecret = registered.client_secret;
+    return client;
+  })();
+
+  // Cache the promise, not the result, so two sign-ins racing at boot share one
+  // registration — two would mean two consent screens for the same persona.
+  // A failure is dropped so the next attempt rediscovers rather than replaying
+  // the error forever.
+  registrations.set(key, minted);
+  minted.catch(() => registrations.delete(key));
+  return minted;
+}
+
+/** Only for tests, which point this at a stand-in and must not inherit the last one's registration. */
+export function forgetGatewayClients() {
+  registrations.clear();
+}
+
+export function gatewayAuthorizeUrl(options: {
+  client: GatewayClient;
+  redirectUri: string;
+  resource: string;
+  state: string;
+  challenge: string;
+}): string {
+  return `${options.client.metadata.authorization_endpoint}?${new URLSearchParams({
+    response_type: "code",
+    client_id: options.client.clientId,
+    redirect_uri: options.redirectUri,
+    scope: GATEWAY_SCOPE,
+    state: options.state,
+    code_challenge: options.challenge,
+    code_challenge_method: "S256",
+    resource: options.resource,
+  })}`;
+}
+
+export interface GatewayTokenResponse {
+  access_token: string;
+  refresh_token?: string;
+  expires_in?: number;
+}
+
+export type GatewayTokenResult =
+  | { ok: true; token: GatewayTokenResponse }
+  | { ok: false; status: number; body: string };
+
+async function tokenRequest(endpoint: string, form: Record<string, string>): Promise<GatewayTokenResult> {
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams(form).toString(),
+  });
+  const body = await response.text();
+  if (!response.ok) return { ok: false, status: response.status, body };
+  try {
+    return { ok: true, token: JSON.parse(body) as GatewayTokenResponse };
+  } catch {
+    return { ok: false, status: response.status, body };
+  }
+}
+
+export function exchangeGatewayCode(options: {
+  client: GatewayClient;
+  redirectUri: string;
+  resource: string;
+  code: string;
+  codeVerifier: string;
+}): Promise<GatewayTokenResult> {
+  return tokenRequest(options.client.metadata.token_endpoint, {
+    grant_type: "authorization_code",
+    code: options.code,
+    redirect_uri: options.redirectUri,
+    client_id: options.client.clientId,
+    code_verifier: options.codeVerifier,
+    resource: options.resource,
+  });
+}
+
+/**
+ * Refresh, server-side.
+ *
+ * The browser never sees either token and never drives this: the refresh is a
+ * server-to-server call made on the next request that needs a live bearer, and
+ * the result is resealed into the same cookie.
+ */
+export function refreshGatewayToken(options: {
+  tokenEndpoint: string;
+  clientId: string;
+  refreshToken: string;
+  resource: string;
+}): Promise<GatewayTokenResult> {
+  return tokenRequest(options.tokenEndpoint, {
+    grant_type: "refresh_token",
+    refresh_token: options.refreshToken,
+    client_id: options.clientId,
+    resource: options.resource,
+  });
+}
+
+/**
+ * When a token issued now expires.
+ *
+ * A missing `expires_in` is treated as **one hour**, not as "never": a token
+ * assumed immortal is one this service keeps presenting after Arcade stopped
+ * accepting it, and the symptom is a tool call that fails with nothing on the
+ * panel — hop 1 is upstream of every hook.
+ */
+export function expiryOf(token: GatewayTokenResponse, now = Date.now()): number {
+  return now + (token.expires_in ?? 3600) * 1000;
+}
+
+/** Refresh this far before expiry, so a token does not die mid-call. */
+export const REFRESH_SKEW_MS = 60_000;
+
+export function isExpiring(expiresAt: number, now = Date.now()): boolean {
+  return expiresAt - REFRESH_SKEW_MS <= now;
+}
