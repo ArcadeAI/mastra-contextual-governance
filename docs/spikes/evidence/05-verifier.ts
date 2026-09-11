@@ -267,20 +267,7 @@ async function callback(url: URL): Promise<Response> {
   const credentials = await readCredentials();
   if (!credentials.ok) return credentialsMissing(credentials.missing);
 
-  const tokenRes = await fetch(`${IDP_ISSUER}/oauth2/token`, {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "authorization_code",
-      code,
-      redirect_uri: redirectUri(),
-      client_id: credentials.clientId,
-      client_secret: credentials.clientSecret,
-      code_verifier: flow.verifier,
-    }).toString(),
-  });
-  const tokenText = await tokenRes.text();
-  note(`IdP token exchange -> ${tokenRes.status}`, redact(tokenText).slice(0, 400));
+  const { res: tokenRes, text: tokenText } = await exchangeCode(code, flow.verifier, credentials);
   if (!tokenRes.ok) return page("Token exchange failed", `<pre>${redact(tokenText)}</pre>`, 502);
   const token = JSON.parse(tokenText) as { access_token: string; id_token?: string };
 
@@ -364,6 +351,69 @@ async function confirmUser(
   return { response };
 }
 
+
+/**
+ * Trade the code for a token, authenticating the client the way this IdP wants.
+ *
+ * `apps/idp` enforces **one** client-authentication method per client and refuses
+ * the other outright rather than accepting either. This project has now been bitten
+ * by that in both directions within one afternoon: Arcade sent `client_secret_basic`
+ * to a `client_secret_post` registration (#61), and after #61 flipped the client,
+ * this verifier sent `client_secret_post` to a `client_secret_basic` registration
+ * and got `client registered for client_secret_basic cannot use client_secret_post`.
+ *
+ * So it is not hardcoded. The method comes from what the IdP publishes on `/health`,
+ * and if that is wrong or absent the other method is tried once — because the
+ * failure mode otherwise is a relying party that looks correctly configured, fails
+ * at a step no hook observes, and gets blamed on whoever owns the other end.
+ */
+async function exchangeCode(
+  code: string,
+  codeVerifier: string,
+  credentials: { clientId: string; clientSecret: string },
+): Promise<{ res: Response; text: string }> {
+  const advertised = await fetch(`${IDP_ISSUER}/health`)
+    .then((r) => (r.ok ? r.json() : null))
+    .then((b: any) => b?.oauth?.token_endpoint_auth_method as string | undefined)
+    .catch(() => undefined);
+  const order =
+    advertised === "client_secret_post"
+      ? (["post", "basic"] as const)
+      : (["basic", "post"] as const);
+
+  let last!: { res: Response; text: string };
+  for (const method of order) {
+    const headers: Record<string, string> = { "content-type": "application/x-www-form-urlencoded" };
+    const form: Record<string, string> = {
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: redirectUri(),
+      client_id: credentials.clientId,
+      code_verifier: codeVerifier,
+    };
+    if (method === "basic") {
+      headers.authorization = `Basic ${Buffer.from(`${credentials.clientId}:${credentials.clientSecret}`).toString("base64")}`;
+    } else {
+      form.client_secret = credentials.clientSecret;
+    }
+    const res = await fetch(`${IDP_ISSUER}/oauth2/token`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams(form).toString(),
+    });
+    const text = await res.text();
+    note(`IdP token exchange, client_secret_${method} -> ${res.status}`, redact(text).slice(0, 400));
+    last = { res, text };
+    if (res.ok) return last;
+    // Only a method mismatch is worth a second attempt. A wrong secret, a spent
+    // code or an expired one must not be retried — that just doubles the noise in
+    // the IdP's log and tells the reader nothing.
+    if (!/cannot use client_secret_(post|basic)/.test(text)) return last;
+    note(`the IdP refuses client_secret_${method} for this client; trying the other`);
+  }
+  return last;
+}
+
 /** Where the human's `confirm_user` response comes back in. Local use only. */
 async function confirm(req: Request): Promise<Response> {
   const payload = (await req.json().catch(() => null)) as { flow_id?: string; response?: unknown } | null;
@@ -379,7 +429,13 @@ async function confirm(req: Request): Promise<Response> {
 }
 
 const server = Bun.serve({
-  port: 0, // never claim a port another worktree owns
+  // Port 0 by default — never claim a port another worktree owns. `PORT` exists for
+  // exactly one case: restarting this process without losing the tunnel. `ngrok`
+  // runs as its own OS process pointing at a local port, so killing only the Bun
+  // server and rebinding the same port keeps the public URL alive — which matters
+  // because that URL is pasted into a dashboard by a human, and on the free tier a
+  // new tunnel means a new hostname and a field that is now silently wrong.
+  port: Number(process.env.PORT ?? 0),
   idleTimeout: 255,
   async fetch(req) {
     const url = new URL(req.url);
