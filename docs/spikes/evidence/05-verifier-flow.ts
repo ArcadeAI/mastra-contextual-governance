@@ -147,12 +147,17 @@ async function main() {
       );
     }
 
-    const params = await Promise.race([
-      captured,
-      new Promise<URLSearchParams>((_, reject) =>
-        setTimeout(() => reject(new Error("no callback within 120s")), 120_000),
-      ),
-    ]);
+    // The chain is walked by hand, so it lands *on* the redirect URI rather than
+    // being fetched through it: read the query off `landedOn` and fall back to the
+    // loopback listener only if something else drove the last hop.
+    const params = drive.landedOn
+      ? new URL(drive.landedOn).searchParams
+      : await Promise.race([
+          captured,
+          new Promise<URLSearchParams>((_, reject) =>
+            setTimeout(() => reject(new Error("no callback within 120s")), 120_000),
+          ),
+        ]);
     t.hop("callback query", {
       keys: [...params.keys()],
       stateMatches: params.get("state") === state,
