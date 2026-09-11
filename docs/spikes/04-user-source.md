@@ -507,10 +507,37 @@ call the checked-in result stale.
 **It is a live change on Arcade's side, not a measurement error here.** The window is
 narrow and bounded by timestamps on this PR: the round-1 reply at **14:14Z** was
 written against a chain that still ended at `account.arcade.dev`, and the verdict at
-**14:24Z** found `cg-idp-or5b`. Whatever moved, moved inside those nine minutes. The
-candidate-(A)-or-(B) framing above was therefore answered as **(B)**: the gateway's
-`user_source_id` was never being ignored; the User Source's own configuration was the
-thing not working, and Arcade's broker started acting on it the moment that was fixed.
+**14:24Z** found `cg-idp-or5b`. Whatever moved, moved inside those nine minutes.
+
+What that settles, and what it does not:
+
+- **Settled by observation.** As of **14:24Z** the User Source attached to
+  `cg-demo-us` is honoured at authorize: the gateway brokers hop 1 to
+  `cg-idp-or5b.onrender.com`, and `auth.arcade.dev` and `account.arcade.dev` are gone
+  from the chain. `cg-demo` in members mode is unchanged.
+- **Not explained.** *Why* it began to be honoured is unknown and on Arcade's side.
+  Nothing of ours changed in that window: the driver comment on **#75 dated
+  2026-09-11 14:41Z** records the human's answers that the custom verifier URL was
+  **never saved** and the User Source was **not touched**, so the change was not
+  caused by us, and it is recorded there as unexplained and Arcade-side between 14:15Z
+  and 14:24Z. The comment on **#75 dated 2026-09-11 14:28Z** adds that the verifier
+  tunnel received zero requests from Arcade, so even attributing it to the verifier
+  was not separable from outside.
+
+So the candidate-(A)-or-(B) framing above is **closed by observation rather than
+answered**. Candidate (A), that Arcade's broker does not consult a gateway's
+`user_source_id` at authorize, is not true of the live system as of 14:24Z, and the
+#75 comment of 14:28Z says so in those terms. Whether it was true before 14:15Z, and
+whether candidate (B) was ever the real cause, is not established either way and this
+document should not be read as establishing it. **Do not cite (B) as the answer.**
+
+The failure that remained at 14:24Z is a different thing and it *was* explained: the
+chain reached our `/login` and `/consent` and then came back
+`access_denied: Token exchange with identity provider failed`. That was the client
+authentication-method mismatch — Arcade's OIDC client sends `client_secret_basic`
+against a client registered `client_secret_post`, which Better Auth rejects before it
+checks the secret — inferred at 14:41Z and fixed in code by **#61** (`aa98780`), then
+measured working at **15:25Z**. See item 2 below.
 
 **The committed evidence is not amended, and it should not be.** Every hop in
 `evidence/04-user-source-transcript.md` is a true record of what the live services did
@@ -525,9 +552,12 @@ match today's behaviour is worth nothing the next time something moves. Read sec
 Question 2 above is answered, elsewhere and by someone else. The driver comment on
 **#61 dated 2026-09-11 15:32Z** records the live acceptance: after `aa98780` deployed,
 the User Source token exchange against `cg-idp-or5b` returned **200** as Dana at
-**15:25Z**. The cause of every earlier failure was the client authentication method —
-`aa98780` registers the IdP's OAuth client `client_secret_basic` — and the same
-comment records that the `cg-idp` auth provider was already `client_secret_basic` in
+**15:25Z**. What had been failing was the token exchange specifically, from 14:24Z
+onward once the chain started reaching our IdP at all, and its cause was the client
+authentication method: `aa98780` registers the IdP's OAuth client
+`client_secret_basic`. Spike 05 records that as measured rather than inferred —
+inferred at 14:41Z, confirmed at 15:25Z by changing exactly that and nothing else. The
+same #61 comment records that the `cg-idp` auth provider was already `client_secret_basic` in
 the dashboard, so nothing had to change there and the #13 handoff's
 "credentials in body" note was wrong about how Arcade stored it.
 
