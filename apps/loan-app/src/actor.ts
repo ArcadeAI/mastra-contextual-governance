@@ -8,6 +8,11 @@
  * itself identifies the user from, so the `user_id` the control plane governs
  * and the actor this service records are the same string by construction.
  *
+ * Addresses are case-insensitive, so the one the provider returns is folded to
+ * lower case before it is recorded (#58). Two systems that spell the same
+ * person `Dana.Okafor@…` and `dana.okafor@…` join on neither, and the
+ * decision history would then describe two people where there is one.
+ *
  * This is validation, not decision-making: a token either names someone or it
  * does not. What that someone may do is not asked here.
  */
@@ -53,5 +58,5 @@ export async function actorFromRequest(request: Request, idpHost: string): Promi
   const parsed = userinfoSchema.safeParse(await response.json().catch(() => null));
   if (!parsed.success) throw new ActorError("The token does not identify an email address.");
 
-  return parsed.data.email;
+  return parsed.data.email.trim().toLowerCase();
 }

@@ -31,7 +31,20 @@ const dbPath = join(tmpdir(), `cg-loan-app-${crypto.randomUUID()}`, "loans.db");
 
 const DANA = "dana@example.test";
 const RILEY = "riley@example.test";
-const TOKENS: Record<string, string> = { "tok-dana": DANA, "tok-riley": RILEY };
+/**
+ * A provider that hands back a capitalised address. Real ones do: the value
+ * is whatever the account was created under, and #58 found a deployment where
+ * every persona was `Dana.Okafor@megaforce.tech`. The actor recorded here has
+ * to be the same string the control plane governs, and neither end gets to
+ * assume the other's case.
+ */
+const MORGAN_AS_ISSUED = "Morgan.Ellis@Example.Test";
+const MORGAN = MORGAN_AS_ISSUED.toLowerCase();
+const TOKENS: Record<string, string> = {
+  "tok-dana": DANA,
+  "tok-riley": RILEY,
+  "tok-morgan": MORGAN_AS_ISSUED,
+};
 
 /**
  * A port the OS says is free, rather than a guess.
@@ -241,6 +254,21 @@ describe("decisions", () => {
     expect(second.decisions).toHaveLength(2);
     expect(second.decisions.map((d) => d.amount)).toEqual([15_500, 9_000]);
     expect(second.decisions.map((d) => d.decided_by)).toEqual([DANA, RILEY]);
+  });
+
+  test("an actor the provider capitalises is recorded in one case, not two (#58)", async () => {
+    const loan = (await (
+      await post("tok-morgan", "/loans/LN-2292/approve", { amount: 2_500 })
+    ).json()) as LoanRecord;
+
+    const latest = loan.decisions.at(-1)!;
+    expect(latest.decided_by).toBe(MORGAN);
+    expect(latest.decided_by).not.toBe(MORGAN_AS_ISSUED);
+
+    // And the book holds one Morgan, not two spellings of them.
+    expect(loan.decisions.filter((d) => d.decided_by?.toLowerCase() === MORGAN)).toEqual(
+      loan.decisions.filter((d) => d.decided_by === MORGAN),
+    );
   });
 
   test("deny records the reason verbatim", async () => {
