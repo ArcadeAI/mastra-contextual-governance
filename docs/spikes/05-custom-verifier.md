@@ -391,13 +391,78 @@ Authentication Method dropdown read *"Client Secret Basic"*, greyed out, with th
 tooltip *"Currently, client secret basic is the only supported authentication
 method."* Underneath, its Token Settings and Refresh Token Settings each carried
 Request Parameters rows `client_id={{client_id}}` and `client_secret={{client_secret}}`
-— left over from the #13 sitting's template — and **those rows are what decides the
+— left over from the #13 sitting's template — and **those rows are what decided the
 wire behaviour**. A control that reports itself as one thing and does another, in
 the console this demo depends on, is precisely the failure mode this project exists
 to keep out.
 
-The human removed both pairs and re-entered the post-rotation secret. The chain
-still ends the same way: verification perfect, grant absent.
+Removing the rows did not switch it to a Basic header. It made the provider send
+**no client credentials at all**:
+
+```
+2026-09-11T16:48:41.847Z [idp] POST /oauth2/token rejected: status=400
+  error=invalid_request error_description="client_id is required"
+  client_auth="absent" client_id=(not the registered client)
+```
+
+### Reading the configuration back beats reading the console
+
+Two dashboard errors in one evening, both found in seconds by asking Arcade's admin
+API what it had actually stored. `evidence/05-auth-provider-config.ts` does that,
+read-only, with every secret-shaped value scrubbed before it reaches a terminal. It
+is the cheapest thing this spike produced and the one worth keeping.
+
+The **pre-existing** provider, created 2026-09-10, stored this:
+
+```json
+"token_request": {
+  "endpoint": "https://cg-idp-or5b.onrender.com/oauth2/token",
+  "method": "POST",
+  "params": { "grant_type": "authorization_code", "redirect_uri": "{{redirect_uri}}" },
+  "request_content_type": "application/x-www-form-urlencoded"
+}
+```
+
+**No `auth_method` field at all** — while the sibling `user_info_request` block has
+one (`"auth_method": "bearer_access_token"`), so the concept exists in the schema
+and was simply absent here. For that record, the only path to the token endpoint
+was `params`, which is `client_secret_post` by construction.
+
+A provider **recreated the same evening** stores something different:
+
+```json
+"token_request": {
+  "endpoint": "https://cg-idp-or5b.onrender.com/oauth2/token",
+  "method": "POST",
+  "auth_method": "client_secret_basic",
+  "params": { "client_id": "{{client_id}}", "client_secret": "<redacted>",
+              "grant_type": "authorization_code", "redirect_uri": "{{redirect_uri}}" }
+}
+```
+
+`auth_method: "client_secret_basic"` is present. **So the incompatibility this spike
+first reported — that an Arcade auth provider can only ever send credentials in the
+body, and therefore cannot share one IdP client with a User Source — is a property
+of the older record, not of Arcade.** That correction matters enough to state
+plainly: an earlier draft of this document recommended `apps/idp` mint one OAuth
+client per relying party on the strength of the first reading. See
+[the one-client problem](#the-one-client-problem) for what survives of it.
+
+Recreating also rotated the provider's callback path, from
+`.../api/v1/oauth/f4c6b_ap_GvSAhPpynQRj/callback` to
+`.../api/v1/oauth/f4c6b_ap_1cWxRQzV98W4/callback`. **A provider recreate invalidates
+the redirect URI allowlisted at the IdP**, which is a step for #24's runbook and a
+failure that fires no hook if missed.
+
+The recreated provider then failed one step earlier still, on a misfiled field —
+its Client ID held the token endpoint URL:
+
+```
+"client_id": "https://cg-idp-or5b.onrender.com/oauth2/token"
+
+GET  cg-idp-or5b/oauth2/authorize?client_id=https%3A%2F%2F…%2Foauth2%2Ftoken
+302 → cg-idp-or5b/error?error=invalid_client&error_description=client_id+is+required
+```
 
 **So H2-c and H2-d are unmeasured, and `/pre` has never fired for a loan tool.**
 A layer-2 refusal produces no hook — DESIGN.md's open risk 2, met again — so the
@@ -429,22 +494,40 @@ section says why it is also a problem.
 
 ## The one-client problem
 
-`apps/idp` registers **exactly one** OAuth client, confidential,
-`client_secret_post`, secret stored hashed since #70, with dynamic client
-registration off by design (`POST /oauth2/register` → 403). Measured: there is no
-PKCE-only path around the secret —
+`apps/idp` registers **exactly one** OAuth client, confidential, secret stored
+hashed since #70, with dynamic client registration off by design
+(`POST /oauth2/register` → 403). Measured: there is no PKCE-only path around the
+secret —
 
 ```
 no client_secret (PKCE only) -> 400 {"error":"invalid_client",
   "error_description":"client registered for client_secret_post cannot use none"}
 ```
 
-Three different relying parties now want to be that client: the **User Source**,
-the **auth provider**, and the **verifier** (later, `apps/web`). They share a
-secret that can be read exactly once, so rotating for one breaks the other two
-until every dashboard field is updated by hand. **`apps/idp` needs to mint and
-print additional clients**, the way it does the first. That is a #14 prerequisite
-or its own small slice, and it is bigger than this spike.
+Three relying parties want to be that client: the **User Source**, the **auth
+provider**, and the **verifier** (later, `apps/web`). What that costs, measured
+rather than argued:
+
+- **One client has one auth method, and `apps/idp` refuses the other outright.**
+  #61 registered it `client_secret_basic` to fix hop 1. Within the hour the verifier
+  — pointed at the same client — was refused: *"client registered for
+  `client_secret_basic` cannot use `client_secret_post`"*. Fixed by having the
+  verifier read the method off the IdP's `/health` rather than assume one.
+- **One client has one secret, readable once.** It was rotated during this sitting,
+  which meant re-entering it in the User Source *and* the auth provider by hand, and
+  a registration that misses the rotation fails at a step no hook observes.
+- **One client means one consent.** Hop 2's authorization at our IdP is silent
+  precisely because the User Source and the auth provider are the same client and
+  consent is per client. **Split them and each will consent separately**, so the
+  round-trip count in the section above changes. Design for it rather than
+  discovering it in #14.
+
+**What this spike does *not* establish** is that one client is unworkable. An
+earlier reading of the pre-existing provider record — no `auth_method` on its token
+request — suggested the User Source (Basic) and the auth provider (body) could never
+share a client. A provider recreated the same evening stores
+`auth_method: "client_secret_basic"`, so that conclusion does not hold in general.
+The costs above are real; the impossibility was not.
 
 ## Findings
 
