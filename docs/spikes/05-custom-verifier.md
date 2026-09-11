@@ -744,9 +744,28 @@ it does, do not wire #14's tool-authorization path on the assumption that it wor
 
 ## Nothing under `apps/` changed
 
-`git diff --name-only main` is `docs/spikes/` and nothing else. The verifier is
-deliberately not an app: no database, no tests, no deployment, and it holds a
-client secret in its environment, read from a gitignored file.
+```console
+$ git diff --name-only main...HEAD
+docs/spikes/05-custom-verifier.md
+docs/spikes/evidence/05-auth-provider-config.ts
+docs/spikes/evidence/05-custom-verifier-transcript.md
+docs/spikes/evidence/05-drive.ts
+docs/spikes/evidence/05-redirect-allowlist.ts
+docs/spikes/evidence/05-token-auth-methods.ts
+docs/spikes/evidence/05-verifier-flow.ts
+docs/spikes/evidence/05-verifier.ts
+```
+
+Three dots, not two: #61 landed on `main` after this branch started, so a two-dot
+`git diff main` lists its `apps/idp` changes as well. None of them are this branch's.
+
+The verifier is deliberately not an app: no database, no tests, no deployment, and it
+reads a client secret and an API key from a gitignored file that no one but the human
+opens.
+
+**Proposed #14 scope item.** The verifier moves into `apps/web` as two route handlers,
+not a service — see [the recommendation](#recommendation-for-14) for the shape and for
+the one property that must survive the move.
 
 ## Follow-ups
 
