@@ -122,14 +122,46 @@ async function readCredentials(): Promise<
     else if (process.env[name]) seen.push("the environment");
     return (fromFile[name] ?? process.env[name] ?? "").trim();
   };
-  const clientId = pick("IDP_CLIENT_ID");
+  let clientId = pick("IDP_CLIENT_ID");
   const clientSecret = pick("IDP_CLIENT_SECRET");
+
+  // The client id is not a secret — `apps/idp` publishes it on `/health` — so ask
+  // the IdP rather than asking a human for something they can get wrong. One fewer
+  // value to copy is one fewer value to mistype, and this spike lost a measurement
+  // to exactly that: a placeholder reached `/oauth2/authorize` as a literal
+  // `client_id=<the cg-idp client id>` and came back `client_id is required`.
+  if (!clientId || isPlaceholder(clientId)) {
+    const published = await fetch(`${IDP_ISSUER}/health`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((body: any) => body?.oauth?.client_id as string | undefined)
+      .catch(() => undefined);
+    if (published) {
+      clientId = published;
+      seen.push(`${IDP_ISSUER}/health`);
+    }
+  }
+
   const missing = [
     ...(clientId ? [] : ["IDP_CLIENT_ID"]),
     ...(clientSecret ? [] : ["IDP_CLIENT_SECRET"]),
   ];
   if (missing.length) return { ok: false, missing };
+
+  // A placeholder is worse than an absence: it produces a flow that runs, fails
+  // somewhere downstream, and looks like the counterparty's fault. Refuse it by
+  // shape — the shape is all this process is willing to know about the value.
+  const placeholders = [
+    ...(isPlaceholder(clientId) ? ["IDP_CLIENT_ID"] : []),
+    ...(isPlaceholder(clientSecret) ? ["IDP_CLIENT_SECRET"] : []),
+  ];
+  if (placeholders.length) return { ok: false, missing: placeholders.map((name) => `${name} (looks like a placeholder, not a value)`) };
+
   return { ok: true, clientId, clientSecret, source: [...new Set(seen)].join(" and ") };
+}
+
+/** Angle brackets, whitespace, ellipses: the shapes a "fill this in" marker takes. */
+function isPlaceholder(value: string): boolean {
+  return /[<>\s]/.test(value) || /^\.{3}|\.{3}$/.test(value) || /^(your|the|todo|changeme|placeholder)[-_ ]/i.test(value);
 }
 
 /** What to say, to a browser and to the log, when the file is not there yet. */
