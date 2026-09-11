@@ -21,7 +21,7 @@ import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import type { Subprocess } from "bun";
 import { Database } from "bun:sqlite";
 import { hashPassword, symmetricEncrypt } from "better-auth/crypto";
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -38,10 +38,18 @@ import {
 } from "../src/db.ts";
 
 const ROOT = join(import.meta.dir, "..");
-const REPO_ROOT = join(ROOT, "..", "..");
 
-/** The commit that merged #58; its parent is the last case-sensitive schema. */
-const SLICE_58 = "3d2dd9d";
+/**
+ * `src/schema.sql` as it stood before #58 made `user.email` case-insensitive,
+ * checked in rather than read out of git.
+ *
+ * It used to be `git show 3d2dd9d^:apps/idp/src/schema.sql`, which passes on a
+ * full clone and fails in CI with `fatal: invalid object name '3d2dd9d^'` —
+ * `actions/checkout@v4` fetches one commit by default. A test that reads
+ * repository history is a test that does not run in the gate, which is worse
+ * than one that fails there. Round 2 review on PR #71.
+ */
+const PRE_58_SCHEMA = join(import.meta.dir, "fixtures", "schema-pre-3d2dd9d.sql");
 const SECRET = "test-secret-".padEnd(48, "x");
 const OTHER_SECRET = "a-different-secret-".padEnd(48, "y");
 const REDIRECT_URI = "http://127.0.0.1:9/callback";
@@ -500,23 +508,18 @@ describe("a disk written before #58 made user.email case-insensitive", () => {
   /** As `PERSONA_DANA_EMAIL` was set on `cg-idp` during the #13 sitting. */
   const CAPITALISED = "Dana.Okafor@Bank.Example";
 
-  /** `git show 3d2dd9d^:apps/idp/src/schema.sql` — the last case-sensitive schema. */
+  /** The frozen pre-#58 schema. See `PRE_58_SCHEMA`. */
   function schemaBefore58(): string {
-    const shown = Bun.spawnSync(["git", "show", `${SLICE_58}^:apps/idp/src/schema.sql`], {
-      cwd: REPO_ROOT,
-    });
-    if (shown.exitCode !== 0) {
-      throw new Error(
-        `could not read the pre-#58 schema from git (exit ${shown.exitCode}): ` +
-          new TextDecoder().decode(shown.stderr),
-      );
-    }
-    const sql = new TextDecoder().decode(shown.stdout);
+    const sql = readFileSync(PRE_58_SCHEMA, "utf8");
 
-    // If this ever stops holding, the fixture is no longer the thing the test
-    // claims to be, and a green run would mean nothing.
-    expect(sql).toContain('"email" text not null unique');
-    expect(sql.toLowerCase()).not.toContain("collate nocase");
+    // If these ever stop holding, the fixture is no longer the thing the test
+    // claims to be and a green run would mean nothing — so they are checked
+    // against the `user` statement itself rather than the file, which also
+    // carries a header explaining why it is frozen.
+    const user = /create table "user" \([^;]*\)/i.exec(sql)?.[0];
+    expect(user).toBeTruthy();
+    expect(user).toContain('"email" text not null unique');
+    expect(user!.toLowerCase()).not.toContain("collate nocase");
     expect(sql).not.toContain('create table "jwks"');
     return sql;
   }
