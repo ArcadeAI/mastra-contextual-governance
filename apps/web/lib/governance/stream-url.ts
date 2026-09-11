@@ -59,12 +59,13 @@ export function governanceStreamSource(
 }
 
 /** The knobs the fixture stream understands. See its route for what they do. */
-const FIXTURE_PARAMS = ["delayMs", "repeat"] as const;
+const FIXTURE_PARAMS = ["delayMs", "repeat", "fanout"] as const;
 
 /**
- * `source` with the fixture stream's pacing parameters carried over from the
- * page's own query string, so `/panel?repeat=2000&delayMs=0` is a burst a
- * presenter can rehearse against and a reviewer can watch.
+ * `source` with the fixture stream's own parameters carried over from the
+ * page's query string, so `/panel?repeat=2000&delayMs=0` is a burst a
+ * presenter can rehearse against and a reviewer can watch, and
+ * `/panel?fanout=1` is the measured `/access` fan-out landing in one row.
  *
  * Only in fixture mode. The hook server's stream is not ours to add query
  * parameters to, and a stray `repeat` on it would be meaningless at best.
