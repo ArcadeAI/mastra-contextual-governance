@@ -87,6 +87,20 @@ const CONFIRM_TIMEOUT_MS = Number(process.env.CONFIRM_TIMEOUT_MS ?? 900_000);
 const NO_NGROK = process.argv.includes("--no-ngrok");
 const ENV_FILE = new URL("./.env.local", import.meta.url).pathname;
 
+/** Parse `docs/spikes/evidence/.env.local`, if the human has written it yet. */
+async function readEnvFile(): Promise<Record<string, string>> {
+  const file = Bun.file(ENV_FILE);
+  const values: Record<string, string> = {};
+  if (!(await file.exists())) return values;
+  for (const line of (await file.text()).split("\n")) {
+    if (line.trimStart().startsWith("#")) continue;
+    const match = /^\s*(?:export\s+)?([A-Z0-9_]+)\s*=\s*(.*)$/.exec(line);
+    if (!match) continue;
+    values[match[1]] = match[2].trim().replace(/^["']|["']$/g, "");
+  }
+  return values;
+}
+
 /**
  * Read the IdP client credentials out of `docs/spikes/evidence/.env.local`.
  *
@@ -106,16 +120,7 @@ const ENV_FILE = new URL("./.env.local", import.meta.url).pathname;
 async function readCredentials(): Promise<
   { ok: true; clientId: string; clientSecret: string; source: string } | { ok: false; missing: string[] }
 > {
-  const file = Bun.file(ENV_FILE);
-  const fromFile: Record<string, string> = {};
-  if (await file.exists()) {
-    for (const line of (await file.text()).split("\n")) {
-      if (line.trimStart().startsWith("#")) continue;
-      const match = /^\s*(?:export\s+)?([A-Z0-9_]+)\s*=\s*(.*)$/.exec(line);
-      if (!match) continue;
-      fromFile[match[1]] = match[2].trim().replace(/^["']|["']$/g, "");
-    }
-  }
+  const fromFile = await readEnvFile();
   const seen: string[] = [];
   const pick = (name: string) => {
     if (fromFile[name]) seen.push("docs/spikes/evidence/.env.local");
@@ -178,7 +183,23 @@ function credentialsMissing(missing: string[]): Response {
   );
 }
 
-const ARCADE_API_KEY = process.env.ARCADE_API_KEY?.trim();
+/**
+ * The Arcade project API key, read from the same untracked file as the IdP
+ * credentials and never printed.
+ *
+ * Read **per flow**, for a reason this spike measured rather than assumed. Without
+ * a key, `confirm_user` has to be run by a human, and Arcade only accepts it while
+ * the flow is still awaiting verification — a window narrower than a human's
+ * turnaround. Measured: the same call succeeded once at ~8 minutes and returned a
+ * bare `{"code":400,"msg":"Bad request"}` the next time, for a flow that was still
+ * live enough for Arcade to keep handing back its id. A verifier that holds the key
+ * closes that window to milliseconds, which is why the production shape is the only
+ * shape that reliably works.
+ */
+async function arcadeApiKey(): Promise<string | undefined> {
+  const fromFile = await readEnvFile();
+  return (fromFile.ARCADE_API_KEY ?? process.env.ARCADE_API_KEY ?? "").trim() || undefined;
+}
 
 interface Flow {
   /** Everything Arcade put on the query string, so the transcript records the real contract. */
@@ -188,6 +209,8 @@ interface Flow {
   startedAt: string;
   email?: string;
   confirm?: { auth_id?: string; next_uri?: string; [k: string]: unknown };
+  /** True between printing the curl and `POST /confirm` arriving. */
+  pending?: boolean;
   resolve?: (response: Record<string, unknown>) => void;
 }
 
@@ -284,7 +307,25 @@ async function callback(url: URL): Promise<Response> {
   const userId = userinfo.email.toLowerCase();
   flow.email = userId;
 
-  const confirmed = await confirmUser(flow, userId);
+  const apiKey = await arcadeApiKey();
+  if (!apiKey) {
+    // Without a key the confirm is a human's to run, and a human takes minutes. An
+    // earlier version parked the browser on this request until the answer came back;
+    // measured, that does not work — the connection dies first (Bun caps idleTimeout
+    // at 255s), the walker gives up, and the flow is left half-done with nobody
+    // holding it. So: print the curl, answer the browser now, and let `POST /confirm`
+    // finish the job server-side. The browser is not the thing that has to wait.
+    printConfirmCurl(flow, userId);
+    flow.pending = true;
+    return page(
+      "Waiting for confirm_user",
+      `<p>Identity established: <code>${userId}</code>.</p>` +
+        `<p>This verifier holds no Arcade API key, so <code>confirm_user</code> is run by hand. ` +
+        `The exact command is on this process's stdout; <code>POST /confirm</code> finishes the flow.</p>`,
+    );
+  }
+
+  const confirmed = await confirmUser(flow, userId, apiKey);
   if ("failed" in confirmed) return page("confirm_user failed", `<pre>${redact(confirmed.failed)}</pre>`, 502);
 
   flow.confirm = confirmed.response;
@@ -293,34 +334,38 @@ async function callback(url: URL): Promise<Response> {
   if (!next) {
     return page("Verified", `<p>Confirmed <code>${userId}</code>. Arcade returned no <code>next_uri</code>.</p>`);
   }
+  // A real browser would follow this 303 itself. Returning it is correct, and the
+  // redirect is what a deployed verifier should emit — but a scripted user agent
+  // that stops at the redirect leaves the grant unfinalised, so say where it goes.
+  note("303 to Arcade's next_uri", next);
   return new Response(null, { status: 303, headers: { Location: next } });
 }
 
 /**
- * The `confirm_user` call, made by whoever holds the API key.
+ * The `confirm_user` call, for the case where this process holds the API key.
  *
- * With a key in the environment this is one `fetch`. Without one it prints the
- * exact curl and waits for `POST /confirm` to hand the answer back. The caller
- * cannot tell the two apart, which is the point: the manual path is not a
- * different protocol.
+ * That is the production shape and the code a real deployment runs. This spike does
+ * not hold one, so it takes the other path — see `/callback` and `POST /confirm`.
  */
 async function confirmUser(
   flow: Flow,
   userId: string,
+  apiKey: string,
 ): Promise<{ response: Record<string, unknown> } | { failed: string }> {
-  const body = JSON.stringify({ flow_id: flow.flowId, user_id: userId });
-  if (ARCADE_API_KEY) {
-    const res = await fetch(ARCADE_CONFIRM_URL, {
-      method: "POST",
-      headers: { authorization: `Bearer ${ARCADE_API_KEY}`, "content-type": "application/json" },
-      body,
-    });
-    const text = await res.text();
-    note(`POST confirm_user -> ${res.status}`, text.slice(0, 400));
-    if (!res.ok) return { failed: `${res.status} ${text}` };
-    return { response: JSON.parse(text) as Record<string, unknown> };
-  }
+  const res = await fetch(ARCADE_CONFIRM_URL, {
+    method: "POST",
+    headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+    body: JSON.stringify({ flow_id: flow.flowId, user_id: userId }),
+  });
+  const text = await res.text();
+  note(`POST confirm_user -> ${res.status}`, text.slice(0, 400));
+  if (!res.ok) return { failed: `${res.status} ${text}` };
+  return { response: JSON.parse(text) as Record<string, unknown> };
+}
 
+/** The exact command, with the real values, for whoever does hold the key. */
+function printConfirmCurl(flow: Flow, userId: string) {
+  const body = JSON.stringify({ flow_id: flow.flowId, user_id: userId });
   console.log(
     [
       "",
@@ -341,91 +386,37 @@ async function confirmUser(
       "",
     ].join("\n"),
   );
-  note("parked, waiting for POST /confirm", { flow_id: flow.flowId, user_id: userId });
-
-  const response = await new Promise<Record<string, unknown> | null>((resolve) => {
-    flow.resolve = resolve as (r: Record<string, unknown>) => void;
-    setTimeout(() => resolve(null), CONFIRM_TIMEOUT_MS);
-  });
-  if (!response) return { failed: `no POST /confirm within ${CONFIRM_TIMEOUT_MS}ms` };
-  return { response };
+  note("waiting for POST /confirm", { flow_id: flow.flowId, user_id: userId });
 }
-
 
 /**
- * Trade the code for a token, authenticating the client the way this IdP wants.
+ * Where the human's `confirm_user` response comes back in. Local use only.
  *
- * `apps/idp` enforces **one** client-authentication method per client and refuses
- * the other outright rather than accepting either. This project has now been bitten
- * by that in both directions within one afternoon: Arcade sent `client_secret_basic`
- * to a `client_secret_post` registration (#61), and after #61 flipped the client,
- * this verifier sent `client_secret_post` to a `client_secret_basic` registration
- * and got `client registered for client_secret_basic cannot use client_secret_post`.
- *
- * So it is not hardcoded. The method comes from what the IdP publishes on `/health`,
- * and if that is wrong or absent the other method is tried once — because the
- * failure mode otherwise is a relying party that looks correctly configured, fails
- * at a step no hook observes, and gets blamed on whoever owns the other end.
+ * It also **follows `next_uri` server-side**, because Arcade does not finalise the
+ * grant until something lands there. Measured: a `confirm_user` that returned
+ * `{auth_id, next_uri}` left the tool still unauthorized, because the browser had
+ * already given up and nothing ever fetched that URL.
  */
-async function exchangeCode(
-  code: string,
-  codeVerifier: string,
-  credentials: { clientId: string; clientSecret: string },
-): Promise<{ res: Response; text: string }> {
-  const advertised = await fetch(`${IDP_ISSUER}/health`)
-    .then((r) => (r.ok ? r.json() : null))
-    .then((b: any) => b?.oauth?.token_endpoint_auth_method as string | undefined)
-    .catch(() => undefined);
-  const order =
-    advertised === "client_secret_post"
-      ? (["post", "basic"] as const)
-      : (["basic", "post"] as const);
-
-  let last!: { res: Response; text: string };
-  for (const method of order) {
-    const headers: Record<string, string> = { "content-type": "application/x-www-form-urlencoded" };
-    const form: Record<string, string> = {
-      grant_type: "authorization_code",
-      code,
-      redirect_uri: redirectUri(),
-      client_id: credentials.clientId,
-      code_verifier: codeVerifier,
-    };
-    if (method === "basic") {
-      headers.authorization = `Basic ${Buffer.from(`${credentials.clientId}:${credentials.clientSecret}`).toString("base64")}`;
-    } else {
-      form.client_secret = credentials.clientSecret;
-    }
-    const res = await fetch(`${IDP_ISSUER}/oauth2/token`, {
-      method: "POST",
-      headers,
-      body: new URLSearchParams(form).toString(),
-    });
-    const text = await res.text();
-    note(`IdP token exchange, client_secret_${method} -> ${res.status}`, redact(text).slice(0, 400));
-    last = { res, text };
-    if (res.ok) return last;
-    // Only a method mismatch is worth a second attempt. A wrong secret, a spent
-    // code or an expired one must not be retried — that just doubles the noise in
-    // the IdP's log and tells the reader nothing.
-    if (!/cannot use client_secret_(post|basic)/.test(text)) return last;
-    note(`the IdP refuses client_secret_${method} for this client; trying the other`);
-  }
-  return last;
-}
-
-/** Where the human's `confirm_user` response comes back in. Local use only. */
 async function confirm(req: Request): Promise<Response> {
-  const payload = (await req.json().catch(() => null)) as { flow_id?: string; response?: unknown } | null;
+  const payload = (await req.json().catch(() => null)) as { flow_id?: string; response?: any } | null;
   if (!payload?.flow_id || typeof payload.response !== "object" || payload.response === null) {
     return Response.json({ error: "expected {flow_id, response}" }, { status: 400 });
   }
   const flow = [...flows.values()].find((f) => f.flowId === payload.flow_id);
-  if (!flow?.resolve) return Response.json({ error: `no flow ${payload.flow_id} is waiting` }, { status: 404 });
-  flow.resolve(payload.response as Record<string, unknown>);
+  if (!flow) return Response.json({ error: `no flow ${payload.flow_id} is known here` }, { status: 404 });
+
+  flow.confirm = payload.response;
+  flow.pending = false;
+  flow.resolve?.(payload.response);
   flow.resolve = undefined;
-  note("POST /confirm resumed a parked flow", { flow_id: payload.flow_id });
-  return Response.json({ resumed: payload.flow_id });
+  note("POST /confirm", { flow_id: payload.flow_id, auth_id: payload.response.auth_id });
+
+  const next = typeof payload.response.next_uri === "string" ? payload.response.next_uri : undefined;
+  if (!next) return Response.json({ confirmed: payload.flow_id, followed: null });
+  const res = await fetch(next, { redirect: "manual" });
+  const followed = { url: next, status: res.status, location: res.headers.get("location") };
+  note("followed next_uri so Arcade finalises the grant", followed);
+  return Response.json({ confirmed: payload.flow_id, followed });
 }
 
 const server = Bun.serve({
@@ -448,14 +439,14 @@ const server = Bun.serve({
         public_url: publicUrl,
         issuer: IDP_ISSUER,
         idp_credentials: credentials.ok ? `present, from ${credentials.source}` : `MISSING: ${credentials.missing.join(", ")}`,
-        arcade_api_key_present: Boolean(ARCADE_API_KEY),
+        arcade_api_key_present: Boolean(await arcadeApiKey()),
         flows: [...flows.values()].map((f) => ({
           flow_id: f.flowId,
           started_at: f.startedAt,
           arcade_query: f.arcadeQuery,
           email: f.email,
           confirm: f.confirm,
-          waiting: Boolean(f.resolve),
+          waiting: Boolean(f.pending),
         })),
         log,
       });
@@ -540,7 +531,7 @@ console.log(
     `  IdP issuer         ${IDP_ISSUER}`,
     `  IdP credentials    ${CREDENTIAL_BANNER}`,
     `  tunnel             ${NO_NGROK ? "off (--no-ngrok): this URL is not reachable from Arcade" : "ngrok"}`,
-    `  confirm_user       ${ARCADE_API_KEY ? "automatic (ARCADE_API_KEY is set)" : "manual — the curl is printed per flow"}`,
+    `  confirm_user       ${(await arcadeApiKey()) ? "automatic — this process holds the key and calls it in-flow" : "manual — the curl is printed per flow (see the note in /callback)"}`,
     "",
     "  ═══ the two values the human enters, exactly as written ═══",
     "",

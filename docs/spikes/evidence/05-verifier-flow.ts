@@ -290,6 +290,21 @@ async function main() {
         stoppedBecause: hop2.stoppedBecause ?? null,
       });
       t.hop("hop 2 — redirect chain", hop2.visited);
+
+      // The authorization is Arcade's to record, not this script's, so the only
+      // honest way to ask whether hop 2 worked is to call the tool again.
+      const retry = await mcp.send(token, {
+        jsonrpc: "2.0",
+        id: 4,
+        method: "tools/call",
+        params: { name: TOOL, arguments: TOOL_ARGS },
+      });
+      const stillNeedsAuth = Boolean(authorizationUrlFrom(retry.json));
+      t.hop(
+        `hop 2 — ${TOOL} retried after the authorization walk -> ${retry.status}` +
+          (stillNeedsAuth ? " — STILL UNAUTHORIZED" : " — authorized"),
+        retry.json ?? retry.text,
+      );
     } else {
       t.hop("hop 2 — no authorization URL came back from the tool call", toolAuthUrl ?? null);
     }
