@@ -673,6 +673,10 @@ The costs above are real; the impossibility was not.
 Marked where it is provisional. The hop-1 half is settled by measurement; the
 hop-2 half rests on a chain that completed except for its last step.
 
+> ⚠️ **One paragraph below is superseded** — "`apps/idp` needs one OAuth client per
+> relying party". See [the 2026-09-11 addendum](#addendum-2026-09-11--the-cause-was-duplicated-credentials-not-a-shared-client).
+> Everything else in this section stands.
+
 **Take the User Source for hop 1. Settled.** `cg-demo-us` signs Dana in at our IdP,
 issues a gateway token, lists eight tools, and hands the hooks her exact lowercase
 address on every `/access` frame. `cg-demo` cannot do any of that without four
@@ -749,6 +753,60 @@ data-entry error. **The measurement is one field and one run away**, and
 it does, do not wire #14's tool-authorization path on the assumption that it works.
 
 **Arcade Headers is not considered.** The human ruled the mode out on 2026-09-11.
+
+## Addendum, 2026-09-11 — the cause was duplicated credentials, not a shared client
+
+**Written after this spike closed, from the log window it asked the next reader to
+look in.** §11.10 of the transcript ends by naming the measurement that was missing:
+*"the window is 2026-09-11T17:38:50Z to 17:40:00Z on `cg-idp`, and the line to find is
+a `POST /oauth2/token` for client `RskTFjl6…` that is not the verifier's own 200."*
+That line exists. It is not any of the four causes the transcript listed for it:
+
+```
+2026-09-11T17:38:5?Z [idp] POST /oauth2/token rejected: status=400
+  error=invalid_request
+  error_description="A request must use only one client authentication method"
+  client_auth="client_secret_basic" client_id=RskTFjl6…
+```
+
+The Arcade auth provider sends its credentials **twice**: `auth_method:
+client_secret_basic` puts them in an `Authorization: Basic` header, and the
+dashboard template's Request Parameter rows —
+`client_id={{client_id}}`, `client_secret={{client_secret}}`, visible in the
+recreated configuration read back in §11.8 — put the same pair in the form body.
+RFC 6749 §2.3 forbids presenting two client authentication methods in one request,
+and `@better-auth/oauth-provider` enforces it in
+`normalizeClientAuthenticationParameters` (`utils-C2yu_zRr.mjs:541`), before any
+credential is checked. Our IdP refused, correctly and uselessly.
+
+**So the recommendation's client-splitting paragraph had the right decision for the
+wrong reason, and the wrong scope.** Splitting would not have fixed this: each of
+clients A, B and C would have been refused the same way, because the refusal is about
+the shape of one request and not about which client sent it. The fix is in `apps/idp`
+and it is one rule (#79):
+
+> When a token request carries an `Authorization: Basic` header **and** a body
+> `client_id`/`client_secret` pair that is byte-for-byte the header's, the body
+> `client_secret` is dropped and the request is passed through. Any other
+> combination — a different pair, half a pair, an assertion beside the header — is
+> refused `invalid_request`, with one log line reading `client_auth="mixed"`.
+
+Three things follow for whoever reads the section above.
+
+- **The table of three clients is no longer forced by the token endpoint.** A second
+  client is still *supported* — `IDP_OAUTH_CLIENTS`, #79 — and there are still good
+  reasons to want one, chiefly that a rotated secret then costs one dashboard field
+  rather than three. It is now an option with a cost, not a repair. The cost is the
+  one the section already names: consent is per client, so splitting adds a consent
+  per persona per client and lengthens #24's rehearsal.
+- **The tolerance is deliberately narrow.** Identical credentials presented twice,
+  nothing else. It is not "accept both methods": a client registered for
+  `client_secret_basic` that sends credentials in the body alone is still refused
+  `invalid_client`, exactly as #61 left it.
+- **The 17:38Z line is also the vindication of #61.** Without the rejection log this
+  spike added, this failure is a token exchange that returns nothing and explains
+  nothing, server to server, with no hook fired and nothing on the panel. Three of
+  this spike's four causes were found the same way.
 
 ## Nothing under `apps/` changed
 
