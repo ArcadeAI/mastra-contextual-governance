@@ -59,6 +59,22 @@ describe("the fixture", () => {
       fixture.find((p) => p.persona === "riley")?.email,
     );
   });
+
+  // #58. Better Auth lowercases the address before it looks a user up, so a
+  // row stored with a capital is a persona nobody can sign in as — and the
+  // login page calls that a wrong password. The Arcade accounts are invited by
+  // hand, so the capitalisation arrives here from a human typing it.
+  test("lowercases an override, whatever case the Arcade account was invited under", () => {
+    const people = loadPeople({ PERSONA_DANA_EMAIL: "  Dana.Okafor@MegaForce.Tech " });
+
+    expect(people.find((p) => p.persona === "dana")?.email).toBe("dana.okafor@megaforce.tech");
+  });
+
+  test("every address it hands back is already lower case", () => {
+    const people = loadPeople({ PERSONA_SAM_EMAIL: "SAM.REYES@BANK.EXAMPLE" });
+
+    expect(people.map((p) => p.email)).toEqual(people.map((p) => p.email.toLowerCase()));
+  });
 });
 
 describe("seeding", () => {
@@ -67,6 +83,15 @@ describe("seeding", () => {
 
     expect(countPeople(db)).toBe(4);
     expect(listPeople(db).map((p) => p.email).sort()).toEqual(fixture.map((p) => p.email).sort());
+  });
+
+  // The half of #58 that `loadPeople`'s unit test cannot see: what actually
+  // reached the table.
+  test("writes lowercase rows even when the personas are configured capitalised", async () => {
+    const db = await openPeople(":memory:", loadPeople({ PERSONA_DANA_EMAIL: "Dana.Okafor@Bank.Example" }));
+
+    expect(listPeople(db).map((p) => p.email)).toContain("dana.okafor@bank.example");
+    expect(listPeople(db).some((p) => /[A-Z]/.test(p.email))).toBe(false);
   });
 
   test("a seed that fails leaves no schema, so the next boot retries", async () => {

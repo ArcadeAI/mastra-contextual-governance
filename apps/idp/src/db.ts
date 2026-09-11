@@ -51,11 +51,20 @@ export interface Person {
  * these four variables for the persona switcher; reading them here is what
  * keeps `idp.db` and the Arcade accounts on the same string without a second
  * place to edit. The fixture's own addresses are the fallback for a local run.
+ *
+ * **Every address is lowercased on the way in** (#58). Better Auth lowercases
+ * the address before it looks a user up, and SQLite compares text
+ * case-sensitively, so a row stored as `Dana.Okafor@…` can never be signed in
+ * as — and the login page reports the same "did not match" it gives a wrong
+ * password, so nothing on screen says why. Normalising here means
+ * `insertPeople` can only ever write a lowercase row; `schema.sql`'s
+ * `collate nocase` on the column is the second line of defence, for a row
+ * this function did not write.
  */
 export function loadPeople(env: Record<string, string | undefined> = process.env): PersonSeed[] {
   return fixtureSchema.parse(fixture).people.map((person) => {
     const override = env[`PERSONA_${person.persona.toUpperCase()}_EMAIL`]?.trim();
-    return override ? { ...person, email: override } : person;
+    return { ...person, email: (override || person.email).toLowerCase() };
   });
 }
 
