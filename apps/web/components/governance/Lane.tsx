@@ -6,16 +6,26 @@
  * control points are the structure the audience should find first; a card is a
  * detail inside one of them.
  *
- * The lane draws at most `visible` cards. Everything the timeline holds beyond
- * that, plus everything it has already let go, is *counted and stated* in the
- * header — an audit surface that quietly discards records would argue against
- * the thing this project argues for. It sits in the header rather than under
- * the cards because under them it is the first thing a burst pushes out of a
- * lane that clips its overflow, so the one line saying "there is more than
- * this" would disappear exactly when it became true.
+ * The lane draws at most `visible` cards, and one card can stand for a run of
+ * decisions: `/access` fans out — one `tools/call` produced three access
+ * decisions for one tool when it was measured (#64) — so adjacent matching
+ * access decisions share a row that carries their count. `lib/governance/
+ * grouping.ts` owns that rule and says at length why it is presentation only.
+ * What the header counts is unaffected: a grouped row is *n* decisions drawn,
+ * not one, so "earlier decisions" stays a count of decisions the audience
+ * cannot see rather than of cards that were not drawn.
+ *
+ * Everything the timeline holds beyond what is drawn, plus everything it has
+ * already let go, is *counted and stated* in the header — an audit surface
+ * that quietly discards records would argue against the thing this project
+ * argues for. It sits in the header rather than under the cards because under
+ * them it is the first thing a burst pushes out of a lane that clips its
+ * overflow, so the one line saying "there is more than this" would disappear
+ * exactly when it became true.
  */
 import type { Effect, GovernanceEvent, HookPoint } from "@cg/policy-schema";
 
+import { rowCount, rowsFor } from "../../lib/governance/grouping.ts";
 import { EventCard } from "./EventCard.tsx";
 import { DECISION_ORDER, DECISIONS, LANES } from "./decisions.ts";
 
@@ -35,7 +45,7 @@ export function Lane({
   behind: number;
   /** This lane's own decisions, over everything it ever received. */
   counts: Readonly<Record<Effect, number>>;
-  /** How many cards to draw. The rest are counted, not dropped. */
+  /** How many cards to draw. Rows, not events — a card can carry several. */
   visible: number;
   /**
    * The newest event in this lane, or `null`. Used as a React key on the flash
@@ -46,8 +56,14 @@ export function Lane({
   correlatedIds: ReadonlySet<string>;
 }) {
   const lane = LANES[hook];
-  const drawn = events.slice(0, visible);
-  const notDrawn = events.length - drawn.length + behind;
+  const rows = rowsFor(hook, events);
+  const drawn = rows.slice(0, visible);
+  // Counted in decisions rather than cards. A row saying "3 decisions" has
+  // shown all three of them, and calling two of those "earlier decisions" in
+  // the header as well would double-count the fan-out this grouping exists to
+  // make legible.
+  const shown = drawn.reduce((total, row) => total + rowCount(row), 0);
+  const notDrawn = events.length - shown + behind;
   // Only decisions this lane has actually made. A lane that has denied nothing
   // should not carry a zero for it; the global tally is where totals live.
   const present = DECISION_ORDER.filter((decision) => counts[decision] > 0);
@@ -91,8 +107,16 @@ export function Lane({
         {drawn.length === 0 ? (
           <p className="cg-lane-empty">{lane.empty}</p>
         ) : (
-          drawn.map((event) => (
-            <EventCard key={event.id} event={event} correlated={correlatedIds.has(event.id)} />
+          drawn.map((row) => (
+            <EventCard
+              key={row.event.id}
+              event={row.event}
+              members={row.events}
+              // Any member joining the chat's execution outlines the row: the
+              // join is to a decision, and the row is standing in for all of
+              // them.
+              correlated={row.events.some((member) => correlatedIds.has(member.id))}
+            />
           ))
         )}
       </div>

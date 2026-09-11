@@ -424,6 +424,44 @@ body {
   min-width: 0;
 }
 
+/*
+ * "3 decisions" — one card standing for a run of identical /access decisions
+ * (#64). In the meta line rather than beside the tool name: it is a fact about
+ * the record, the same kind of thing as the time and the person, and the tool
+ * call underneath must stay the largest thing on the card. Stated in words
+ * because a bare multiplier at projector distance reads as part of an
+ * identifier.
+ */
+.cg-event-count {
+  flex: none;
+  white-space: nowrap;
+  color: var(--white);
+}
+
+/*
+ * The individual event ids. The only thing on the panel behind a disclosure,
+ * and deliberately the least presentable thing on it: a column of opaque
+ * identifiers nobody reads from across a room, wanted only by the person who
+ * is about to go and look one of them up in the audit log.
+ */
+.cg-event-members {
+  margin: 0.4em 0 0;
+  font-size: 0.82em;
+  color: var(--neutral);
+}
+
+.cg-event-members summary {
+  cursor: pointer;
+  color: var(--white);
+}
+
+.cg-event-ids {
+  margin: 0.3em 0 0;
+  padding: 0 0 0 1.1em;
+  font-family: var(--font-mono);
+  line-height: 1.5;
+}
+
 /* Question one: which tool call. Largest thing on the card, and first. */
 .cg-tool {
   margin: 0;
