@@ -21,11 +21,15 @@ import { usingDevSecret, readConfig } from "./config.ts";
 import { EVENTS_PATH } from "./events.ts";
 import { createPolicyCache } from "./policy-cache.ts";
 import { counts, openGovernance } from "./policy-store.ts";
+import { orExitConfig } from "./public-host.ts";
 import { createServer, SERVICE } from "./server.ts";
 
 const log = (line: string) => console.log(`[${SERVICE}] ${line}`);
 
-const config = readConfig();
+// A cross-service address that cannot resolve is a startup failure, not a
+// surprise later — see `public-host.ts`. Every other configuration error still
+// propagates as it did.
+const config = orExitConfig(SERVICE, readConfig);
 const db = openGovernance(config.dbPath, config);
 const cache = createPolicyCache(db, { log, pollMs: config.policyPollMs });
 // Warm before the port opens: Arcade's first /access may be the 1.6 MB one.

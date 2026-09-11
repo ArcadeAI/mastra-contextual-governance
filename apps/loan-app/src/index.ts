@@ -26,12 +26,18 @@ import { z } from "zod";
 
 import { ActorError, actorFromRequest } from "./actor.ts";
 import { countLoans, getLoan, openLoanBook, recordDecision, searchLoans } from "./db.ts";
+import { orExitConfig, publicHost } from "./public-host.ts";
 
 const SERVICE = "loan-app";
 
 const port = Number(process.env.PORT ?? 8082);
 const dbPath = process.env.LOANS_DB_PATH ?? "./loans.db";
-const idpHost = process.env.IDP_PUBLIC_HOST ?? "localhost:8083";
+// Before the database is opened and before the port is bound: an address this
+// service cannot possibly reach is a startup failure, not a 503 on the first
+// call. See `public-host.ts` for what Render's `fromService` actually emitted.
+const idpHost = orExitConfig(SERVICE, () =>
+  publicHost("IDP_PUBLIC_HOST", process.env.IDP_PUBLIC_HOST, "localhost:8083"),
+);
 
 const db = openLoanBook(dbPath);
 

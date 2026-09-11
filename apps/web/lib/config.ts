@@ -1,10 +1,12 @@
 /**
  * What the web service reads from its environment, in one place.
  *
- * Every address here is HOST-form (`host` or `host:port`), never a URL: Render
- * derives cross-service addresses with `fromService`, which can only emit a
- * bare host, and blueprints have no string interpolation to prepend a scheme.
- * The consumer adds it, and `baseUrl` is the one place that decides which.
+ * Every address here is HOST-form (`host` or `host:port`), never a URL: the
+ * consumer adds the scheme, and `baseUrl` is the one place that decides which.
+ * The cross-service keys are `sync: false` in `render.yaml` and set by hand from
+ * the value on each Render service page — `fromService` emitted the bare service
+ * name rather than the hostname, which #59 has the measurement for.
+ * `public-host.ts` refuses a value that still looks like one.
  *
  * Nothing here is `NEXT_PUBLIC_`, deliberately. `next build` inlines those into
  * the client bundle while Render supplies service env vars at runtime, so a
@@ -12,6 +14,8 @@
  * the worst possible failure mode. Server components read this and pass what
  * the browser needs down as props.
  */
+import { publicHost } from "./public-host.ts";
+
 export interface WebConfig {
   /** `apps/hooks`, which owns `governance.db` and the approvals store. */
   hooksHost: string;
@@ -58,7 +62,10 @@ export function readWebConfig(env: Record<string, string | undefined> = process.
   }
 
   return {
-    hooksHost: env.HOOKS_PUBLIC_HOST?.trim() || "localhost:8081",
+    // Refuses a bare service name outright — `public-host.ts` has the measured
+    // story. The panel reads this in a server component and hands it to the
+    // browser, so a host nothing can resolve fails in a visitor's DevTools.
+    hooksHost: publicHost("HOOKS_PUBLIC_HOST", env.HOOKS_PUBLIC_HOST, "localhost:8081"),
     approvalsStoreToken: storeToken || DEV_STORE_TOKEN,
     arcadeApiUrl: (env.ARCADE_API_URL?.trim() || "https://api.arcade.dev").replace(/\/+$/, ""),
     arcadeApiKey: env.ARCADE_API_KEY?.trim() ?? "",
