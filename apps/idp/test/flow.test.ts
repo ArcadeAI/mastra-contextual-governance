@@ -56,6 +56,7 @@ interface Credentials {
   issuer: string;
   jwks_url: string;
   redirect_uris: string[];
+  token_endpoint_auth_method: string;
   pkce: string;
   userinfo_email_jsonpath: string;
 }
@@ -83,6 +84,40 @@ async function runScript(name: string, ...args: string[]): Promise<{ code: numbe
     proc.exited,
   ]);
   return { code, out, err };
+}
+
+/**
+ * Waits for a line matching `match` to appear in the service's stdout, and
+ * returns it.
+ *
+ * The log is a file the child writes to, so a line the server printed while
+ * answering the request we just made may not have reached the disk by the time
+ * the response did. Polling is what makes that a wait rather than a race; the
+ * deadline is what makes its absence a failure with the whole log attached
+ * rather than an `undefined` three assertions later.
+ */
+async function waitForLogLine(match: RegExp, from = 0, timeoutMs = 5_000): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  let tail = "";
+  for (;;) {
+    tail = (await Bun.file(logPath).text()).slice(from);
+    const line = tail.split("\n").find((candidate) => match.test(candidate));
+    if (line) return line;
+    if (Date.now() > deadline) {
+      throw new Error(`no log line matched ${match} within ${timeoutMs}ms. Tail was:\n${tail}`);
+    }
+    await Bun.sleep(25);
+  }
+}
+
+/**
+ * How much of the log has already been written. Passed to `waitForLogLine` as
+ * its starting offset, so a test reads the line *its own* request produced
+ * rather than an identically-shaped one from a test that ran earlier — which
+ * is a green assertion about somebody else's behaviour.
+ */
+async function logLength(): Promise<number> {
+  return (await Bun.file(logPath).text()).length;
 }
 
 /**
@@ -215,6 +250,21 @@ function pkce() {
   return { verifier, challenge };
 }
 
+/**
+ * `Authorization: Basic base64(client_id:client_secret)` — the header Arcade
+ * sends, built the way RFC 6749 §2.3.1 says to: each half
+ * `application/x-www-form-urlencoded` before the base64.
+ *
+ * Hand-rolled rather than imported from `@better-auth/core`, because the thing
+ * under test is that a relying party which only read the RFC can authenticate
+ * here. A helper shared with the server would agree with the server by
+ * construction.
+ */
+function basicAuth(clientId: string, clientSecret: string): string {
+  const half = (value: string) => new URLSearchParams({ v: value }).toString().slice(2);
+  return `Basic ${Buffer.from(`${half(clientId)}:${half(clientSecret)}`).toString("base64")}`;
+}
+
 function authorizeUrl(clientId: string, extra: Record<string, string> = {}): string {
   const params = new URLSearchParams({
     response_type: "code",
@@ -304,16 +354,19 @@ async function authorizeAs(
   const code = callback.searchParams.get("code");
   expect(code).toBeTruthy();
 
-  // 7. Exchange it, the way Arcade does: client_secret_post, form-encoded.
+  // 7. Exchange it, the way Arcade does: HTTP Basic, form-encoded body. Since
+  //    #61 this is the only form the client is registered for — the post form
+  //    is refused before the secret is looked at.
   const token = await fetch(`${baseUrl}/oauth2/token`, {
     method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      authorization: basicAuth(creds.client_id, creds.client_secret!),
+    },
     body: new URLSearchParams({
       grant_type: "authorization_code",
       code: code!,
       redirect_uri: REDIRECT_URI,
-      client_id: creds.client_id,
-      client_secret: creds.client_secret!,
       code_verifier: verifier,
     }),
   });
@@ -333,6 +386,58 @@ async function authorizeAs(
     refreshToken: tokens.refresh_token,
     idToken: tokens.id_token,
   };
+}
+
+/**
+ * Walks a persona to a **real, unused authorization code** and returns it with
+ * its verifier, stopping short of the token endpoint.
+ *
+ * Needed because the `authorization_code` grant validates in this order,
+ * measured in `introspect-C6P1zrTr.mjs:1975..1982`: the code is looked up and
+ * **consumed** first, the client is authenticated second. So a token request
+ * carrying a made-up code never reaches the client checks at all — it comes
+ * back `invalid_grant: invalid code`, whatever the credentials were. Any test
+ * about *who the client is* has to spend a genuine code to get there, and one
+ * code per attempt, since the failing attempt burns it.
+ *
+ * That ordering is also why a wrong auth method is so quiet in production:
+ * Arcade sends a real code, so it does reach the check — but anyone
+ * reproducing the failure by hand with a placeholder code sees a different
+ * error and concludes something else is wrong.
+ */
+async function mintCode(persona: { email: string; password: string }): Promise<{
+  code: string;
+  verifier: string;
+}> {
+  const browser = new Browser();
+  const { verifier, challenge } = pkce();
+
+  const authorize = await browser.fetch(
+    authorizeUrl(creds.client_id, { code_challenge: challenge, code_challenge_method: "S256" }),
+  );
+  let location = authorize.headers.get("location") ?? "";
+
+  if (/\/login(\?|$)/.test(location)) {
+    const login = await browser.submit(`${baseUrl}/login`, {
+      email: persona.email,
+      password: persona.password,
+      oauth_query: queryOf(location),
+    });
+    expect(login.status).toBe(303);
+    location = login.headers.get("location") ?? "";
+  }
+  if (/\/consent\?/.test(location)) {
+    const consent = await browser.submit(`${baseUrl}/consent`, {
+      decision: "allow",
+      oauth_query: queryOf(location),
+    });
+    expect(consent.status).toBe(303);
+    location = consent.headers.get("location") ?? "";
+  }
+
+  const code = new URL(location).searchParams.get("code");
+  expect(code).toBeTruthy();
+  return { code: code!, verifier };
 }
 
 /** One entry of the published key set. RSA public halves only — see the test. */
@@ -537,21 +642,32 @@ describe("the OAuth client", () => {
 
     // The old one is refused at the token endpoint. A rotation that left the
     // previous secret working would be a rotation in name only.
+    //
+    // A real code, because the grant consumes the code before it authenticates
+    // the client (see `mintCode`): with a placeholder this would come back
+    // `invalid_grant` without the stale secret ever being looked at, and pass.
+    const { code, verifier } = await mintCode(morgan);
     const refused = await fetch(`${baseUrl}/oauth2/token`, {
       method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        authorization: basicAuth(rotated.client_id, stale!),
+      },
       body: new URLSearchParams({
         grant_type: "authorization_code",
-        code: "whatever",
+        code,
         redirect_uri: REDIRECT_URI,
-        client_id: rotated.client_id,
-        client_secret: stale!,
-        code_verifier: "x".repeat(43),
+        code_verifier: verifier,
       }),
     });
-    expect(refused.status).toBeGreaterThanOrEqual(400);
-    const body = (await refused.json()) as { error: string; access_token?: string };
-    expect(["invalid_client", "invalid_grant"]).toContain(body.error);
+    expect(refused.status).toBe(401);
+    const body = (await refused.json()) as {
+      error: string;
+      error_description?: string;
+      access_token?: string;
+    };
+    expect(body.error).toBe("invalid_client");
+    expect(body.error_description).toBe("invalid client_secret");
     expect(body.access_token).toBeUndefined();
   });
 
@@ -559,6 +675,18 @@ describe("the OAuth client", () => {
     expect(creds.pkce).toBe("S256");
     expect(creds.userinfo_email_jsonpath).toBe("$.email");
     expect(creds.jwks_url).toBe(`${baseUrl}/jwks`);
+    // #61: the value a human types into the Arcade dashboard's "client
+    // authentication" field, which is also that field's default.
+    expect(creds.token_endpoint_auth_method).toBe("client_secret_basic");
+  });
+
+  test("the script and the running service name the same auth method", async () => {
+    // Two places a human reads it — `oauth-client` on a shell, `/health` over
+    // the wire — and they are only useful if they cannot disagree.
+    const health = (await (await fetch(`${baseUrl}/health`)).json()) as {
+      oauth: { token_endpoint_auth_method: string };
+    };
+    expect(health.oauth.token_endpoint_auth_method).toBe(creds.token_endpoint_auth_method);
   });
 });
 
@@ -776,14 +904,15 @@ describe("what apps/loan-app depends on", () => {
     // claim it used to look up.
     expect(accessToken.split(".")).toHaveLength(1);
 
+    // Basic here too: the registered auth method governs every endpoint that
+    // authenticates the client, not just `/oauth2/token` (#61).
     const introspect = await fetch(`${baseUrl}/oauth2/introspect`, {
       method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        token: accessToken,
-        client_id: creds.client_id,
-        client_secret: creds.client_secret!,
-      }),
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        authorization: basicAuth(creds.client_id, creds.client_secret!),
+      },
+      body: new URLSearchParams({ token: accessToken }),
     });
     expect(introspect.status).toBe(200);
     expect(((await introspect.json()) as { active: boolean }).active).toBe(true);
@@ -830,13 +959,14 @@ describe("PKCE is required", () => {
 
     const token = await fetch(`${baseUrl}/oauth2/token`, {
       method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        authorization: basicAuth(creds.client_id, creds.client_secret!),
+      },
       body: new URLSearchParams({
         grant_type: "authorization_code",
         code,
         redirect_uri: REDIRECT_URI,
-        client_id: creds.client_id,
-        client_secret: creds.client_secret!,
       }),
     });
 
@@ -844,23 +974,219 @@ describe("PKCE is required", () => {
   });
 
   test("a wrong client secret is refused", async () => {
+    // Real code, wrong secret. With a placeholder code the grant fails at the
+    // code and returns before the secret is ever checked — the assertion would
+    // hold and mean nothing.
+    const { code, verifier } = await mintCode(dana);
+
+    const token = await fetch(`${baseUrl}/oauth2/token`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        authorization: basicAuth(creds.client_id, "wrong"),
+      },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: REDIRECT_URI,
+        code_verifier: verifier,
+      }),
+    });
+
+    expect(token.status).toBe(401);
+    const body = (await token.json()) as {
+      error: string;
+      error_description?: string;
+      access_token?: string;
+    };
+    expect(body.error).toBe("invalid_client");
+    expect(body.error_description).toBe("invalid client_secret");
+    expect(body.access_token).toBeUndefined();
+  });
+});
+
+/**
+ * #61. Better Auth registers **one** token-endpoint auth method per client and
+ * checks it before it checks the secret, so "which one" is not a preference —
+ * the other form is refused outright, and refused in a way that says nothing
+ * about the credentials.
+ */
+describe("client authentication at the token endpoint", () => {
+  test("Authorization: Basic completes a whole flow", async () => {
+    // `authorizeAs` exchanges the code with `Authorization: Basic` and nothing
+    // else, so a flow that reaches userinfo is the measurement. Riley consented
+    // to this client in an earlier test and the record outlives a cookie jar,
+    // so this browser logs in and goes straight back with a code.
+    const { accessToken } = await authorizeAs(new Browser(), creds, riley, { expectConsent: false });
+    expect((await userinfo(accessToken)).email).toBe(riley.email);
+  });
+
+  test("the post form is refused, and the refusal names the mismatch", async () => {
+    // Credentials in the body: correct id, correct secret, correct code,
+    // correct verifier — only the method is wrong. This is the shape #61
+    // believes the live cg-demo-us failure had, inverted.
+    const { code, verifier } = await mintCode(dana);
+
     const token = await fetch(`${baseUrl}/oauth2/token`, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
         grant_type: "authorization_code",
-        code: "whatever",
+        code,
         redirect_uri: REDIRECT_URI,
         client_id: creds.client_id,
-        client_secret: "wrong",
-        code_verifier: "x".repeat(43),
+        client_secret: creds.client_secret!,
+        code_verifier: verifier,
       }),
     });
 
-    expect(token.status).toBeGreaterThanOrEqual(400);
-    const body = (await token.json()) as { error: string; access_token?: string };
-    expect(["invalid_client", "invalid_grant"]).toContain(body.error);
+    expect(token.status).toBe(400);
+    const body = (await token.json()) as {
+      error: string;
+      error_description?: string;
+      access_token?: string;
+    };
+    expect(body.error).toBe("invalid_client");
+    // The measurement that settles "one method or both": the plugin rejects on
+    // the registered method alone, with a correct secret in hand.
+    expect(body.error_description).toBe(
+      "client registered for client_secret_basic cannot use client_secret_post",
+    );
     expect(body.access_token).toBeUndefined();
+  });
+
+  test("so does a bare client_id with no credentials at all", async () => {
+    const { code, verifier } = await mintCode(dana);
+
+    const token = await fetch(`${baseUrl}/oauth2/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: REDIRECT_URI,
+        client_id: creds.client_id,
+        code_verifier: verifier,
+      }),
+    });
+
+    expect(token.status).toBe(400);
+    const body = (await token.json()) as { error: string; error_description?: string };
+    expect(body.error).toBe("invalid_client");
+    // Classified `none` — a public client — which this one is not.
+    expect(body.error_description).toBe(
+      "client registered for client_secret_basic cannot use none",
+    );
+  });
+});
+
+/**
+ * #61, and the reason #75 could not answer its own question: a wrong secret and
+ * a client registered for the other auth method both come back
+ * `invalid_client`, and this service used to log only its boot lines. So the
+ * distinguishing fact is written down, once per rejection.
+ */
+describe("the token endpoint says why it refused", () => {
+  const rejection = /POST \/oauth2\/token rejected:/;
+
+  test("a wrong secret over Basic leaves a line naming the method and the reason", async () => {
+    const { code, verifier } = await mintCode(dana);
+    const from = await logLength();
+
+    const response = await fetch(`${baseUrl}/oauth2/token`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        authorization: basicAuth(creds.client_id, "definitely-not-the-secret"),
+      },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: REDIRECT_URI,
+        code_verifier: verifier,
+      }),
+    });
+    expect(response.status).toBe(401);
+
+    const line = await waitForLogLine(/client_auth="client_secret_basic"/, from);
+    expect(line).toMatch(rejection);
+    expect(line).toContain("status=401");
+    expect(line).toContain("error=invalid_client");
+    expect(line).toContain('error_description="invalid client_secret"');
+    // It was our client, with the wrong secret — not a different registration.
+    expect(line).toContain(`client_id=${creds.client_id}`);
+  });
+
+  test("a wrong auth method leaves a different line, which is the whole point", async () => {
+    const { code, verifier } = await mintCode(dana);
+    const from = await logLength();
+
+    const response = await fetch(`${baseUrl}/oauth2/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: REDIRECT_URI,
+        client_id: creds.client_id,
+        client_secret: creds.client_secret!,
+        code_verifier: verifier,
+      }),
+    });
+    expect(response.status).toBe(400);
+
+    const line = await waitForLogLine(/client_auth="client_secret_post"/, from);
+    expect(line).toMatch(rejection);
+    expect(line).toContain("status=400");
+    expect(line).toContain("error=invalid_client");
+    expect(line).toContain(
+      'error_description="client registered for client_secret_basic cannot use client_secret_post"',
+    );
+    expect(line).toContain(`client_id=${creds.client_id}`);
+
+    // The two cases are distinguishable from the log alone. That sentence is
+    // the acceptance criterion; this is it as an assertion.
+    expect(line).not.toContain("client_auth=\"client_secret_basic\"");
+  });
+
+  test("an unknown client is reported as unknown, not echoed back", async () => {
+    // The id is attacker-controlled and, under Basic, shares a base64 blob
+    // with the secret. So it is compared, never printed.
+    const { code, verifier } = await mintCode(dana);
+    const from = await logLength();
+
+    const response = await fetch(`${baseUrl}/oauth2/token`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        authorization: basicAuth("someone-elses-client-id", "someone-elses-secret"),
+      },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: REDIRECT_URI,
+        code_verifier: verifier,
+      }),
+    });
+    expect(response.status).toBeGreaterThanOrEqual(400);
+
+    const line = await waitForLogLine(/client_id=\(not the registered client\)/, from);
+    expect(line).toMatch(rejection);
+    expect(line).not.toContain("someone-elses-client-id");
+    expect(line).not.toContain("someone-elses-secret");
+  });
+
+  test("a token request that succeeds logs nothing", async () => {
+    const before = (await Bun.file(logPath).text()).split("\n").filter((l) => rejection.test(l)).length;
+
+    const { accessToken } = await authorizeAs(new Browser(), creds, dana, { expectConsent: false });
+    expect(accessToken).toBeTruthy();
+
+    // A line per rejection, not a line per request: an access log would bury
+    // the four rejections above in the noise of a working demo.
+    await Bun.sleep(250);
+    const after = (await Bun.file(logPath).text()).split("\n").filter((l) => rejection.test(l)).length;
+    expect(after).toBe(before);
   });
 });
 

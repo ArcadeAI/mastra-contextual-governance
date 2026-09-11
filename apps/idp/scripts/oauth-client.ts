@@ -17,7 +17,12 @@
  * On Render: open a shell on the cg-idp service and run the same command.
  */
 import { createAuth, JWKS_PATH } from "../src/auth.ts";
-import { ensureOAuthClient, REQUIRE_PKCE, rotateOAuthClientSecret } from "../src/client.ts";
+import {
+  ensureOAuthClient,
+  REQUIRE_PKCE,
+  rotateOAuthClientSecret,
+  TOKEN_ENDPOINT_AUTH_METHOD,
+} from "../src/client.ts";
 import { readConfig } from "../src/config.ts";
 import { openPeople } from "../src/db.ts";
 
@@ -74,7 +79,7 @@ if (json) {
         userinfo_url: `${config.baseURL}/oauth2/userinfo`,
         jwks_url: `${config.baseURL}${JWKS_PATH}`,
         redirect_uris: client.redirectUris,
-        token_endpoint_auth_method: "client_secret_post",
+        token_endpoint_auth_method: TOKEN_ENDPOINT_AUTH_METHOD,
         pkce: REQUIRE_PKCE ? "S256" : "off",
         scopes: "openid profile email offline_access",
         userinfo_email_jsonpath: "$.email",
@@ -93,7 +98,9 @@ if (json) {
   console.log(`  userinfo URL      ${config.baseURL}/oauth2/userinfo`);
   console.log(`  JWKS URL          ${config.baseURL}${JWKS_PATH}`);
   console.log(`  redirect URIs     ${client.redirectUris.join(", ")}`);
-  console.log(`  client auth       client_secret_post (credentials in the token request body)`);
+  console.log(
+    `  client auth       ${TOKEN_ENDPOINT_AUTH_METHOD} (HTTP Basic — this is the Arcade dashboard default)`,
+  );
   console.log(`  PKCE              ${REQUIRE_PKCE ? "required, S256 — enable it on the Arcade side" : "off"}`);
   console.log(`  scopes            openid profile email offline_access`);
   console.log(`  identity          userinfo JSONPath $.email`);

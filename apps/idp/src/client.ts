@@ -38,6 +38,41 @@ export const OAUTH_CLIENT_ROW_ID = "arcade";
 export const REQUIRE_PKCE = true;
 
 /**
+ * How the client proves who it is at `/oauth2/token`: **HTTP Basic**, the
+ * credentials in the `Authorization` header, RFC 6749 §2.3.1.
+ *
+ * It was `client_secret_post` until #61. Two measurements forced the change.
+ *
+ * First, `@better-auth/oauth-provider` permits **exactly one** method per
+ * client, and checks it *before* it checks the secret
+ * (`utils-C2yu_zRr.mjs:640`):
+ *
+ * ```js
+ * const registeredAuthMethod = client.tokenEndpointAuthMethod ?? "client_secret_basic";
+ * if (authMethod && registeredAuthMethod !== authMethod)
+ *   throwInvalidClient(`client registered for ${registeredAuthMethod} cannot use ${authMethod}`)
+ * ```
+ *
+ * So there is no "accept both": whichever value this constant holds, the other
+ * form is refused with `invalid_client`, and the refusal says nothing about
+ * whether the secret was right. Nothing negotiates it — the client sends one
+ * form and we either registered for it or we did not.
+ *
+ * Second, Arcade sends Basic. `client_secret_basic` is the Arcade dashboard's
+ * default for a custom OAuth provider, and an Arcade **User Source** form has
+ * no auth-method field at all — so a User Source can only ever be registered
+ * against a client that accepts Basic. Spike #75 measured `cg-demo-us` getting
+ * through consent at this IdP and then failing with `Token exchange with
+ * identity provider failed`; a client registered for the post form is the
+ * explanation that fits.
+ *
+ * Registering for the method Arcade already defaults to is also what makes the
+ * registration **dashboard-only**, which is what this issue is for: nobody has
+ * to change a field they would not otherwise have touched.
+ */
+export const TOKEN_ENDPOINT_AUTH_METHOD = "client_secret_basic";
+
+/**
  * What happened to the stored client secret on this call. Reported in the boot
  * log and at `/health`, because the two outcomes that are not `unchanged` have
  * opposite consequences for the Arcade registration and telling them apart
@@ -84,6 +119,14 @@ export interface OAuthClientCredentials {
   /** True when this call created the client; false when it already existed. */
   created: boolean;
   secretState: ClientSecretState;
+  /** What the client row now registers for at the token endpoint. Always `TOKEN_ENDPOINT_AUTH_METHOD`. */
+  tokenEndpointAuthMethod: string;
+  /**
+   * True when this call brought an existing row's method in line — the #61
+   * upgrade on the live disk. Said out loud at boot, because it is the moment
+   * the Arcade dashboard field stops matching what this service accepts.
+   */
+  authMethodReconciled: boolean;
 }
 
 interface StoredClient {
@@ -91,6 +134,8 @@ interface StoredClient {
   clientId: string;
   clientSecret: string | null;
   redirectUris: string | string[];
+  /** `null` on a row written before the column was set. Better Auth then reads it as `client_secret_basic`. */
+  tokenEndpointAuthMethod: string | null;
 }
 
 /** How long a secret Better Auth generates is, and what `--rotate` mints. */
@@ -194,16 +239,27 @@ export async function rotateOAuthClientSecret(auth: Auth): Promise<OAuthClientCr
     redirectUris: parseUris(existing.redirectUris),
     created: false,
     secretState: "rotated",
+    // Rotation touches the secret and nothing else; `ensureOAuthClient` ran
+    // first (both callers) and is what reconciles the method.
+    tokenEndpointAuthMethod: existing.tokenEndpointAuthMethod ?? TOKEN_ENDPOINT_AUTH_METHOD,
+    authMethodReconciled: false,
   };
 }
 
 /**
  * Finds the Arcade client or creates it. On the existing client, brings the
- * redirect URIs in line with `redirectUris` without touching the credentials —
- * Arcade's generated redirect URL is read off its dashboard, so it may only be
- * known after the first deploy, and correcting it must not rotate anything —
- * and carries a secret stored by the pre-#70 build into hashed storage, see
- * `migrateStoredClientSecret`.
+ * redirect URIs **and the token-endpoint auth method** in line without touching
+ * the credentials — Arcade's generated redirect URL is read off its dashboard,
+ * so it may only be known after the first deploy, and correcting either of them
+ * must not rotate anything — and carries a secret stored by the pre-#70 build
+ * into hashed storage, see `migrateStoredClientSecret`.
+ *
+ * The method has to be reconciled here, not only set at creation, for the same
+ * reason the redirect URIs are: `idp.db` is on a Render disk and the live
+ * `cg-idp` client row was written by an earlier build. A constant changed in
+ * this file and nowhere else would leave that row on `client_secret_post`
+ * forever, and the failure lands at the token endpoint — server to server,
+ * no hook, nothing on the panel (#61).
  */
 export async function ensureOAuthClient(
   auth: Auth,
@@ -217,12 +273,24 @@ export async function ensureOAuthClient(
       throw new Error(`OAuth client "${OAUTH_CLIENT_NAME}" has no stored secret`);
     }
 
+    // A row written before the column existed reads as null, which Better
+    // Auth treats as `client_secret_basic` — already what we want, so it is
+    // still written, but it is not a change anyone has to act on.
+    const authMethodReconciled =
+      existing.tokenEndpointAuthMethod !== null &&
+      existing.tokenEndpointAuthMethod !== TOKEN_ENDPOINT_AUTH_METHOD;
+
     const stored = parseUris(existing.redirectUris);
-    if (!sameSet(stored, redirectUris)) {
+    const update: Record<string, unknown> = {};
+    if (!sameSet(stored, redirectUris)) update.redirectUris = redirectUris;
+    if (existing.tokenEndpointAuthMethod !== TOKEN_ENDPOINT_AUTH_METHOD) {
+      update.tokenEndpointAuthMethod = TOKEN_ENDPOINT_AUTH_METHOD;
+    }
+    if (Object.keys(update).length > 0) {
       await ctx.adapter.update({
         model: "oauthClient",
         where: [{ field: "id", value: existing.id }],
-        update: { redirectUris, updatedAt: new Date() },
+        update: { ...update, updatedAt: new Date() },
       });
     }
 
@@ -234,6 +302,8 @@ export async function ensureOAuthClient(
       redirectUris,
       created: false,
       secretState: migration.state,
+      tokenEndpointAuthMethod: TOKEN_ENDPOINT_AUTH_METHOD,
+      authMethodReconciled,
     };
   }
 
@@ -258,7 +328,7 @@ export async function ensureOAuthClient(
         name: OAUTH_CLIENT_NAME,
         redirectUris,
         scopes: [...SCOPES],
-        tokenEndpointAuthMethod: "client_secret_post",
+        tokenEndpointAuthMethod: TOKEN_ENDPOINT_AUTH_METHOD,
         grantTypes: ["authorization_code", "refresh_token"],
         responseTypes: ["code"],
         applicationType: "web",
@@ -276,7 +346,16 @@ export async function ensureOAuthClient(
     return ensureOAuthClient(auth, { redirectUris, secret });
   }
 
-  return { clientId, clientSecret, redirectUris, created: true, secretState: "created" };
+  return {
+    clientId,
+    clientSecret,
+    redirectUris,
+    created: true,
+    secretState: "created",
+    tokenEndpointAuthMethod: TOKEN_ENDPOINT_AUTH_METHOD,
+    // Born correct, so there is nothing for a human to re-enter.
+    authMethodReconciled: false,
+  };
 }
 
 /**
