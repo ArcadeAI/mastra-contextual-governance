@@ -70,7 +70,7 @@ Scripts, all discardable, all outside `apps/`:
 Four of those are runnable right now from a clean checkout with nothing configured:
 
 ```sh
-bun test docs/spikes/evidence/05-redaction.test.ts       # 49 tests, offline, no credential
+bun test docs/spikes/evidence/05-redaction.test.ts       # offline, no credential
 bun docs/spikes/evidence/05-token-auth-methods.ts        # exits 0, boots and tears down its own IdP
 bun docs/spikes/evidence/05-redirect-allowlist.ts        # exits 0, reads the live allowlist
 
@@ -80,7 +80,10 @@ PROBE_ONLY=1 ARCADE_MCP_URL=https://api.arcade.dev/mcp/cg-demo-us \
 ```
 
 The redaction test also runs inside a bare `bun test` at the repo root, which is the
-point: a transcript cannot drift back into leaking without the suite going red.
+point: a transcript cannot drift back into leaking without the suite going red. Its test
+count is one per committed file under `docs/spikes` plus the helper's own assertions, so
+it grows by one when a spike document is added — that is the scan widening, not a new
+claim.
 
 ## What the human has to do, in order
 
