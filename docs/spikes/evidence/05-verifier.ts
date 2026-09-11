@@ -90,17 +90,29 @@ const ENV_FILE = new URL("./.env.local", import.meta.url).pathname;
 /**
  * Read the IdP client credentials out of `docs/spikes/evidence/.env.local`.
  *
+ * **Read per flow, not once at startup.** The ordering this spike lives under is:
+ * the tunnel has to be up before the human can paste its URL into the Arcade
+ * dashboard, and the human writes `.env.local` in the same sitting. A process that
+ * demanded credentials before it would bind would force a restart afterwards, and
+ * a restart on ngrok's free tier means a new hostname and a dashboard field that
+ * is now wrong. So the route comes up first and picks the file up whenever it
+ * appears. A flow that arrives before the file does is refused loudly, which is
+ * the right failure: it says exactly what is missing instead of half-completing.
+ *
  * The human writes that file; nobody else opens it. Values are never echoed, not
  * even truncated — a client id is not a secret but printing one teaches the habit,
- * and this process has no reason to say more than "found".
+ * and this process has no reason to say more than where it found them.
  */
-async function readCredentials(): Promise<{ clientId: string; clientSecret: string; source: string }> {
+async function readCredentials(): Promise<
+  { ok: true; clientId: string; clientSecret: string; source: string } | { ok: false; missing: string[] }
+> {
   const file = Bun.file(ENV_FILE);
   const fromFile: Record<string, string> = {};
   if (await file.exists()) {
     for (const line of (await file.text()).split("\n")) {
+      if (line.trimStart().startsWith("#")) continue;
       const match = /^\s*(?:export\s+)?([A-Z0-9_]+)\s*=\s*(.*)$/.exec(line);
-      if (!match || line.trimStart().startsWith("#")) continue;
+      if (!match) continue;
       fromFile[match[1]] = match[2].trim().replace(/^["']|["']$/g, "");
     }
   }
@@ -112,23 +124,28 @@ async function readCredentials(): Promise<{ clientId: string; clientSecret: stri
   };
   const clientId = pick("IDP_CLIENT_ID");
   const clientSecret = pick("IDP_CLIENT_SECRET");
-  if (!clientId || !clientSecret) {
-    console.error(
-      `IDP_CLIENT_ID and IDP_CLIENT_SECRET are required, and neither is in\n` +
-        `  ${ENV_FILE}\n\n` +
-        `  The IdP registers exactly one OAuth client, confidential, client_secret_post, and\n` +
-        `  stores the secret hashed (#70) — so it cannot be read back, only rotated with\n` +
-        `  \`bun run --cwd apps/idp oauth-client --rotate\`. Whoever holds it writes that file:\n\n` +
-        `    IDP_CLIENT_ID=…\n    IDP_CLIENT_SECRET=…\n\n` +
-        `  It is gitignored at any depth (\`git check-ignore -v\` proves it) and this process\n` +
-        `  never prints what it reads.`,
-    );
-    process.exit(2);
-  }
-  return { clientId, clientSecret, source: [...new Set(seen)].join(" and ") };
+  const missing = [
+    ...(clientId ? [] : ["IDP_CLIENT_ID"]),
+    ...(clientSecret ? [] : ["IDP_CLIENT_SECRET"]),
+  ];
+  if (missing.length) return { ok: false, missing };
+  return { ok: true, clientId, clientSecret, source: [...new Set(seen)].join(" and ") };
 }
 
-const { clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, source: CREDENTIAL_SOURCE } = await readCredentials();
+/** What to say, to a browser and to the log, when the file is not there yet. */
+function credentialsMissing(missing: string[]): Response {
+  note(`a flow arrived before the credentials did — missing ${missing.join(", ")}`);
+  return page(
+    "The verifier is not configured yet",
+    `<p>${missing.join(" and ")} ${missing.length > 1 ? "are" : "is"} not set.</p>` +
+      `<p>Whoever holds the <code>cg-idp</code> OAuth client writes ` +
+      `<code>docs/spikes/evidence/.env.local</code> with <code>IDP_CLIENT_ID</code> and ` +
+      `<code>IDP_CLIENT_SECRET</code>. No restart is needed — this route re-reads the file ` +
+      `on every flow, so the tunnel URL already in the dashboard stays valid.</p>`,
+    503,
+  );
+}
+
 const ARCADE_API_KEY = process.env.ARCADE_API_KEY?.trim();
 
 interface Flow {
@@ -179,13 +196,16 @@ async function verify(url: URL): Promise<Response> {
     return page("No flow_id", "<p>Arcade calls this route with <code>?flow_id=…</code>.</p>", 400);
   }
 
+  const credentials = await readCredentials();
+  if (!credentials.ok) return credentialsMissing(credentials.missing);
+
   const { verifier, challenge } = await pkce();
   const state = b64url(crypto.getRandomValues(new Uint8Array(16)));
   flows.set(state, { arcadeQuery, flowId, verifier, startedAt: new Date().toISOString() });
 
   const authorize = `${IDP_ISSUER}/oauth2/authorize?${new URLSearchParams({
     response_type: "code",
-    client_id: CLIENT_ID,
+    client_id: credentials.clientId,
     redirect_uri: redirectUri(),
     scope: IDP_SCOPES,
     state,
@@ -212,6 +232,9 @@ async function callback(url: URL): Promise<Response> {
   const code = url.searchParams.get("code");
   if (!code) return page("No code", "<p>No authorization code on the callback.</p>", 400);
 
+  const credentials = await readCredentials();
+  if (!credentials.ok) return credentialsMissing(credentials.missing);
+
   const tokenRes = await fetch(`${IDP_ISSUER}/oauth2/token`, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -219,8 +242,8 @@ async function callback(url: URL): Promise<Response> {
       grant_type: "authorization_code",
       code,
       redirect_uri: redirectUri(),
-      client_id: CLIENT_ID,
-      client_secret: CLIENT_SECRET,
+      client_id: credentials.clientId,
+      client_secret: credentials.clientSecret,
       code_verifier: flow.verifier,
     }).toString(),
   });
@@ -332,9 +355,11 @@ const server = Bun.serve({
     if (url.pathname === "/callback") return callback(url);
     if (url.pathname === "/confirm" && req.method === "POST") return confirm(req);
     if (url.pathname === "/state") {
+      const credentials = await readCredentials();
       return Response.json({
         public_url: publicUrl,
         issuer: IDP_ISSUER,
+        idp_credentials: credentials.ok ? `present, from ${credentials.source}` : `MISSING: ${credentials.missing.join(", ")}`,
         arcade_api_key_present: Boolean(ARCADE_API_KEY),
         flows: [...flows.values()].map((f) => ({
           flow_id: f.flowId,
@@ -347,7 +372,14 @@ const server = Bun.serve({
         log,
       });
     }
-    if (url.pathname === "/health") return Response.json({ status: "ok", public_url: publicUrl });
+    if (url.pathname === "/health") {
+      const credentials = await readCredentials();
+      return Response.json({
+        status: "ok",
+        public_url: publicUrl,
+        idp_credentials: credentials.ok ? "present" : `missing: ${credentials.missing.join(", ")}`,
+      });
+    }
     note(`${req.method} ${url.pathname} — no route`);
     return page("Not found", `<p>This verifier serves <code>/verify</code> and <code>/callback</code>.</p>`, 404);
   },
@@ -407,12 +439,18 @@ async function startNgrok(port: number): Promise<string> {
 publicUrl = process.env.VERIFIER_PUBLIC_URL?.replace(/\/+$/, "")
   ?? (NO_NGROK ? `http://localhost:${server.port}` : await startNgrok(server.port));
 
+const startupCredentials = await readCredentials();
+const CREDENTIAL_BANNER = startupCredentials.ok
+  ? `read from ${startupCredentials.source} (never printed)`
+  : `NOT YET SET (${startupCredentials.missing.join(", ")}) — write docs/spikes/evidence/.env.local\n` +
+    `                     when you have them; this route re-reads it per flow, no restart, URL unchanged`;
+
 console.log(
   [
     "",
     `spike 05 verifier — local :${server.port}, public ${publicUrl}`,
     `  IdP issuer         ${IDP_ISSUER}`,
-    `  IdP credentials    read from ${CREDENTIAL_SOURCE} (never printed)`,
+    `  IdP credentials    ${CREDENTIAL_BANNER}`,
     `  tunnel             ${NO_NGROK ? "off (--no-ngrok): this URL is not reachable from Arcade" : "ngrok"}`,
     `  confirm_user       ${ARCADE_API_KEY ? "automatic (ARCADE_API_KEY is set)" : "manual — the curl is printed per flow"}`,
     "",

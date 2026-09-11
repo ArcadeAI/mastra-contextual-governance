@@ -2,11 +2,19 @@
 
 Every run is against the live services on **2026-09-11** unless it says otherwise.
 Secrets are redacted by `05-drive.ts:redact`; the persona domain is redacted by
-hand, as in spikes 03 and 04. The ngrok hostname is left in: the tunnel was dead
-within the hour and it is the only way to read the flow.
+hand, as in spikes 03 and 04. The ngrok hostname is left in where it appears: the
+tunnel was dead within the hour and it is the only way to read the flow.
+
+**Read the write-up's framing first.** Sections 1–9 are round 1, and round 1
+conflated two hops. Hop 1 (MCP client → gateway) is governed by the **User
+Source**; hop 2 (tool-level OAuth) is governed by the **custom verifier**.
+Everything below about hop 1 stands; what round 1 called "question 1 — does the
+verifier move the login" turned out to be the wrong question, and hop 2 is
+unmeasured. Section 10 is the round-2 fixes.
 
 Scripts: [`05-verifier.ts`](05-verifier.ts), [`05-verifier-flow.ts`](05-verifier-flow.ts),
-[`05-redirect-allowlist.ts`](05-redirect-allowlist.ts), [`05-drive.ts`](05-drive.ts).
+[`05-redirect-allowlist.ts`](05-redirect-allowlist.ts), [`05-token-auth-methods.ts`](05-token-auth-methods.ts),
+[`05-drive.ts`](05-drive.ts).
 
 ---
 
@@ -410,3 +418,138 @@ $ curl -s -o /dev/null -w '%{http_code}\n' https://63be-….ngrok-free.app/healt
 The verifier, its tunnel, the local `apps/idp` and the repeat-measurement loop were
 all shut down before this spike reported. Nothing this spike started is still
 listening.
+
+---
+
+## 10. Round 2 — the two checks round 1's reviewer could not run
+
+### 10.1 `05-token-auth-methods.ts` now boots its own IdP and needs no credential
+
+Round 1 it exited 2 with *"IDP_CLIENT_ID is required"*, so the four outcomes were
+transcript-only. From a clean checkout, nothing configured, nothing in the
+environment:
+
+```console
+$ bun docs/spikes/evidence/05-token-auth-methods.ts ; echo "exit=$?"
+spike 05 — apps/idp token-endpoint client authentication
+  throwaway IdP  http://localhost:63470   (port bound as :0 and read back)
+  scratch db     /var/folders/…/T/cg-spike75-token-auth-62092-1789139603291.db
+  persona        dana.okafor@bank.example   (checked-in fixture, not a live address)
+
+  client 5qW8brlosNnjGxtgVyhb2dj3NzDp0kkI, registered client_secret_post, secret minted on creation
+
+══ four real single-use codes, four ways of authenticating the client ══
+
+client_secret_post, correct secret — the configuration we have
+  -> HTTP 200 (a token was issued)
+client_secret_post, WRONG secret — a stale secret in the dashboard
+  -> HTTP 400 {"error_description":"invalid client_secret","error":"invalid_client"}
+client_secret_basic, correct secret — a relying party that prefers the header
+  -> HTTP 401 {"error_description":"client registered for client_secret_post cannot use client_secret_basic","error":"invalid_client"}
+no client authentication at all — PKCE only, as a public client would
+  -> HTTP 400 {"error_description":"client registered for client_secret_post cannot use none","error":"invalid_client"}
+
+✓ the status code alone separates the two causes: 401 is an auth-method mismatch (#61 item 1),
+  400 with a client_secret is a wrong secret, 200 means the exchange worked.
+exit=0
+```
+
+The persona is `dana.okafor@bank.example` — the **checked-in fixture** address, not
+the live one. That is the whole trick: the live personas live in Render env vars,
+the fixture ones live in git, and this measurement never needed a live anything.
+
+The ✓ line is an assertion, not a flourish. The script fails if the four statuses
+stop being distinguishable, because the advice it hands the human — *"read the
+status code off the Render log"* — is worthless the moment a Better Auth upgrade
+collapses the 401 onto the 400.
+
+Cleanup, checked:
+
+```console
+$ ls /tmp/cg-spike75-token-auth-*        ; # no matches
+$ pgrep -fl "apps/idp/src/index.ts"      ; # no idp process left
+```
+
+### 10.2 `PROBE_ONLY=1` exits 0 when it stops on purpose
+
+Round 1 it printed the right answer and then `FAILED: the chain stopped at
+https://cg-idp-or5b.onrender.com/login …` and exited 1. Both gateways, now:
+
+```console
+$ PROBE_ONLY=1 ARCADE_MCP_URL=https://api.arcade.dev/mcp/cg-demo-us \
+    PERSONA_EMAIL=nobody@example.invalid PERSONA_PASSWORD=unused \
+    bun docs/spikes/evidence/05-verifier-flow.ts ; echo "exit=$?"
+
+─── 11 hop 1 — redirect chain
+[
+  "302 GET https://cloud.arcade.dev/oauth2/authorize",
+  "302 GET https://cg-idp-or5b.onrender.com/oauth2/authorize",
+  "200 GET https://cg-idp-or5b.onrender.com/login"
+]
+
+══ PROBE OK — hop 1 on https://api.arcade.dev/mcp/cg-demo-us
+══ 3 hops, first page rendered by cg-idp-or5b.onrender.com: our own IdP — hop 1 is brokered to the User Source.
+══ No password was typed: the probe stops at the first page by design.
+exit=0
+```
+
+```console
+$ ARCADE_MCP_URL=https://api.arcade.dev/mcp/cg-demo … ; echo "exit=$?"
+══ PROBE OK — hop 1 on https://api.arcade.dev/mcp/cg-demo
+══ 5 hops, first page rendered by account.arcade.dev: account.arcade.dev, which is neither our IdP nor the verifier.
+══ No password was typed: the probe stops at the first page by design.
+exit=0
+```
+
+The credentials on the command line are deliberately fake: a probe that stops at
+the first page never uses them, and a probe that *did* use them would not be a
+probe. Note the second run still reports `account.arcade.dev` — members mode is
+unchanged, hours later.
+
+### 10.3 `--no-ngrok` is a real flag, and credentials come from an untracked file
+
+Round 1's non-blocking finding was that `--no-ngrok` was ignored: the process
+still started a tunnel. Now:
+
+```console
+$ bun docs/spikes/evidence/05-verifier.ts --no-ngrok
+spike 05 verifier — local :63436, public http://localhost:63436
+  IdP issuer         https://cg-idp-or5b.onrender.com
+  IdP credentials    NOT YET SET (IDP_CLIENT_ID, IDP_CLIENT_SECRET) — write docs/spikes/evidence/.env.local
+                     when you have them; this route re-reads it per flow, no restart, URL unchanged
+  tunnel             off (--no-ngrok): this URL is not reachable from Arcade
+  confirm_user       manual — the curl is printed per flow
+
+$ pgrep -f "ngrok http"                  ; # no ngrok process
+$ curl -s localhost:63436/health
+{"status":"ok","public_url":"http://localhost:63436","idp_credentials":"missing: IDP_CLIENT_ID, IDP_CLIENT_SECRET"}
+$ curl -s -o /dev/null -w '%{http_code}\n' "localhost:63436/verify?flow_id=t1"
+503
+```
+
+With the file present — the values here are throwaway strings, written and deleted
+inside one test:
+
+```console
+$ printf 'IDP_CLIENT_ID=probe-id\nIDP_CLIENT_SECRET="probe-secret"\n' > docs/spikes/evidence/.env.local
+$ bun docs/spikes/evidence/05-verifier.ts --no-ngrok
+  IdP credentials    read from docs/spikes/evidence/.env.local (never printed)
+$ curl -s localhost:63449/health
+{"status":"ok","public_url":"http://localhost:63449","idp_credentials":"present"}
+$ curl -s localhost:63449/state | grep -c "probe-id\|probe-secret"
+0
+```
+
+`/state` is the fullest thing this route will tell anyone, and neither value is in
+it. The file itself is gitignored at any depth:
+
+```console
+$ git check-ignore -v docs/spikes/evidence/.env.local
+.gitignore:14:.env.local	docs/spikes/evidence/.env.local
+```
+
+**Credentials are read per flow rather than at startup**, which is not tidiness:
+the tunnel has to exist before the human can paste its URL into the dashboard, and
+the human writes `.env.local` in the same sitting. Demanding credentials before
+binding would force a restart, and a restart on ngrok's free tier means a new
+hostname and a dashboard field that is now wrong.
