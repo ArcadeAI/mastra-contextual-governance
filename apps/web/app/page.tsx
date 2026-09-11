@@ -9,7 +9,7 @@
  */
 import { cookies } from "next/headers";
 
-import { identityReadiness, readIdentitySurface } from "../lib/config.ts";
+import { configurationProblems, readIdentitySurface } from "../lib/config.ts";
 import { readSessionFromCookies } from "../lib/identity/session.ts";
 import { SignInPanel } from "../components/identity/SignInPanel.tsx";
 
@@ -66,7 +66,7 @@ export default async function Home() {
         goes into it.
       </p>
 
-      <SignInPanel session={session} readiness={identityReadiness(config)} />
+      <SignInPanel session={session} problems={configurationProblems(config)} />
 
       <ul style={{ listStyle: "none", padding: 0, marginTop: "2rem" }}>
         {SERVICES.map(([name, role]) => (

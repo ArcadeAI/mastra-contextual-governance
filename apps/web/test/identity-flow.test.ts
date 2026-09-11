@@ -508,9 +508,15 @@ describe("hop 2 — the no-session path, which is the human's case", () => {
 describe("/health", () => {
   test("it reports the three identity fields", async () => {
     const ready = identityReadiness(harness.config);
-    expect(ready).toEqual({ signin: "configured", gateway: "configured", verifier: "configured" });
+    expect(ready).toEqual({
+      status: "ok",
+      signin: "configured",
+      gateway: "configured",
+      verifier: "configured",
+    });
 
     expect(identityReadiness(readWebConfig({}))).toEqual({
+      status: "degraded",
       signin: "missing",
       gateway: "missing",
       verifier: "missing",
@@ -525,6 +531,10 @@ describe("/health", () => {
       PUBLIC_URL: harness.webUrl,
     });
     expect(identityReadiness(signinOnly)).toEqual({
+      // Two of three configured is still `degraded`: a deployment that can sign
+      // Dana in and then cannot make a tool call is not `ok`, and round 2 of
+      // this PR's review found exactly that shape reporting itself as fine.
+      status: "degraded",
       signin: "configured",
       gateway: "missing",
       verifier: "missing",
@@ -606,8 +616,16 @@ describe("a SESSION_SECRET that is set but too weak", () => {
     }
     expect((refused[4] as string).length).toBe(SESSION_SECRET_MIN_LENGTH - 1);
 
-    // What a human is told to run, both forms, and the harness's own.
-    for (const value of [GOOD_SECRET, Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64"), SESSION_SECRET]) {
+    // What a human is told to run, both forms, and the harness's own. Written
+    // out rather than generated: round 2 of this PR's review found a test that
+    // was a coin flip at 1.5%, and a suite that generates its own inputs is a
+    // suite whose green is a sample.
+    const ACCEPTED = [
+      GOOD_SECRET, // openssl rand -hex 32
+      "Xh3n5RkqB2vPz9LmTfW0aYdJ8cGsQe4U1oIrNyVbKxM=", // openssl rand -base64 32
+      SESSION_SECRET, // what the harness runs on
+    ];
+    for (const value of ACCEPTED) {
       expect(sessionSecretProblem(value)).toBeNull();
     }
   });
@@ -636,6 +654,7 @@ describe("a SESSION_SECRET that is set but too weak", () => {
   test("/health reports signin, gateway and verifier as missing", async () => {
     const weak = readIdentitySurface({ ...FILLED, SESSION_SECRET: "x" });
     expect(identityReadiness(weak)).toEqual({
+      status: "degraded",
       signin: "missing",
       gateway: "missing",
       verifier: "missing",
@@ -646,8 +665,13 @@ describe("a SESSION_SECRET that is set but too weak", () => {
     try {
       Object.assign(process.env, { ...FILLED, NODE_ENV: "production", SESSION_SECRET: "x" });
       const { GET } = await import("../app/health/route.ts");
-      expect(await GET().json()).toEqual({
-        status: "ok",
+      const answer = GET();
+      // 200 on the wire, `degraded` in the body: Render abandons a deploy whose
+      // health check is not 200, and an instance that never comes up is an
+      // instance whose /health nobody can read.
+      expect(answer.status).toBe(200);
+      expect(await answer.json()).toEqual({
+        status: "degraded",
         service: "web",
         signin: "missing",
         gateway: "missing",

@@ -21,6 +21,25 @@ const SECRET = "a-session-secret-for-the-suite-0123456789";
 const config = (overrides: Record<string, string> = {}) =>
   readWebConfig({ SESSION_SECRET: SECRET, PUBLIC_URL: "https://cg-web-sa31.onrender.com", ...overrides });
 
+/**
+ * One byte of a sealed value, deterministically changed.
+ *
+ * XOR with `0x01`, so the byte always differs — and since base64url is
+ * injective over byte arrays of the same length, the encoded string always
+ * differs too. Every other way of "corrupting" a value this suite tried had a
+ * silent no-op hiding in it.
+ *
+ * `part` is 1 for the nonce and 2 for the ciphertext-and-tag, matching
+ * `v1.<iv>.<ciphertext+tag>`.
+ */
+function flipByte(sealed: string, part: 1 | 2, index: number): string {
+  const parts = sealed.split(".");
+  const bytes = Buffer.from(parts[part]!, "base64url");
+  bytes[index] = bytes[index]! ^ 0x01;
+  parts[part] = bytes.toString("base64url");
+  return parts.join(".");
+}
+
 /** A request carrying whatever `Set-Cookie` headers a previous response wrote. */
 function requestCarrying(headers: Headers, url = "https://cg-web-sa31.onrender.com/"): Request {
   const jar = new Map<string, string>();
@@ -55,11 +74,43 @@ describe("the seal", () => {
     expect(await openSealed(sealed, "a-different-secret-entirely-9876543210")).toBeNull();
   });
 
-  test("a tampered byte does not open", async () => {
+  test("a tampered byte does not open — every byte of the nonce and the ciphertext", async () => {
     const sealed = await seal({ email: "dana.okafor@bank.example" }, SECRET);
-    const body = sealed.split(".")[2]!;
-    const flipped = `${sealed.split(".").slice(0, 2).join(".")}.${body.slice(0, -2)}${body.at(-1)}${body.at(-2)}`;
-    expect(await openSealed(flipped, SECRET)).toBeNull();
+
+    // Every byte, both parts: the 12-byte nonce and the ciphertext with its
+    // 16-byte GCM tag. Exhaustive rather than sampled, because the thing under
+    // test is that *no* single-byte edit survives, and a spot check is a claim
+    // about the byte it happened to pick.
+    let checked = 0;
+    for (const part of [1, 2] as const) {
+      const length = Buffer.from(sealed.split(".")[part]!, "base64url").length;
+      for (let index = 0; index < length; index += 1) {
+        const flipped = flipByte(sealed, part, index);
+        // Prove the edit landed before asserting what it costs. The previous
+        // version of this test swapped the last two base64url characters, which
+        // is a no-op whenever they are equal — round 2 of #84's review caught it
+        // failing on a *valid* cookie, 147 times in 10,000. A tamper test that
+        // can silently assert nothing is worse than no tamper test.
+        expect(flipped).not.toBe(sealed);
+        expect(await openSealed(flipped, SECRET)).toBeNull();
+        checked += 1;
+      }
+    }
+
+    // 12 nonce bytes + ciphertext + a 16-byte tag. The floor is a guard against
+    // this loop quietly running zero times if the format ever changes.
+    expect(checked).toBeGreaterThan(12 + 16);
+  });
+
+  test("truncating the tag does not open either", async () => {
+    const sealed = await seal({ email: "dana.okafor@bank.example" }, SECRET);
+    const body = Buffer.from(sealed.split(".")[2]!, "base64url");
+    const parts = sealed.split(".");
+    for (const dropped of [1, 8, 16]) {
+      parts[2] = body.subarray(0, body.length - dropped).toString("base64url");
+      expect(parts.join(".")).not.toBe(sealed);
+      expect(await openSealed(parts.join("."), SECRET)).toBeNull();
+    }
   });
 
   test("a value from another format version does not open", async () => {

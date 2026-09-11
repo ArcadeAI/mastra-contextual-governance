@@ -11,9 +11,12 @@
  * `configured` or `missing` and never which value is wrong, because the value
  * is a credential in two cases out of three.
  *
- * It still does not read `APPROVALS_STORE_TOKEN`'s production guard, so it
- * answers `200` either way — a health check that fails on a misconfiguration
- * would take the service out of rotation instead of telling anyone what to fix.
+ * It still does not read `APPROVALS_STORE_TOKEN`'s production guard, and it
+ * answers `200` whatever it finds — a health check that fails on a
+ * misconfiguration would take the service out of rotation instead of telling
+ * anyone what to fix, and Render would abandon the deploy before anybody could
+ * read this. The refusal lives in the body (`"status":"degraded"`), on the home
+ * page, and in the 503 every identity route answers.
  * That is what `readIdentitySurface` is for: the same environment, read without
  * the guard that belongs to a credential this endpoint does not use.
  */
@@ -22,5 +25,10 @@ import { identityReadiness, readIdentitySurface } from "../../lib/config.ts";
 export const dynamic = "force-dynamic";
 
 export function GET() {
-  return Response.json({ status: "ok", service: "web", ...identityReadiness(readIdentitySurface()) });
+  const { status, ...capabilities } = identityReadiness(readIdentitySurface());
+  // `status` first, because it is the field anybody actually reads and the one
+  // the other three services answer. `degraded` whenever any capability is
+  // missing — and still HTTP 200, so Render brings the instance up and a human
+  // can read the three fields that say which one.
+  return Response.json({ status, service: "web", ...capabilities });
 }

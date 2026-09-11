@@ -181,17 +181,81 @@ function trimUrl(value: string | undefined): string {
  * whether a key may be derived decides what this function reports.
  */
 export interface IdentityReadiness {
+  /**
+   * `degraded` whenever any of the three below is `missing`, `ok` only when all
+   * three are configured.
+   *
+   * Round 2 of #84's review ran a cg-web with sign-in configured and
+   * `ARCADE_GATEWAY_ID` absent and got `{"status":"ok", … "gateway":"missing"}`.
+   * The top-level word is the one anybody actually reads — it is the first
+   * field, it is what the other three services answer, and it is what somebody
+   * greps for — so a deployment that cannot make a tool call was describing
+   * itself as fine.
+   *
+   * **Still HTTP 200.** Render takes a non-200 on `healthCheckPath` as a dead
+   * instance and stops the deploy, and an instance that will not come up is an
+   * instance whose `/health` nobody can read. The whole point of this endpoint
+   * is to be readable while something is wrong, so the refusal belongs in the
+   * body and the routes, not in the status line. CI asks the same question with
+   * `curl -fsS`, and it keeps passing.
+   */
+  status: "ok" | "degraded";
   signin: "configured" | "missing";
   gateway: "configured" | "missing";
   verifier: "configured" | "missing";
 }
 
 export function identityReadiness(config: IdentitySurface): IdentityReadiness {
+  const capabilities = {
+    signin: state(signinProblems(config)),
+    gateway: state(gatewayProblems(config)),
+    verifier: state(verifierProblems(config)),
+  } as const;
   return {
-    signin: signinProblems(config).length === 0 ? "configured" : "missing",
-    gateway: gatewayProblems(config).length === 0 ? "configured" : "missing",
-    verifier: verifierProblems(config).length === 0 ? "configured" : "missing",
+    status: Object.values(capabilities).every((each) => each === "configured") ? "ok" : "degraded",
+    ...capabilities,
   };
+}
+
+function state(problems: string[]): "configured" | "missing" {
+  return problems.length === 0 ? "configured" : "missing";
+}
+
+/**
+ * Every problem with this environment, grouped, for the banner the home page
+ * puts in front of a visitor.
+ *
+ * The same sentences the 503 pages render and the same ones `/health` counts —
+ * one source, three surfaces. Round 2's finding was that a visitor saw none of
+ * them: the page rendered its ordinary persona buttons and `Gateway token:
+ * none`, and the only way to discover that the gateway was unconfigured was to
+ * click into a flow and read a 503. A control plane demo whose own UI hides its
+ * misconfiguration is arguing against itself.
+ */
+export interface ConfigurationProblems {
+  signin: string[];
+  gateway: string[];
+  verifier: string[];
+}
+
+export function configurationProblems(config: IdentitySurface): ConfigurationProblems {
+  return {
+    signin: signinProblems(config),
+    // The gateway list is a superset of sign-in's by construction, and
+    // repeating five sentences under two headings is how a banner becomes
+    // something people stop reading. Show only what sign-in did not already say.
+    gateway: withoutAll(gatewayProblems(config), signinProblems(config)),
+    verifier: withoutAll(verifierProblems(config), signinProblems(config)),
+  };
+}
+
+function withoutAll(problems: string[], already: string[]): string[] {
+  return problems.filter((problem) => !already.includes(problem));
+}
+
+/** True when anything at all is wrong — what decides whether the banner renders. */
+export function isMisconfigured(problems: ConfigurationProblems): boolean {
+  return Object.values(problems).some((each) => each.length > 0);
 }
 
 /**

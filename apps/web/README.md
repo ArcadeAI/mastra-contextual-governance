@@ -147,6 +147,22 @@ curl -s localhost:3000/health
 Three capabilities rather than one flag, because they fail independently and the person
 reading this is trying to find out which step is outstanding.
 
+**`status` is `degraded` whenever any of the three is `missing`, and the response is
+still HTTP 200.** Round 2 of #84's review ran a cg-web with sign-in configured and
+`ARCADE_GATEWAY_ID` absent and got `{"status":"ok", … "gateway":"missing"}` — the
+field anybody actually reads, describing a deployment that could not make a tool call
+as fine. The status line stays 200 on purpose: Render treats a non-200 on
+`healthCheckPath` as a dead instance and abandons the deploy, and an instance that
+never comes up is an instance whose `/health` nobody can read. CI asks the same
+question with `curl -fsS` and keeps passing.
+
+The home page carries the same news for whoever is not curling anything: a red
+`role="alert"` banner above the persona buttons, listing the same sentences the 503
+pages render, and the persona buttons go inert while sign-in itself is unconfigured.
+Inert rather than hidden — hiding them would leave a visitor wondering whether this
+demo has personas at all. `test/configuration-banner.test.tsx` pins the banner, the
+disabled buttons, and the fully-configured case where neither appears.
+
 | variable | what it is |
 |---|---|
 | `IDP_ISSUER` | `apps/idp`'s public origin, **as a URL** — not the HOST-form the cross-service keys use |
