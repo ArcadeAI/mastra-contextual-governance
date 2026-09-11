@@ -392,13 +392,23 @@ function requestClientId({ authorization, form }: TokenRequest): string | null {
  * echoed — one of them is a secret.
  */
 function mixedCredentialsRefusal(): Response {
-  return Response.json(
-    {
+  return new Response(
+    JSON.stringify({
       error: "invalid_request",
       error_description:
         "The Authorization header and the request body carry different client credentials",
+    }),
+    {
+      status: 400,
+      headers: {
+        "Content-Type": "application/json",
+        // RFC 6749 §5.1, and what the plugin puts on its own token errors —
+        // measured. A refusal this service writes itself should be
+        // indistinguishable in form from one Better Auth wrote.
+        "Cache-Control": "no-store",
+        Pragma: "no-cache",
+      },
     },
-    { status: 400 },
   );
 }
 

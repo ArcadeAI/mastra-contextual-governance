@@ -172,7 +172,7 @@ interface TokenResponse {
 async function postToken(
   fields: Array<[string, string]>,
   headers: Record<string, string> = {},
-): Promise<TokenResponse> {
+): Promise<TokenResponse & { headers: Headers }> {
   const body = fields.map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&");
   const response = await fetch(`${baseUrl}/oauth2/token`, {
     method: "POST",
@@ -180,7 +180,7 @@ async function postToken(
     body,
   });
   const parsed = (await response.json().catch(() => ({}))) as Omit<TokenResponse, "status">;
-  return { status: response.status, ...parsed };
+  return { status: response.status, headers: response.headers, ...parsed };
 }
 
 /** A live refresh token, spent by whichever test asks for one. */
@@ -333,6 +333,12 @@ describe("authorization_code: the four ways a client can present itself", () => 
     expect(token.status).toBe(400);
     expect(token.error).toBe("invalid_request");
     expect(token.access_token).toBeUndefined();
+
+    // The refusal is this service's, so it must not be distinguishable in form
+    // from the plugin's own token errors — RFC 6749 §5.1, and measured against
+    // what @better-auth/oauth-provider puts on an `invalid_request`.
+    expect(token.headers.get("cache-control")).toBe("no-store");
+    expect(token.headers.get("pragma")).toBe("no-cache");
 
     const { line, tail } = await waitForLogLine(/client_auth="mixed"/, from);
     expect(line).toMatch(REJECTION);
