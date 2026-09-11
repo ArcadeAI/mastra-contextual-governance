@@ -33,15 +33,46 @@ const ACCEPTED = [
   "localhost",
   "localhost:8082",
   "  localhost:8082  ",
+  "127.0.0.1:1234",
   "127.0.0.1:4412",
+  "127.0.0.53",
+  "[::1]",
+  "[::1]:9000",
   "[::1]:4412",
   "cg-loan-app.onrender.com",
   "cg-web-sa31.onrender.com",
+  "cg-hooks.onrender.com:443",
   "example.test",
 ];
 
-/** Bare service names: what `fromService` produced, and what a hand-typed key produces. */
-const REFUSED = ["cg-idp", "cg-idp-or5b", "cg-loan-app", "cg-web-sa31", "cg-loan-app:8080"];
+/**
+ * Nothing here is reachable. The first five are bare service names — what
+ * `fromService` produced, and what a hand-typed key produces again.
+ *
+ * The rest are round 1 of #67. The first cut of this check let any value
+ * through once bracket-stripping left a colon in it, so `[::2]` — no dot, not
+ * loopback — booted the loan API and served `/health` on it. `cg-loan-app:bad`
+ * and `foo:bar` got in the same way. A dotless non-loopback host is refused
+ * whatever punctuation it carries, and a port that is not a port number is
+ * refused too.
+ */
+const REFUSED = [
+  "cg-idp",
+  "cg-idp-or5b",
+  "cg-loan-app",
+  "cg-web-sa31",
+  "cg-loan-app:8080",
+  "[::2]",
+  "::2",
+  "[fe80::1]",
+  "cg-loan-app:bad",
+  "foo:bar",
+  "localhost:bad",
+  "localhost:0",
+  "localhost:65536",
+  "cg-hooks.onrender.com:bad",
+  "https://cg-hooks.onrender.com",
+];
 
 test.each(ACCEPTED)("%p is a host something can resolve", (value) => {
   expect(() => assertPublicHost("LOAN_APP_PUBLIC_HOST", value)).not.toThrow();
@@ -87,32 +118,80 @@ test("readConfig refuses a bare service name, and passes a hostname through", ()
  * boot that printed this and then served anyway would pass a message-only
  * assertion, and would be the #59 failure with a warning attached.
  */
-test("the control plane refuses to start on a bare service name", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "cg-public-host-"));
+test.each(["cg-loan-app", "[::2]", "cg-loan-app:bad", "foo:bar"])(
+  "the control plane refuses to start on %p",
+  async (host) => {
+    const dir = mkdtempSync(join(tmpdir(), "cg-public-host-"));
 
-  try {
+    try {
+      const child = Bun.spawn(["bun", join(import.meta.dir, "..", "src", "index.ts")], {
+        env: {
+          ...process.env,
+          PORT: "0",
+          GOVERNANCE_DB_PATH: join(dir, "governance.db"),
+          LOAN_APP_PUBLIC_HOST: host,
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+
+      const status = await child.exited;
+      const stderr = await new Response(child.stderr as ReadableStream).text();
+
+      // 78 is sysexits' EX_CONFIG, the same status `apps/loan-app/scripts/dev-idp.ts` uses.
+      expect(status).toBe(78);
+      expect(stderr).toContain(`LOAN_APP_PUBLIC_HOST=${host}`);
+      expect(stderr).toContain("Render dashboard");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+  30_000,
+);
+
+/** The other side of the line: each accepted shape still boots and serves. */
+test.each(["cg-loan-app.onrender.com", "localhost:8082", "127.0.0.1:1234", "[::1]:9000"])(
+  "the control plane starts on %p",
+  async (host) => {
+    const dir = mkdtempSync(join(tmpdir(), "cg-public-host-"));
+    const probe = Bun.serve({ port: 0, fetch: () => new Response(null, { status: 404 }) });
+    const port = probe.port as number;
+    probe.stop(true);
+
     const child = Bun.spawn(["bun", join(import.meta.dir, "..", "src", "index.ts")], {
       env: {
         ...process.env,
-        PORT: "0",
+        PORT: String(port),
         GOVERNANCE_DB_PATH: join(dir, "governance.db"),
-        LOAN_APP_PUBLIC_HOST: "cg-loan-app",
+        LOAN_APP_PUBLIC_HOST: host,
       },
       stdout: "pipe",
       stderr: "pipe",
     });
 
-    const status = await child.exited;
-    const stderr = await new Response(child.stderr as ReadableStream).text();
-
-    // 78 is sysexits' EX_CONFIG, the same status `apps/loan-app/scripts/dev-idp.ts` uses.
-    expect(status).toBe(78);
-    expect(stderr).toContain("LOAN_APP_PUBLIC_HOST=cg-loan-app");
-    expect(stderr).toContain("Render dashboard");
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-}, 30_000);
+    try {
+      const deadline = Date.now() + 20_000;
+      for (;;) {
+        if (child.exitCode !== null) {
+          const stderr = await new Response(child.stderr as ReadableStream).text();
+          throw new Error(`exited ${child.exitCode} instead of serving: ${stderr}`);
+        }
+        try {
+          if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) break;
+        } catch {
+          // Not listening yet.
+        }
+        if (Date.now() > deadline) throw new Error("hooks did not come up");
+        await Bun.sleep(50);
+      }
+    } finally {
+      child.kill();
+      await child.exited;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+  30_000,
+);
 
 /**
  * The other half. Every configuration error that was fatal before this slice is

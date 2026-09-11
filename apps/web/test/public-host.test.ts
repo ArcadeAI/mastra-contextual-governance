@@ -18,6 +18,9 @@
  * one is pinned by its own suite.
  */
 import { expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { readWebConfig } from "../lib/config.ts";
 import { governanceStreamSource } from "../lib/governance/stream-url.ts";
@@ -27,16 +30,48 @@ import { assertPublicHost, publicHost, PublicHostError } from "../lib/public-hos
 const ACCEPTED = [
   "localhost",
   "localhost:8081",
+  "localhost:8082",
   "  localhost:8081  ",
+  "127.0.0.1:1234",
   "127.0.0.1:4421",
+  "127.0.0.53",
+  "[::1]",
+  "[::1]:9000",
   "[::1]:4421",
   "cg-hooks.onrender.com",
   "cg-web-sa31.onrender.com",
+  "cg-hooks.onrender.com:443",
   "example.test",
 ];
 
-/** Bare service names: what `fromService` produced, and what a hand-typed key produces. */
-const REFUSED = ["cg-idp", "cg-idp-or5b", "cg-loan-app", "cg-web-sa31", "cg-loan-app:8080"];
+/**
+ * Nothing here is reachable. The first five are bare service names — what
+ * `fromService` produced, and what a hand-typed key produces again.
+ *
+ * The rest are round 1 of #67. The first cut of this check let any value
+ * through once bracket-stripping left a colon in it, so `[::2]` — no dot, not
+ * loopback — booted the loan API and served `/health` on it. `cg-loan-app:bad`
+ * and `foo:bar` got in the same way. A dotless non-loopback host is refused
+ * whatever punctuation it carries, and a port that is not a port number is
+ * refused too.
+ */
+const REFUSED = [
+  "cg-idp",
+  "cg-idp-or5b",
+  "cg-loan-app",
+  "cg-web-sa31",
+  "cg-loan-app:8080",
+  "[::2]",
+  "::2",
+  "[fe80::1]",
+  "cg-loan-app:bad",
+  "foo:bar",
+  "localhost:bad",
+  "localhost:0",
+  "localhost:65536",
+  "cg-hooks.onrender.com:bad",
+  "https://cg-hooks.onrender.com",
+];
 
 test.each(ACCEPTED)("%p is a host something can resolve", (value) => {
   expect(() => assertPublicHost("HOOKS_PUBLIC_HOST", value)).not.toThrow();
@@ -96,4 +131,41 @@ test("the panel's stream source refuses a bare service name in either mode", () 
   });
   expect(live.url).toBe("https://cg-hooks.onrender.com/events");
   expect(governanceStreamSource({}).mode).toBe("fixture");
+});
+
+/**
+ * The three copies of the check are written out rather than shared, because
+ * `apps/loan-app` depends on nothing outside itself on purpose and a shared
+ * module would be the dependency edge it must not have. The cost of a copy is
+ * drift, and drift in *this* code is a control that silently permits — so the
+ * marked region is compared byte for byte here.
+ *
+ * Round 1 of #67 is what this is for: one wrong condition, `hostname.includes
+ * (":")`, let `[::2]` boot and serve. Three copies of that is three times the
+ * chance of fixing it in one place and believing it fixed everywhere.
+ *
+ * `apps/web` reads the other two services' sources, the same way
+ * `test/config.test.ts` already reads `apps/hooks` to pin the duplicated
+ * development token. That is cheaper than a dependency edge between the
+ * governed UI, the control plane and the business system.
+ */
+test("the three copies of the check are byte-identical", () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+
+  const START = "// --- shared check: byte-identical in all three services";
+  const END = "// --- end shared check";
+
+  const region = (...parts: string[]) => {
+    const path = join(root, ...parts);
+    const source = readFileSync(path, "utf8");
+    const from = source.indexOf(START);
+    const to = source.indexOf(END);
+    if (from === -1 || to <= from) throw new Error(`${path} has no marked shared region`);
+    return source.slice(from, to);
+  };
+
+  const web = region("apps", "web", "lib", "public-host.ts");
+
+  expect(region("apps", "hooks", "src", "public-host.ts")).toBe(web);
+  expect(region("apps", "loan-app", "src", "public-host.ts")).toBe(web);
 });

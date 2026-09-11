@@ -75,8 +75,8 @@ services:
       # /oauth2/userinfo who the caller is. Host-form, consumer adds https.
       # Read it off the cg-idp service page in the Render dashboard — in the
       # live environment that is `cg-idp-or5b.onrender.com`, not `cg-idp`. See
-      # the note at the top of this file; the service refuses a bare name at
-      # boot.
+      # the note at the top of this file; the service refuses an address it
+      # could not reach at boot.
       - key: IDP_PUBLIC_HOST
         sync: false
 
@@ -145,7 +145,8 @@ services:
       # Host-form, consumer adds the scheme — `fromService` emits neither a
       # scheme nor a hostname, and blueprints have no string interpolation. Read
       # it off the cg-loan-app service page in the Render dashboard. See the
-      # note at the top of this file; the service refuses a bare name at boot.
+      # note at the top of this file; the service refuses an unreachable value
+      # at boot.
       - key: LOAN_APP_PUBLIC_HOST
         sync: false
 
