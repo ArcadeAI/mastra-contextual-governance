@@ -223,8 +223,33 @@ disjoint. "Exactly the missed rows, in order, nothing duplicated" is a property 
 construction rather than of the timing.
 
 An id the log cannot place — a panel left open across a `scripts/reset`, a stale tab — is
-not an error and does not replay the whole log. The stream says so in a comment and goes
-live.
+not an error and does not replay the whole log. The stream says so in a comment, names the
+`seq` it is resuming from and how to ask for everything, and goes live.
+
+### Replaying from the beginning
+
+```sh
+curl -N -H 'last-event-id: 0' "https://$HOOKS_PUBLIC_HOST/events"
+```
+
+`last-event-id: 0` means *from the first row*, as this README always claimed it did. Until
+#62 it fell through the unknown-id path and served live from the current cutoff — a replay
+that looked like it worked and returned nothing.
+
+A `last-event-id` of **all digits is a `seq`**, the unit the preamble and the truncation
+comment already speak in; `0` is then a case of that rule rather than a magic value. The two
+spaces cannot collide, because every audit row id is `evt_` plus ten base32 characters. A seq
+above the high-water mark is as unplaceable as an unknown id, and is answered the same way:
+
+```
+: last-event-id 900 is not in this log; resuming live from seq 41. Send last-event-id: 0 to replay from the beginning.
+```
+
+A fresh connection with no header still replays nothing — history is the log's job — and the
+mark it starts from is on the wire (`: governance stream — live from seq 41`) so the next
+connection can name an exact anchor. The cap applies to a replay from `0` like any other: a
+log longer than 25,000 rows replays its newest 25,000 with the `: replay truncated …`
+comment saying which end was dropped.
 
 ### The cap, and what it costs
 

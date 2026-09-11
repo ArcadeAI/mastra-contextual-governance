@@ -10,6 +10,7 @@
  *
  *     GET /events
  *     Last-Event-ID: evt_4k7xq2m9hz        (optional, on a resume)
+ *     Last-Event-ID: 0                     (or a seq — 0 replays the whole log)
  *
  *     retry: 500
  *
@@ -37,6 +38,21 @@
  * it is already queued, and the two sets are disjoint. That is what makes
  * "reconnect receives exactly the missed rows, in order, nothing duplicated" a
  * property of the construction rather than of the timing.
+ *
+ * ## Replaying from the beginning, and an anchor this log cannot place
+ *
+ * `Last-Event-ID: 0` means "from the first row", as the docs always claimed it
+ * did. It used to fall through the unknown-id path and serve live from the
+ * current cutoff, which looked like a working replay that returned nothing
+ * (#62). A `last-event-id` of all digits is now read as a `seq` — the unit the
+ * preamble and the truncation comment already speak in — and no audit row id
+ * can be one, because every id is `evt_` plus ten base32 characters.
+ *
+ * An anchor this log cannot place — an unknown id, or a seq past the
+ * high-water mark — still resumes live, and still says so in the first bytes
+ * on the wire rather than quietly. The comment now names the mark it is
+ * resuming from and how to ask for everything, so the second attempt can be
+ * exact.
  *
  * ## Backpressure, and why a slow client is disconnected rather than trimmed
  *
@@ -168,6 +184,39 @@ function comment(text: string): string {
 }
 
 /**
+ * A `last-event-id` of all digits names a `seq` rather than a row id, and `0`
+ * therefore means "from the beginning".
+ *
+ * The two spaces cannot collide: every audit row id is `evt_` and ten base32
+ * characters (`audit-log.ts`), so nothing the panel ever sends is a number.
+ * Seqs are already a public part of this endpoint's vocabulary — the preamble
+ * and the truncation comment both quote them — so the documented
+ * `last-event-id: 0` is a case of a rule rather than a magic value.
+ */
+const SEQ_ANCHOR = /^\d+$/;
+
+/**
+ * The `seq` to replay after, or `null` when the request named something this
+ * log cannot place.
+ *
+ * A seq above the high-water mark is unplaceable for the same reason an unknown
+ * id is: the client is describing a log this is not. Saying so beats replaying
+ * from a mark the caller did not ask for, which is what the old handling of
+ * `0` did — it looked like a working replay that returned nothing (#62).
+ */
+function resolveAnchor(db: Database, lastEventId: string, cutoff: number): number | null {
+  if (!SEQ_ANCHOR.test(lastEventId)) return seqOf(db, lastEventId);
+  const seq = Number(lastEventId);
+  return Number.isSafeInteger(seq) && seq <= cutoff ? seq : null;
+}
+
+/** How the log line names an anchor, so `0` reads as what it is. */
+function describeAnchor(lastEventId: string, seq: number): string {
+  if (!SEQ_ANCHOR.test(lastEventId)) return `${lastEventId} (seq ${seq})`;
+  return seq === 0 ? "seq 0 (the beginning of the log)" : `seq ${seq}`;
+}
+
+/**
  * Opens a stream. Replays first if the request names a `Last-Event-ID` the log
  * can place, then stays open on the bus until the client goes away.
  */
@@ -234,11 +283,16 @@ export function handleEvents(request: Request, deps: EventStreamDeps): Response 
       let preamble = `retry: ${RETRY_MS}\n\n`;
 
       if (lastEventId !== "") {
-        const found = seqOf(db, lastEventId);
+        const found = resolveAnchor(db, lastEventId, cutoff);
         if (found === null) {
-          // A panel left open across `scripts/reset`, or a stale tab. Replaying
-          // the whole log would be worse than saying so and going live.
-          preamble += comment(`last-event-id ${lastEventId} is not in this log; resuming live`);
+          // A panel left open across `scripts/reset`, a stale tab, or a seq
+          // past the end of this log. Replaying everything for a client that
+          // asked for something else would be worse than saying so and going
+          // live — and the mark is named so the next attempt can be exact.
+          preamble += comment(
+            `last-event-id ${lastEventId} is not in this log; resuming live from seq ${cutoff}. ` +
+              `Send last-event-id: 0 to replay from the beginning.`,
+          );
           log(`/events resumed from an unknown id ${lastEventId}; serving live from seq ${cutoff}`);
         } else {
           const capped = cappedAnchor(db, found, cutoff, backlogLimit);
@@ -254,10 +308,17 @@ export function handleEvents(request: Request, deps: EventStreamDeps): Response 
                 `${backlogLimit}-event cap; replaying from seq ${capped}, ~${dropped} skipped`,
             );
           } else {
-            log(`/events resumed from ${lastEventId} (seq ${found}); replaying up to seq ${cutoff}`);
+            log(
+              `/events resumed from ${describeAnchor(lastEventId, found)}; ` +
+                `replaying up to seq ${cutoff}`,
+            );
           }
         }
       } else {
+        // The mark this connection starts from, on the wire as well as in the
+        // log: it is what a `curl` reader needs to pick an anchor, and it is
+        // what the docblock above and the README have always claimed is here.
+        preamble += comment(`governance stream — live from seq ${cutoff}`);
         log(`/events opened live from seq ${cutoff}`);
       }
 
