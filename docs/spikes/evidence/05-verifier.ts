@@ -2,15 +2,23 @@
 /**
  * Spike 05 — a throwaway Arcade **custom user verifier** backed by `apps/idp`.
  *
- * Arcade's default verifier makes every end user sign in to an Arcade account
- * that is a member of the project. A custom verifier replaces that: Arcade sends
- * the browser to a route you own, you decide who the person is by whatever means
- * you like, and you post that identity back to Arcade server-side. This is that
- * route, wired to an OIDC login against `apps/idp`, run locally behind `ngrok`.
+ * There are two hops in this demo's identity chain and two different mechanisms,
+ * and round 1 of this spike conflated them:
+ *
+ *   hop 1  MCP client → gateway           governed by the **User Source**
+ *   hop 2  tool-level OAuth, `cg-idp`     governed by the **custom user verifier**
+ *
+ * This file is hop 2's mechanism. Arcade's default verifier makes every end user
+ * sign in to an Arcade account that is a member of the project, which our personas
+ * are not and should not be. A custom verifier replaces that: Arcade sends the
+ * browser to a route we own, we decide who the person is, and we post that identity
+ * back to Arcade server-side.
  *
  * Nothing here is deployed and nothing here belongs in `apps/`. It exists to
- * answer #75: does setting a custom verifier move the gateway login off
- * `account.arcade.dev` and onto our own IdP?
+ * answer the questions #75 is now actually asking: on Dana's **first tool
+ * authorization**, does Arcade redirect her browser here, does `confirm_user`
+ * complete the flow, and is the persona on the `/pre` payload the email this
+ * route confirmed?
  *
  *   Arcade  ──303──▶  GET /verify?flow_id=…
  *                       │  start an authorization-code + PKCE login at the IdP
@@ -26,22 +34,36 @@
  *                       ▼
  *                     303 to the `next_uri` Arcade answers with
  *
+ * ## The IdP it authenticates against, and why it is the live one
+ *
+ * Round 1 pointed this at a local `apps/idp`, which proved the route's own contract
+ * and nothing else. The measurement that matters needs the **live** IdP
+ * `https://cg-idp-or5b.onrender.com`: hop 1 already signs Dana in there, so the
+ * browser arriving at `/verify` is carrying that session, and whether hop 2 reuses
+ * it or asks her to log in a second time is exactly the round-trip count #75 wants.
+ * A local IdP is a different origin and would answer a different question.
+ *
  * ## Running it
  *
- *   IDP_CLIENT_ID=… IDP_CLIENT_SECRET=… \
  *   bun docs/spikes/evidence/05-verifier.ts
+ *   bun docs/spikes/evidence/05-verifier.ts --no-ngrok    # local port only, no tunnel
  *
- * It binds port **0** and reads the port back — never a guessed port, because
- * every worktree owns a different block — then spawns `ngrok` and prints the
- * public URL. Two values go to the human, both printed at startup:
+ * It binds port **0** and reads the port back — never a guessed port, because every
+ * worktree owns a different block — then spawns `ngrok` and prints the public URL.
  *
- *   1. `<public>/verify`   → Arcade dashboard, Auth → Settings → custom verifier
- *   2. `<public>/callback` → `IDP_OAUTH_REDIRECT_URIS` on the IdP
+ * ## Credentials it holds and never shows
+ *
+ * `IDP_CLIENT_ID` and `IDP_CLIENT_SECRET` are read from **`docs/spikes/evidence/.env.local`**,
+ * which the human writes and `.gitignore` excludes at any depth. The implementer of
+ * this spike never reads that file and this process never prints either value: the
+ * startup banner says only whether they were found. The IdP registers exactly one
+ * OAuth client, confidential, `client_secret_post`, and stores the secret hashed
+ * since #70, so there is no unattended way to obtain one — see the write-up.
  *
  * ## The one manual step, and why
  *
  * `confirm_user` is authenticated with the Arcade **project API key**, which the
- * implementer of this spike does not hold and must not. So:
+ * implementer does not hold and must not. So:
  *
  *   - with `ARCADE_API_KEY` set, the verifier calls `confirm_user` itself and the
  *     flow completes with no human in it. That is the production shape, and it is
@@ -62,23 +84,51 @@ const IDP_SCOPES = process.env.IDP_SCOPES ?? "openid email";
 /** How long a browser parked on the waiting page will hold before giving up. */
 const CONFIRM_TIMEOUT_MS = Number(process.env.CONFIRM_TIMEOUT_MS ?? 900_000);
 
-function requireEnv(name: string): string {
-  const value = process.env[name]?.trim();
-  if (!value) {
+const NO_NGROK = process.argv.includes("--no-ngrok");
+const ENV_FILE = new URL("./.env.local", import.meta.url).pathname;
+
+/**
+ * Read the IdP client credentials out of `docs/spikes/evidence/.env.local`.
+ *
+ * The human writes that file; nobody else opens it. Values are never echoed, not
+ * even truncated — a client id is not a secret but printing one teaches the habit,
+ * and this process has no reason to say more than "found".
+ */
+async function readCredentials(): Promise<{ clientId: string; clientSecret: string; source: string }> {
+  const file = Bun.file(ENV_FILE);
+  const fromFile: Record<string, string> = {};
+  if (await file.exists()) {
+    for (const line of (await file.text()).split("\n")) {
+      const match = /^\s*(?:export\s+)?([A-Z0-9_]+)\s*=\s*(.*)$/.exec(line);
+      if (!match || line.trimStart().startsWith("#")) continue;
+      fromFile[match[1]] = match[2].trim().replace(/^["']|["']$/g, "");
+    }
+  }
+  const seen: string[] = [];
+  const pick = (name: string) => {
+    if (fromFile[name]) seen.push("docs/spikes/evidence/.env.local");
+    else if (process.env[name]) seen.push("the environment");
+    return (fromFile[name] ?? process.env[name] ?? "").trim();
+  };
+  const clientId = pick("IDP_CLIENT_ID");
+  const clientSecret = pick("IDP_CLIENT_SECRET");
+  if (!clientId || !clientSecret) {
     console.error(
-      `${name} is required.\n` +
+      `IDP_CLIENT_ID and IDP_CLIENT_SECRET are required, and neither is in\n` +
+        `  ${ENV_FILE}\n\n` +
         `  The IdP registers exactly one OAuth client, confidential, client_secret_post, and\n` +
-        `  stores the secret hashed (#70) — so it cannot be read back, only rotated. Get the\n` +
-        `  pair from whoever holds it and pass them in the environment; they are never printed\n` +
-        `  by this process and never written to a file.`,
+        `  stores the secret hashed (#70) — so it cannot be read back, only rotated with\n` +
+        `  \`bun run --cwd apps/idp oauth-client --rotate\`. Whoever holds it writes that file:\n\n` +
+        `    IDP_CLIENT_ID=…\n    IDP_CLIENT_SECRET=…\n\n` +
+        `  It is gitignored at any depth (\`git check-ignore -v\` proves it) and this process\n` +
+        `  never prints what it reads.`,
     );
     process.exit(2);
   }
-  return value;
+  return { clientId, clientSecret, source: [...new Set(seen)].join(" and ") };
 }
 
-const CLIENT_ID = requireEnv("IDP_CLIENT_ID");
-const CLIENT_SECRET = requireEnv("IDP_CLIENT_SECRET");
+const { clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, source: CREDENTIAL_SOURCE } = await readCredentials();
 const ARCADE_API_KEY = process.env.ARCADE_API_KEY?.trim();
 
 interface Flow {
@@ -354,21 +404,30 @@ async function startNgrok(port: number): Promise<string> {
   throw new Error("ngrok did not report a tunnel within 30s");
 }
 
-publicUrl = process.env.VERIFIER_PUBLIC_URL?.replace(/\/+$/, "") ?? (await startNgrok(server.port));
+publicUrl = process.env.VERIFIER_PUBLIC_URL?.replace(/\/+$/, "")
+  ?? (NO_NGROK ? `http://localhost:${server.port}` : await startNgrok(server.port));
 
 console.log(
   [
     "",
     `spike 05 verifier — local :${server.port}, public ${publicUrl}`,
     `  IdP issuer         ${IDP_ISSUER}`,
-    `  IdP client         ${CLIENT_ID}`,
+    `  IdP credentials    read from ${CREDENTIAL_SOURCE} (never printed)`,
+    `  tunnel             ${NO_NGROK ? "off (--no-ngrok): this URL is not reachable from Arcade" : "ngrok"}`,
     `  confirm_user       ${ARCADE_API_KEY ? "automatic (ARCADE_API_KEY is set)" : "manual — the curl is printed per flow"}`,
     "",
-    "  Two values for the human:",
-    `    Arcade dashboard, Auth → Settings → custom verifier :  ${publicUrl}/verify`,
-    `    IdP IDP_OAUTH_REDIRECT_URIS, one more entry         :  ${publicUrl}/callback`,
+    "  ═══ the two values the human enters, exactly as written ═══",
     "",
-    `  What it has seen so far:  curl -s ${publicUrl}/state | jq`,
+    `  1. Arcade dashboard → Auth → Settings → Custom verifier route:`,
+    `       ${publicUrl}/verify`,
+    "",
+    `  2. cg-idp on Render → IDP_OAUTH_REDIRECT_URIS → append, keeping every existing entry:`,
+    `       ${publicUrl}/callback`,
+    "",
+    `  Verify (2) landed without opening the dashboard:`,
+    `       bun docs/spikes/evidence/05-redirect-allowlist.ts "${publicUrl}/callback"`,
+    "",
+    `  Everything this route has seen:  curl -s ${publicUrl}/state | jq`,
     "",
   ].join("\n"),
 );

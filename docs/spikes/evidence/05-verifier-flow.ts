@@ -23,8 +23,12 @@
  *     bun docs/spikes/evidence/05-verifier-flow.ts
  *
  * Optional: ARCADE_MCP_URL (defaults to the User Source gateway), IDP_ISSUER,
- * HOOKS_URL, SPIKE_TOOL, SPIKE_TOOL_ARGS, PROBE_ONLY=1 (stop after the first
- * page and report its host — no password is typed anywhere).
+ * HOOKS_URL, SPIKE_TOOL, SPIKE_TOOL_ARGS.
+ *
+ * `PROBE_ONLY=1` answers one question — which host renders hop 1's first page —
+ * and stops there without typing a password anywhere. **It exits 0 when it stops,**
+ * because stopping is the measurement. Only a chain that renders no page at all is
+ * a probe failure.
  *
  * The guard from spike 04 is kept: **this will not type a persona's password
  * into a host it was not told to trust.** The trusted set is the IdP and, if
@@ -129,6 +133,8 @@ async function main() {
     t.hop("authorize URL", authorizeUrl);
 
     const drive = await driveAuthorize(authorizeUrl, redirectUri, persona, t, {
+      // PROBE_ONLY trusts nothing, which is how it stops at the first page without
+      // submitting anything. That stop is the probe's whole result, not a failure.
       trustedPageHosts: PROBE_ONLY ? [] : trustedPageHosts,
       jar,
     });
@@ -140,6 +146,37 @@ async function main() {
       stoppedBecause: drive.stoppedBecause ?? null,
     });
     t.hop("hop 1 — redirect chain", drive.visited);
+
+    // A probe asks one question — which host authenticates the persona on hop 1 —
+    // and answers it by looking at the first page rendered. Round 1's reviewer ran
+    // this, got the right answer on screen, and got a "FAILED" line and exit 1
+    // underneath it, because the code below could not tell "stopped on purpose"
+    // from "stopped because something broke". It can now: a probe that reached a
+    // page succeeded, whichever host served it, and the host is the finding.
+    if (PROBE_ONLY) {
+      const host = drive.pageHosts[0];
+      if (!host) {
+        console.error(
+          `\nPROBE FAILED: the chain rendered no page at all. It ended at ` +
+            `${drive.stoppedAt ? stripQuery(drive.stoppedAt) : "the redirect URI"} — ${drive.stoppedBecause ?? "no reason recorded"}.`,
+        );
+        process.exitCode = 1;
+        return;
+      }
+      const whose =
+        host === idpHost
+          ? `our own IdP — hop 1 is brokered to the User Source`
+          : host === verifierHost
+            ? `the custom verifier's tunnel`
+            : `${host}, which is neither our IdP nor the verifier`;
+      console.log(
+        `\n══ PROBE OK — hop 1 on ${MCP_URL}` +
+          `\n══ ${drive.visited.length} hops, first page rendered by ${host}: ${whose}.` +
+          `\n══ No password was typed: the probe stops at the first page by design.`,
+      );
+      return;
+    }
+
     if (drive.stoppedAt) {
       throw new Error(
         `the chain stopped at ${stripQuery(drive.stoppedAt)} instead of reaching the redirect URI — ` +
@@ -217,7 +254,7 @@ async function main() {
       t.hop("hop 2 — the tool call handed back a URL; walking it with the same cookie jar", toolAuthUrl);
       const cookiesBefore = jar.hosts();
       const hop2 = await driveAuthorize(toolAuthUrl, "http://never.invalid/", persona, t, {
-        trustedPageHosts: PROBE_ONLY ? [] : trustedPageHosts,
+        trustedPageHosts,
         jar,
       });
       t.hop("hop 2 — hosts that rendered a page", {
