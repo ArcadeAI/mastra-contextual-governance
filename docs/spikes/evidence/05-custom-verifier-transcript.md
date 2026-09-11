@@ -93,8 +93,28 @@ REJECTED  https://example.com/definitely-not-allowlisted
 
 `https://cloud.arcade.dev/oauth2/intermediate_callback` is the redirect URL
 Arcade's User Source documentation names. `https://cloud.arcade.dev/api/v1/oauth/callback`
-is the one `apps/idp/src/config.ts` carries as `DEFAULT_ARCADE_REDIRECT_URI` for
-the **auth provider** the loan tools use.
+is the one `apps/idp/src/config.ts` carries as `DEFAULT_ARCADE_REDIRECT_URI` and
+`.env.example` ships, for the **auth provider** the loan tools use.
+
+**Corrected later the same day, and the correction matters.** That generic
+auth-provider callback is not the one Arcade actually uses. The human read the
+live `IDP_OAUTH_REDIRECT_URIS`, which carries two entries, and the real
+auth-provider callback has a per-provider path segment. Re-probed with it:
+
+```console
+$ bun docs/spikes/evidence/05-redirect-allowlist.ts \
+    "https://cloud.arcade.dev/api/v1/oauth/f4c6b_ap_GvSAhPpynQRj/callback"
+ALLOWED   https://cloud.arcade.dev/oauth2/intermediate_callback
+REJECTED  https://cloud.arcade.dev/api/v1/oauth/callback
+REJECTED  https://cloud.arcade.dev/api/v1/oauth/callback/
+REJECTED  https://cloud.arcade.dev/oauth/callback
+REJECTED  https://api.arcade.dev/v1/oauth/callback
+REJECTED  https://example.com/definitely-not-allowlisted
+ALLOWED   https://cloud.arcade.dev/api/v1/oauth/f4c6b_ap_GvSAhPpynQRj/callback
+```
+
+So the live allowlist is correct and complete; what is wrong is `.env.example`'s
+documented default, which is a URL Arcade never calls. Recorded as finding 7a.
 
 ---
 
@@ -230,3 +250,163 @@ The third row is the one that matters for #75 question 3, and it is measured:
 
 Two complete authorization flows through the verifier, one cookie jar. The second
 showed the persona nothing at all.
+
+---
+
+## 5. Hop 1 on `cg-demo-us`, at 14:24Z: the persona logs in at our IdP
+
+Same script, same persona, nine minutes after section 3's control. This is the
+spike's headline measurement.
+
+```
+─── 02 protected-resource metadata
+{"resource":"https://api.arcade.dev/mcp/cg-demo-us",
+ "authorization_servers":["https://cloud.arcade.dev/oauth2"],
+ "bearer_methods_supported":["header"],"scopes_supported":["mcp"],
+ "resource_name":"contextual-governance (user source)",
+ "urn:arcade:oauth:user_source_id":"us_3JA8GcvHfT17WNnnRazx6FZpxeg"}
+
+─── 05 dynamic client registration
+{"client_id":"bdd5093b-a579-4421-9248-5a786a88bfc4",
+ "redirect_uris":["http://localhost:56575/callback"],
+ "token_endpoint_auth_method":"none","scope":"mcp offline_access",
+ "client_name":"cg-spike-75","application_type":"web"}
+
+─── 07 302 https://cloud.arcade.dev/oauth2/authorize -> https://cg-idp-or5b.onrender.com/oauth2/authorize
+https://cg-idp-or5b.onrender.com/oauth2/authorize
+  ?response_type=code
+  &client_id=RskTFjl6AqkUO8FKYWjpDCLd139YE36F
+  &redirect_uri=https%3A%2F%2Fcloud.arcade.dev%2Foauth2%2Fintermediate_callback
+  &scope=openid+profile+email
+  &state=…&code_challenge=…&code_challenge_method=S256
+
+─── 08 302 https://cg-idp-or5b.onrender.com/oauth2/authorize -> https://cg-idp-or5b.onrender.com/login
+
+─── 09 page 1: login at https://cg-idp-or5b.onrender.com/login
+{ "action": "https://cg-idp-or5b.onrender.com/login",
+  "fields": ["oauth_query","email","password"] }
+
+─── 10 page 2: consent at https://cg-idp-or5b.onrender.com/consent
+{ "action": "https://cg-idp-or5b.onrender.com/consent",
+  "fields": ["oauth_query","decision"] }
+
+─── 13 hop 1 — hosts that rendered a page
+{
+  "pageHosts": ["cg-idp-or5b.onrender.com","cg-idp-or5b.onrender.com"],
+  "pagesShown": 2,
+  "reachedTheVerifier": false,
+  "reachedTheIdP": true,
+  "stoppedBecause": null
+}
+
+─── 14 hop 1 — redirect chain
+[
+  "302 GET https://cloud.arcade.dev/oauth2/authorize",
+  "302 GET https://cg-idp-or5b.onrender.com/oauth2/authorize",
+  "200 GET https://cg-idp-or5b.onrender.com/login",
+  "303 POST https://cg-idp-or5b.onrender.com/login",
+  "200 GET https://cg-idp-or5b.onrender.com/consent",
+  "303 POST https://cg-idp-or5b.onrender.com/consent",
+  "302 GET https://cloud.arcade.dev/oauth2/intermediate_callback"
+]
+```
+
+`auth.arcade.dev` and `account.arcade.dev` do not appear. Compare section 3, which
+is the same gateway at 14:15Z.
+
+`reachedTheVerifier: false` is not incidental — the verifier's tunnel was up and
+serving for the whole window, and `GET /state` on it shows five flows, all of them
+this spike's own local tests and none from Arcade.
+
+## 6. …and the token exchange fails
+
+The last hop of the chain above:
+
+```
+─── 11 302 https://cloud.arcade.dev/oauth2/intermediate_callback -> http://localhost:56575/callback
+http://localhost:56575/callback
+  ?error=access_denied
+  &iss=https%3A%2F%2Fcloud.arcade.dev%2Foauth2
+  &error_description=Token+exchange+with+identity+provider+failed
+  &state=…
+
+─── 14 callback query
+{ "keys": ["error","iss","error_description","state"],
+  "stateMatches": true,
+  "error": "access_denied",
+  "error_description": "Token exchange with identity provider failed" }
+
+FAILED: authorize failed: access_denied — Token exchange with identity provider failed
+```
+
+Reproduced on a two-minute timer for seventeen minutes. Every line identical but
+the state:
+
+```
+14:32:29Z | Token+exchange+with+identity+provider+failed | no-pre
+14:34:33Z | Token+exchange+with+identity+provider+failed | no-pre
+14:36:38Z | Token+exchange+with+identity+provider+failed | no-pre
+14:38:41Z | Token+exchange+with+identity+provider+failed | no-pre
+14:40:46Z | Token+exchange+with+identity+provider+failed | no-pre
+```
+
+The 14:29:47Z run rendered **one** page rather than two: Dana's consent from
+14:24Z is on record at our IdP, so only `/login` appeared. Consent persists across
+runs; the session cookie did not, because each run used a fresh jar.
+
+## 7. What `apps/idp` says at the token endpoint, per client-auth method
+
+Four real single-use codes against a local instance, because the live one checks
+the code before the client.
+
+```console
+$ IDP_ISSUER=http://localhost:4423 IDP_CLIENT_ID=… IDP_CLIENT_SECRET=… \
+  IDP_REDIRECT_URI=http://localhost:4429/callback \
+  PERSONA_EMAIL=morgan.ellis@… PERSONA_PASSWORD=… \
+  bun docs/spikes/evidence/05-token-auth-methods.ts
+
+client_secret_post, correct secret — the configuration we have
+  -> HTTP 200 (a token was issued)
+client_secret_post, WRONG secret — a stale secret in the dashboard
+  -> HTTP 400 {"error_description":"invalid client_secret","error":"invalid_client"}
+client_secret_basic, correct secret — a relying party that prefers the header
+  -> HTTP 401 {"error_description":"client registered for client_secret_post cannot use client_secret_basic","error":"invalid_client"}
+no client authentication at all — PKCE only, as a public client would
+  -> HTTP 400 {"error_description":"client registered for client_secret_post cannot use none","error":"invalid_client"}
+```
+
+**The status code alone separates the two candidate causes.** 401 is an
+auth-method mismatch; 400 is a wrong secret.
+
+And the live IdP cannot be asked, because it validates the code first:
+
+```console
+$ # junk code, no secret
+{"error_description":"invalid code","error":"invalid_grant"}
+$ # junk code, wrong secret
+{"error_description":"invalid code","error":"invalid_grant"}
+$ # junk code, Basic auth
+{"error_description":"invalid code","error":"invalid_grant"}
+```
+
+## 8. Why the cause stayed an inference
+
+The discriminator above needs one line of the `cg-idp` Render log, for the
+`POST /oauth2/token` at 14:24:07Z or 14:29:47Z. **The human looked: `apps/idp`
+writes boot lines and nothing else. There is no request log.** So the cause is
+recorded as an inference and the missing log as a finding in its own right.
+
+## 9. Teardown
+
+```console
+$ pgrep -fl "05-verifier.ts|ngrok http|watch.sh|bun src/index.ts"
+none
+$ lsof -nP -iTCP -sTCP:LISTEN | grep -E ':(442[0-9])\b'
+no 4420-4429 listeners
+$ curl -s -o /dev/null -w '%{http_code}\n' https://63be-….ngrok-free.app/health
+404          # ngrok's own page: the tunnel is gone
+```
+
+The verifier, its tunnel, the local `apps/idp` and the repeat-measurement loop were
+all shut down before this spike reported. Nothing this spike started is still
+listening.
