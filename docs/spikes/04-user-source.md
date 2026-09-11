@@ -2,7 +2,9 @@
 
 **Answer: `apps/idp` is now capable of it, and the gateway `cg-demo-us` does not use it.**
 
-Two separate findings, measured a week apart and both in this document:
+Two separate findings, both measured on 2026-09-11 and both in this document. The
+first came out of the human's dashboard sitting earlier in the day, before #70;
+the second is from the AFK measurement after it:
 
 1. **`apps/idp` could not back a User Source as it stood, and now can.** The Arcade
    dashboard refused the issuer with *"OIDC discovery document does not include a
@@ -19,8 +21,10 @@ Two separate findings, measured a week apart and both in this document:
    not change the login. So questions 2 and 3 could not be measured, and they are
    marked unverified rather than guessed.
 
-**Recommendation for [#14](https://github.com/ArcadeAI-labs/mastra-contextual-governance/issues/14): (c) Arcade Headers.** Reasoning in
-[the last section](#recommendation-for-14).
+**Recommendation for [#14](https://github.com/ArcadeAI-labs/mastra-contextual-governance/issues/14): keep going with the User Source, backed by a
+custom user verifier against `apps/idp`; fall back to every persona being an Arcade
+project member.** Reasoning in [the last section](#recommendation-for-14), including
+the option this spike originally recommended and why it is off the table.
 
 Resolves [#65](https://github.com/ArcadeAI-labs/mastra-contextual-governance/issues/65).
 Feeds the #14 gate. Raw transcripts, redacted, in
@@ -271,23 +275,49 @@ DESIGN.md's open risk 4 is exactly that identity can split silently. Do not buil
 
 ## Question 3 — does the tool's own OAuth need a second consent?
 
-**Unverified, for the same reason**, and one thing is already known well enough to
-plan around.
+**Unverified, for the same reason**, and the shape of the answer is already clear
+enough to plan #14 around. The thing to get straight first is that there are two
+separate hops, configured in two separate places, and this spike only ever
+reached the first.
 
-`tools/loan/loan/__init__.py:56-64` declares `OAuth2(id="cg-idp", scopes=…)` on all
-four loan tools. That is an Arcade **auth provider** also named `cg-idp`, a separate registration
-from the **User Source** of the same name, pointed at the same IdP. Arcade's own gateway documentation is explicit that the two do not
-collapse:
+### Hop 1 — gateway access, the User Source
 
-> Users will still need to authenticate to the tools within the MCP Gateway as normal.
+Who is allowed to open an MCP session on `cg-demo-us` at all, and what
+`context.user_id` the hooks then see. Configured on the **gateway**: user
+authentication mode set to User Source, with `cg-idp` attached, and the subject
+claim `email` deciding the string. This is the hop every measurement in question 2
+is about, and it is the one that never reaches `cg-idp`.
 
-So the best case is not one browser round trip. It is two authorizations against one login. The gateway login sends the persona to
-`cg-idp` and leaves a session cookie there. The tool's authorization sends them to
-`cg-idp` again, where that cookie should make the second pass consent-only or
-silent. Whether Better Auth's consent page is
-skipped on the second pass for an already-consented client is exactly the number
-#65 asked for, and it was not measured. Recorded as **unverified: expected 2
-authorizations / 1 credential prompt, unmeasured.**
+### Hop 2 — tool authorization, the user verifier
+
+Whether *this* persona holds a credential for the loan tools, which is layer 2 in
+DESIGN.md's table, upstream of `/pre` and invisible to the control plane.
+Configured on the **tool**: `tools/loan/loan/__init__.py:56-64` declares
+`OAuth2(id="cg-idp", scopes=…)` on all four loan tools. That `cg-idp` is an Arcade
+**auth provider**, a separate registration from the **User Source** of the same
+name, pointed at the same IdP. Configuring one does not configure the other.
+
+The part a #14 reader needs and that is easy to miss: hop 2 has its own notion of
+*which user is authorizing*, and Arcade's default for it is **"sign in to a
+project account"** — the persona proves who they are to Arcade before Arcade
+starts the tool's OAuth flow. A custom **user verifier** against `apps/idp` is
+what would replace that default, so that hop 2 identifies the persona from our IdP
+rather than from an Arcade account. Left on the default, hop 2 reintroduces the
+Arcade-account login that hop 1's User Source was meant to remove, and "one
+identity, not two" ends up with two front doors.
+
+### What that means for the round-trip count
+
+The best case is not one browser round trip. It is two authorizations against one
+login: hop 1 sends the persona to `cg-idp` and leaves a session cookie there, then
+hop 2 sends them to `cg-idp` again, where that cookie should make the second pass
+consent-only or silent. Whether Better Auth's consent page is skipped on the
+second pass for an already-consented client is exactly the number #65 asked for,
+and it was not measured. Recorded as **unverified: expected 2 authorizations and 1
+credential prompt, unmeasured** — and that estimate assumes hop 2 runs against a
+user verifier pointed at `apps/idp`. On Arcade's default it is 2 authorizations
+across 2 different identity providers, which is a worse answer and a different
+demo.
 
 ## Question 4 — can Mastra's `MCPClient` drive this from a server with no browser?
 
@@ -356,6 +386,7 @@ rather than trusting an empty tool list.**
 | 2g | A client can name which User Source it wants | **measured** | No. Ten parameters tried (`user_source_id`, `user_source`, `urn:arcade:oauth:user_source_id`, `connection`, `idp_hint`, `kc_idp_hint`, `login_hint`, `audience`, the source's name, and none at all); identical 302 every time |
 | 2d | Arcade offers `cg-idp` at its login | **measured** | No. Work email / GitHub / Google / Microsoft; the persona resolves to an Arcade password form |
 | 3 | Second consent for the tool's OAuth | **unverified** | Blocked. Tools declare `OAuth2(id="cg-idp")`; Arcade documents gateway and tool auth as separate, so expect 2 authorizations against 1 IdP session |
+| 3a | Hop 1 and hop 2 are configured in different places | **measured, from configuration** | Hop 1 is the gateway's User Source with subject claim `email`; hop 2 is `OAuth2(id="cg-idp")` on the tool, whose own identity default is Arcade's "sign in to a project account". A custom user verifier against `apps/idp` is what replaces that default (#75) |
 | 4 | `MCPClient.authenticate()` from a hosted route handler | **measured** | Refused: *"the provider's redirect URL must be a loopback address"* |
 | 4a | `MCPOAuthClientProvider` from a server process | **measured** | Works up to the browser hop: discovery, DCR, PKCE, authorization URL emitted, loopback bound |
 | 4b | Unauthenticated `listTools()` | **measured** | Returns `{}` and logs; `getServerAuthState` returns `"needs-auth"` |
@@ -378,32 +409,52 @@ rather than trusting an empty tool list.**
 | `listTools()` is empty rather than throwing when unauthorized | ✅ `[]` alongside `"needs-auth"` |
 | **Why** `cg-demo-us` does not broker to `cg-idp` | ⬜ **narrowed to two, not determined.** Either Arcade's broker ignores the gateway's `user_source_id` at the authorize step (a platform bug), or the `cg-idp` User Source record fails validation there and Arcade falls back silently, most likely on a client secret predating #70's rotation. Separating them needs the dashboard or an Arcade API key |
 | `user_id` on `/pre` under a User Source | ⬜ **not measured.** Expectation only |
-| Round trips on a persona's first use | ⬜ **not measured.** Expectation only, from Arcade's documentation |
+| Round trips on a persona's first use | ⬜ **not measured.** Expectation only, from Arcade's documentation, and it assumes hop 2 runs against a user verifier pointed at `apps/idp` rather than Arcade's default |
+| That a custom user verifier is what makes hop 2 use `apps/idp` | ⬜ **not measured here.** Read off Arcade's tool-authorization configuration, not from a run; #75 measures it |
 | Whether `MCPOAuthClientProvider` completes against Arcade end to end | ⬜ **not measured.** Everything up to the browser hop was; the hop itself needs a login this spike could not reach |
 
 ## Recommendation for #14
 
-**Take (c) Arcade Headers.** The gateway's login is not where this demo's identity claim lives. Layers 1 to 4
-are, and all four key off `context.user_id`, so the only thing #14 needs from the
-gateway is the ability to say which persona is acting, per call, from a Next.js
-route handler, with no browser hop. Headers mode
-does exactly that with an Arcade API key in `Authorization` and the persona's email
-in `Arcade-User-ID`, and it is the only one of the three that works today and survives contact with a
-hosted server. (b) User Source cannot be reached at all,
-even with the source demonstrably attached to `cg-demo-us`, and even once it can, question 4 shows a hosted `apps/web` must hand
-the flow to the user's own browser and take the callback itself, which is four
-personas and four interactive logins to rehearse live. (a) per-persona Arcade OAuth
-is that same interactive cost plus token storage for four Arcade member accounts,
-and it lands on the identical `user_id`. Headers mode does not
-weaken the thesis, because the header is not the credential: the loan tools still
-declare `OAuth2(id="cg-idp")`, so a forged `Arcade-User-ID` gets a governance
-decision for a persona whose OAuth grant `apps/web` does not hold and the call dies
-at layer 2, and `apps/loan-app` still derives its actor from the token rather than
-from anything the header said. The one thing to keep honest is DESIGN.md's rule 3. The header must carry the same
-lowercase address as the OAuth subject and the loan book's actor. **Revisit (b) when someone gets the authorization chain to
-reach `cg-idp` and measures questions 2 and 3**: it is the better story for an enterprise audience, it
-is what a forker with a real Okta should use, and this spike's script measures it in
-about two minutes once the authorization chain reaches `cg-idp`.
+**Stay with the User Source and make hop 2 match it: a custom user verifier
+against `apps/idp`. If that does not land, fall back to every persona being an
+Arcade project member, which is how `cg-demo` runs today.** The reason to keep
+going rather than route around it is that the two failures this spike hit are both
+configuration, not architecture: `apps/idp` satisfies everything Arcade asks of an
+issuer after #70, the source is demonstrably attached to `cg-demo-us`, and the one
+remaining unknown is why the broker does not act on it. That is a two-minute
+re-measure away for whoever can see the dashboard, and
+[`evidence/04-user-source-flow.ts`](evidence/04-user-source-flow.ts) prints the
+`/pre` `user_id` the moment the chain reaches `cg-idp-or5b.onrender.com`. Spike
+[#75](https://github.com/ArcadeAI-labs/mastra-contextual-governance/issues/75) is
+measuring whether the custom user verifier is the missing piece, and question 3
+above is why it matters: hop 2 on Arcade's default sends the persona to an Arcade
+account login, so a User Source on hop 1 alone would still leave the demo with two
+front doors. The fallback is unglamorous and it works: four Arcade member accounts
+under the four persona addresses, the gateway in "Members of this Project" mode, and
+`context.user_id` lands on exactly the same lowercase string, which is all DESIGN.md's
+rule 3 asks. What #14 must carry either way is finding 4b — check
+`getServerAuthState`, because an unauthorized `MCPClient` reports an empty tool list
+rather than an error, and an agent that trusts it will explain, plausibly and
+wrongly, that it cannot help.
+
+### The option this spike recommended, and why it is rejected
+
+Round 1 of this document recommended **(c) Arcade Headers**: an Arcade API key in
+`Authorization` and the persona's email in `Arcade-User-ID`, which names the acting
+persona per call from a route handler with no browser hop and, unlike the other two,
+worked on the day. The human rejected it outright on 2026-09-11. The reason is not
+that it fails a control: layer 2 would still gate it, because the loan tools declare
+`OAuth2(id="cg-idp")`, so a forged `Arcade-User-ID` would get a governance decision
+for a persona whose OAuth grant `apps/web` does not hold and the call would die
+before reaching `apps/loan-app`, which derives its actor from the token and never
+from a header. The reason is that **a backend asserting `user_id` in a header is not
+the identity story this template exists to tell.** The deliverable is a forkable
+template for a real multi-person production setting, and an enterprise audience that
+sees `apps/web` naming the acting user has been handed the same question DESIGN.md
+already refused about folding the IdP into `apps/web`: could the agent's host just
+claim to be anyone? Recorded here so the next reader does not rediscover the
+measurement and propose it again — the measurements stay, in the findings and
+confidence tables; the recommendation does not.
 
 ## Follow-ups
 
@@ -415,7 +466,13 @@ about two minutes once the authorization chain reaches `cg-idp`.
   everything Arcade asks of a User Source issuer.
 - **#14 must not trust an empty tool list.** Check `getServerAuthState` (finding
   4b).
-- **The `cg-idp` name is overloaded.** An Arcade *auth provider* and an Arcade *User
-  Source* both carry it, pointed at the same IdP but configured separately and
-  doing different jobs. Worth disambiguating in `.env.example` before either is
-  wired, or a future reader will assume configuring one configures the other.
+- **The `cg-idp` name is overloaded three ways.** An Arcade *auth provider*
+  (hop 2), an Arcade *User Source* (hop 1), and soon a *user verifier*, all
+  carrying the same name, all pointed at the same IdP, each configured separately
+  and doing a different job. Worth disambiguating in `.env.example` before any of
+  them is wired, or a future reader will assume configuring one configures the
+  others.
+- **Hop 2's user verifier is #75's question.** Question 3 above explains why hop 2
+  on Arcade's default "sign in to a project account" would undo hop 1's User
+  Source. Whoever measures #75 should record the round-trip count question 3 could
+  not.

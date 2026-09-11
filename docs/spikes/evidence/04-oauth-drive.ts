@@ -13,14 +13,68 @@ export interface Hop {
   detail?: string;
 }
 
+/**
+ * Every parameter and JSON field whose value is scrubbed before it reaches a
+ * transcript.
+ *
+ * `code_challenge` and `state` are on this list even though neither is a secret
+ * in the OAuth sense: the challenge is a public hash and the state is a dead
+ * CSRF nonce the moment the flow ends. They are here because a transcript that
+ * is *mostly* redacted is the harder thing to review. A reader should be able to
+ * say "no flow value survives" and check it with one grep, rather than deciding
+ * per field which leftovers are harmless. `redactionPattern()` is what that grep
+ * is made of, and `04-redaction.test.ts` asserts the committed transcript
+ * matches none of it.
+ *
+ * Longer names come first so the alternation prefers `code_challenge` over
+ * `code`.
+ */
+export const REDACTED_PARAMS = [
+  "code_challenge",
+  "code_verifier",
+  "client_secret",
+  "refresh_token",
+  "access_token",
+  "id_token",
+  "password",
+  "nonce",
+  "state",
+  "code",
+] as const;
+
+/** Minimum value length worth hiding, so `state=p` in prose survives as prose. */
+const MIN_SECRET_LENGTH = 8;
+
+/**
+ * A pattern matching any unredacted value of a {@link REDACTED_PARAMS} field,
+ * in either query-parameter or JSON-field form.
+ *
+ * Exported so a test can grep the committed transcript with the same rule the
+ * scripts redact by, instead of a second rule that can drift from it.
+ */
+export function redactionPattern(): RegExp {
+  const names = REDACTED_PARAMS.join("|");
+  // `(?!<redacted>)` so the pattern does not flag its own output: a scrubbed
+  // `code_challenge=<redacted>` is the goal, not a finding.
+  return new RegExp(
+    `(?:"(?:${names})"\\s*:\\s*"(?!<redacted>)[^"]{${MIN_SECRET_LENGTH},}")` +
+      `|(?:\\b(?:${names})=(?!<redacted>)[^&\\s"'\`]{${MIN_SECRET_LENGTH},})`,
+    "g",
+  );
+}
+
 /** Anything that looks like a secret, gone before it reaches a transcript. */
 export function redact(text: string): string {
+  const names = REDACTED_PARAMS.join("|");
   return text
     .replace(
-      /("(?:access_token|refresh_token|id_token|code|client_secret|password|code_verifier)"\s*:\s*")([^"]{8,})"/g,
+      new RegExp(`("(?:${names})"\\s*:\\s*")([^"]{${MIN_SECRET_LENGTH},})"`, "g"),
       '$1<redacted>"',
     )
-    .replace(/\b(code|client_secret|password|access_token|id_token|refresh_token)=([^&\s"]{8,})/g, "$1=<redacted>");
+    .replace(
+      new RegExp(`\\b(${names})=([^&\\s"'\`]{${MIN_SECRET_LENGTH},})`, "g"),
+      "$1=<redacted>",
+    );
 }
 
 export class Transcript {
@@ -80,7 +134,8 @@ export function stripQuery(url: string): string {
 }
 
 export function redactQuery(url: string): string {
-  return url.replace(/(code|id_token|access_token|login_challenge|consent_challenge)=[^&]+/g, "$1=<redacted>");
+  const names = [...REDACTED_PARAMS, "login_challenge", "consent_challenge"].join("|");
+  return url.replace(new RegExp(`\\b(${names})=[^&]+`, "g"), "$1=<redacted>");
 }
 
 export interface ParsedForm {

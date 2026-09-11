@@ -2,11 +2,22 @@
 
 Everything here is against the live services on **2026-09-11**, from the worktree
 for issue #65. Sections 1 to 3 are the first pass; section 4 is a second pass,
-after the human recreated the `cg-demo-us` gateway mid-spike. The persona's email domain is replaced with `<persona-domain>`
-throughout — the four addresses live in Render environment variables and are
-deliberately not in git. Authorization codes, tokens and login/consent challenges
-are redacted by the scripts themselves (`redact` and `redactQuery` in
-`04-oauth-drive.ts`).
+a few hours later, after the human recreated the `cg-demo-us` gateway mid-spike.
+
+The persona's email domain is replaced with `<persona-domain>` throughout: the
+four addresses live in Render environment variables and are deliberately not in
+git. Every flow value is scrubbed by `redact` and `redactQuery` in
+`04-oauth-drive.ts` — authorization codes, access and refresh and ID tokens,
+client secrets, PKCE verifiers **and challenges**, `state`, `nonce`, and the
+IdP's login and consent challenges. The list lives in one place,
+`REDACTED_PARAMS`, and `04-redaction.test.ts` greps this file with the same
+pattern the scripts redact by, so a value that stops being scrubbed fails
+`bun test` rather than sitting here unnoticed.
+
+Two things deliberately survive, because they are the evidence: the throwaway
+`client_id` of each dynamically registered client, and the loopback ports. A
+short `state=p` or `code_challenge=…` in hand-written prose survives too; those
+are illustrations, not values.
 
 Reproduce with:
 
@@ -103,10 +114,10 @@ spike 04 — https://api.arcade.dev/mcp/cg-demo-us as dana.okafor@<persona-domai
 }
 
 ─── 05 authorize URL
-https://cloud.arcade.dev/oauth2/authorize?response_type=code&client_id=73b98c2a-d0fd-4867-ae99-ff28d9510e64&redirect_uri=http%3A%2F%2Flocalhost%3A62459%2Fcallback&scope=mcp+offline_access&state=avQJsMTNZ-Cs4VL7Zbv9Tw&code_challenge=Fwlgszt1oAO7Hqmh7ZbPT3f0IE3Fa5Jygk27sgG2QVg&code_challenge_method=S256&resource=https%3A%2F%2Fapi.arcade.dev%2Fmcp%2Fcg-demo-us
+https://cloud.arcade.dev/oauth2/authorize?response_type=code&client_id=73b98c2a-d0fd-4867-ae99-ff28d9510e64&redirect_uri=http%3A%2F%2Flocalhost%3A62459%2Fcallback&scope=mcp+offline_access&state=<redacted>&code_challenge=<redacted>&code_challenge_method=S256&resource=https%3A%2F%2Fapi.arcade.dev%2Fmcp%2Fcg-demo-us
 
 ─── 06 302 https://cloud.arcade.dev/oauth2/authorize -> https://auth.arcade.dev/oauth2/auth
-https://auth.arcade.dev/oauth2/auth?response_type=code&client_id=4eabdfa1-482e-4296-ba72-ba5fde2a3812&redirect_uri=https%3A%2F%2Fcloud.arcade.dev%2Foauth2%2Fintermediate_callback&scope=openid+profile+email&state=gUOqG5aDdkWECWKAvFnVWIgTz_N6QmGT3RuO54dKzy4&code_challenge=n2Qt7_NUoJHi-c_7ppUe_DsDvesR1oPZpOI84GBjyYk&code_challenge_method=S256
+https://auth.arcade.dev/oauth2/auth?response_type=code&client_id=4eabdfa1-482e-4296-ba72-ba5fde2a3812&redirect_uri=https%3A%2F%2Fcloud.arcade.dev%2Foauth2%2Fintermediate_callback&scope=openid+profile+email&state=<redacted>&code_challenge=<redacted>&code_challenge_method=S256
 
 ─── 07 302 https://auth.arcade.dev/oauth2/auth -> https://auth.arcade.dev/ui/login
 https://auth.arcade.dev/ui/login?login_challenge=<redacted>
@@ -183,13 +194,13 @@ threw: Cannot authenticate MCP server arcade: the provider's redirect URL must b
 
 ─── 04 authenticate() emitted an authorization URL
 {
-  "authorizationUrl": "https://cloud.arcade.dev/oauth2/authorize?response_type=code&client_id=037e26fa-c453-4b4b-8d40-b448dd619258&code_challenge=rDaRNyycWDjScXeDEyZcATk4XmkEvmJkPDSDaaAe420&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A62468%2Foauth%2Fcallback&state=a1b908cd-2fec-4700-9f93-9861ead7b22f&scope=mcp+offline_access&prompt=consent&resource=https%3A%2F%2Fapi.arcade.dev%2Fmcp%2Fcg-demo-us",
+  "authorizationUrl": "https://cloud.arcade.dev/oauth2/authorize?response_type=code&client_id=037e26fa-c453-4b4b-8d40-b448dd619258&code_challenge=<redacted>&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A62468%2Foauth%2Fcallback&state=<redacted>&scope=mcp+offline_access&prompt=consent&resource=https%3A%2F%2Fapi.arcade.dev%2Fmcp%2Fcg-demo-us",
   "redirect_uri": "http://localhost:62468/oauth/callback",
   "note": "Mastra bound this loopback port itself and is waiting for a browser to hit it"
 }
 
 ─── 05 302 https://cloud.arcade.dev/oauth2/authorize -> https://auth.arcade.dev/oauth2/auth
-https://auth.arcade.dev/oauth2/auth?response_type=code&client_id=4eabdfa1-482e-4296-ba72-ba5fde2a3812&redirect_uri=https%3A%2F%2Fcloud.arcade.dev%2Foauth2%2Fintermediate_callback&scope=openid+profile+email&state=JNXwf_sNUHxr-aH0QL8thCoInkeCC8y5JzpncYD7SSU&code_challenge=NMjgSDR8ksfOTPYrTuQfaiY_C3qi6F2Ad9tKHSARFSU&code_challenge_method=S256
+https://auth.arcade.dev/oauth2/auth?response_type=code&client_id=4eabdfa1-482e-4296-ba72-ba5fde2a3812&redirect_uri=https%3A%2F%2Fcloud.arcade.dev%2Foauth2%2Fintermediate_callback&scope=openid+profile+email&state=<redacted>&code_challenge=<redacted>&code_challenge_method=S256
 
 ─── 06 302 https://auth.arcade.dev/oauth2/auth -> https://auth.arcade.dev/ui/login
 https://auth.arcade.dev/ui/login?login_challenge=<redacted>
@@ -405,10 +416,10 @@ spike 04 — https://api.arcade.dev/mcp/cg-demo-us as dana.okafor@<persona-domai
 }
 
 ─── 05 authorize URL
-https://cloud.arcade.dev/oauth2/authorize?response_type=code&client_id=0033cb90-038b-49e8-9f9e-5d84fe68205b&redirect_uri=http%3A%2F%2Flocalhost%3A64265%2Fcallback&scope=mcp+offline_access&state=HhGcn6jAiwbRXHev3oGQcw&code_challenge=M8GTikurTmFLo_2Rff9sRA2rIbeYQGV-roSkJJDd_c0&code_challenge_method=S256&resource=https%3A%2F%2Fapi.arcade.dev%2Fmcp%2Fcg-demo-us
+https://cloud.arcade.dev/oauth2/authorize?response_type=code&client_id=0033cb90-038b-49e8-9f9e-5d84fe68205b&redirect_uri=http%3A%2F%2Flocalhost%3A64265%2Fcallback&scope=mcp+offline_access&state=<redacted>&code_challenge=<redacted>&code_challenge_method=S256&resource=https%3A%2F%2Fapi.arcade.dev%2Fmcp%2Fcg-demo-us
 
 ─── 06 302 https://cloud.arcade.dev/oauth2/authorize -> https://auth.arcade.dev/oauth2/auth
-https://auth.arcade.dev/oauth2/auth?response_type=code&client_id=4eabdfa1-482e-4296-ba72-ba5fde2a3812&redirect_uri=https%3A%2F%2Fcloud.arcade.dev%2Foauth2%2Fintermediate_callback&scope=openid+profile+email&state=5xfeuaKfN-vskUlSWUOo0QQSkTyNEOrQDuBrLqmSIRE&code_challenge=j12qQAPsXuOghVelKBMjKEvbZUKflHb4FvsGMcDp5-I&code_challenge_method=S256
+https://auth.arcade.dev/oauth2/auth?response_type=code&client_id=4eabdfa1-482e-4296-ba72-ba5fde2a3812&redirect_uri=https%3A%2F%2Fcloud.arcade.dev%2Foauth2%2Fintermediate_callback&scope=openid+profile+email&state=<redacted>&code_challenge=<redacted>&code_challenge_method=S256
 
 ─── 07 302 https://auth.arcade.dev/oauth2/auth -> https://auth.arcade.dev/ui/login
 https://auth.arcade.dev/ui/login?login_challenge=<redacted>
