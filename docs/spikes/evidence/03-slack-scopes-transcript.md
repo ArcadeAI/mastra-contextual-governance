@@ -22,7 +22,7 @@ Response:
 
 ```json
 {
-  "url": "https://slack.com/oauth/v2/authorize?client_id=<redacted>&redirect_uri=https%3A%2F%2Fcloud.arcade.dev%2Fapi%2Fv1%2Foauth%2Ff4c6b_aps_arcade-slack%2Fcallback&state=db295531-1268-48cc-9eab-dad1a095645f&user_scope=chat%3Awrite%2Cim%3Awrite%2Cusers%3Aread%2Cusers%3Aread.email%2C",
+  "url": "https://slack.com/oauth/v2/authorize?client_id=<redacted>&redirect_uri=https%3A%2F%2Fcloud.arcade.dev%2Fapi%2Fv1%2Foauth%2Ff4c6b_aps_arcade-slack%2Fcallback&state=<redacted>&user_scope=chat%3Awrite%2Cim%3Awrite%2Cusers%3Aread%2Cusers%3Aread.email%2C",
   "id": "ar_3In2S0sBnmmmkhELEPHUgmRhNqW",
   "user_id": "mateo@arcade.dev",
   "provider_id": "arcade-slack",

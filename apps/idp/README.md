@@ -18,7 +18,7 @@ plugin as an OAuth 2.1 authorization server, owning `idp.db` on its own disk.
 | Path | What |
 |---|---|
 | `GET /oauth2/authorize` | Authorization endpoint. Sends the browser to `/login`, then `/consent`, then back to the client with a code. |
-| `POST /oauth2/token` | Token endpoint. `client_secret_post`, PKCE `S256` required. Access tokens are opaque; the ID token is an RS256 JWT. |
+| `POST /oauth2/token` | Token endpoint. `client_secret_basic` (HTTP Basic), PKCE `S256` required. Access tokens are opaque; the ID token is an RS256 JWT. Rejections are logged — see below. |
 | `GET /oauth2/userinfo` | The persona's identity. `email` is the claim Arcade extracts. |
 | `GET /jwks` | The key set the ID token is verified against. One RSA key, `alg: RS256`. |
 | `POST /oauth2/introspect`, `POST /oauth2/revoke` | For a resource server that needs to validate or revoke an opaque token. |
@@ -83,7 +83,7 @@ wrong password.
 ## The OAuth client
 
 Exactly one, named `Arcade`, created on first boot if absent: confidential,
-`token_endpoint_auth_method: client_secret_post`, PKCE required, redirect URIs from
+`token_endpoint_auth_method: client_secret_basic`, PKCE required, redirect URIs from
 `IDP_OAUTH_REDIRECT_URIS`. Better Auth generates the `client_id` and `client_secret`; they
 cannot be pinned from env.
 
@@ -92,6 +92,73 @@ bun run --cwd apps/idp oauth-client           # client id and endpoints
 bun run --cwd apps/idp oauth-client --json    # the same, machine-readable
 bun run --cwd apps/idp oauth-client --rotate  # mint a new secret, same client id
 ```
+
+### Client authentication is `client_secret_basic`, and only that
+
+The client sends its credentials as HTTP Basic, RFC 6749 §2.3.1:
+
+```
+Authorization: Basic base64(client_id ":" client_secret)
+```
+
+**Better Auth registers exactly one method per client and checks it before it checks the
+secret** (`@better-auth/oauth-provider`, `utils-*.mjs:640`):
+
+```js
+const registeredAuthMethod = client.tokenEndpointAuthMethod ?? "client_secret_basic";
+if (authMethod && registeredAuthMethod !== authMethod)
+  throwInvalidClient(`client registered for ${registeredAuthMethod} cannot use ${authMethod}`)
+```
+
+So there is no "accept both". Credentials in the token request body — the `client_secret_post`
+form this client used until #61 — now come back `400 invalid_client`, with a correct id and
+a correct secret, and the same is true of `/oauth2/introspect` and `/oauth2/revoke`.
+
+Two reasons for Basic rather than post. It is the Arcade dashboard's default for a custom
+OAuth provider, so registering the provider touches no field a forker would not otherwise
+touch — which is the whole point of #61. And an Arcade **User Source** form has no
+auth-method knob at all, so a User Source can only ever authenticate against a client that
+accepts Basic; spike #75 measured `cg-demo-us` reaching consent here and then failing with
+`Token exchange with identity provider failed`.
+
+**An existing `idp.db` is reconciled at boot**, the same way the redirect URIs are, so the
+live client changes in place: same `client_id`, same `client_secret`, no re-registration.
+The boot log says so on stderr the one time it happens:
+
+```
+[idp] OAuth client token auth method reconciled to client_secret_basic (#61). …
+```
+
+and `/health` reports the current value, so the state of the live row is one curl away:
+
+```sh
+curl -s https://<idp-host>/health | jq -r '.oauth.token_endpoint_auth_method'
+# client_secret_basic
+```
+
+### When the token endpoint says no, it says why
+
+Every `/oauth2/token` rejection writes one line:
+
+```
+[idp] POST /oauth2/token rejected: status=401 error=invalid_client \
+  error_description="invalid client_secret" client_auth="client_secret_basic" client_id=<id>
+```
+
+`client_auth` is the field that matters, and the reason this exists. A wrong secret and a
+client registered for the other auth method both come back `invalid_client`; the exchange
+is server to server, so nothing user-visible reports either; and before #61 this service
+logged only its boot lines, which is why spike #75 could not tell the two apart.
+
+Two things are deliberately **not** on that line. The secret, ever. And the `client_id` the
+request supplied — under Basic it shares one base64 blob with the secret, so it is compared
+against the registered id and the line says `client_id=<the registered id>` or
+`client_id=(not the registered client)` instead of echoing it.
+
+One more trap, measured: the `authorization_code` grant consumes the code **before** it
+authenticates the client. Reproducing a client-auth failure by hand with a placeholder code
+returns `invalid_grant: invalid code` and never reaches the check. Use a real code, or ask
+`/oauth2/introspect`, which authenticates the client first.
 
 ### ⚠️ The secret is printed exactly once
 
@@ -147,7 +214,7 @@ Custom OAuth 2.0 provider, from the output of the script above:
 | Client secret | as printed **at creation or by `--rotate`**; it is not retrievable afterwards |
 | Authorize URL | `https://<idp-host>/oauth2/authorize` |
 | Token URL | `https://<idp-host>/oauth2/token` |
-| Client authentication | credentials in the token request body (`client_secret_post`) |
+| Client authentication | **`client_secret_basic`** — the dashboard default. Leave it alone. Anything else is refused with `invalid_client` before the secret is checked. |
 | **PKCE** | **enable it**, `S256`. Arcade defaults PKCE off; this client requires it. A mismatch fails at the authorize step, where no hook fires and nothing on the panel says why. |
 | Scopes | `openid profile email offline_access` |
 | User info endpoint | `https://<idp-host>/oauth2/userinfo`, bearer token |

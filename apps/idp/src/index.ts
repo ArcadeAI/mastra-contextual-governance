@@ -180,6 +180,100 @@ async function handleConsent(request: Request): Promise<Response> {
   );
 }
 
+/**
+ * The token endpoint, named once. Everything else Better Auth serves goes
+ * through the catch-all below; this one path is wrapped so a rejection leaves
+ * a line behind.
+ */
+const TOKEN_PATH = "/oauth2/token";
+
+/** RFC 7235 scheme token, so a garbage `Authorization` header is reported as garbage. */
+const AUTH_SCHEME = /^([!#$%&'*+\-.^_`|~0-9A-Za-z]{1,32})(?=\s|$)/;
+
+/** The `Authorization` header and the form body of one token request, read once. */
+interface TokenRequest {
+  authorization: string | null;
+  form: URLSearchParams;
+}
+
+/**
+ * Which client authentication method the request actually used, classified the
+ * same way `@better-auth/oauth-provider` classifies it
+ * (`extractClientCredentials`): assertion first, then the `Authorization`
+ * header, then credentials in the form body, then a bare `client_id`.
+ *
+ * This is the field spike #75 went looking for and could not find. A client
+ * registered for one method and sending the other is refused with
+ * `invalid_client` **before the secret is checked**, so from the outside it is
+ * indistinguishable from a wrong secret — and the caller is Arcade, server to
+ * server, with nothing user-visible to report it.
+ */
+function observedClientAuth({ authorization, form }: TokenRequest): string {
+  if (form.get("client_assertion") || form.get("client_assertion_type")) return "private_key_jwt";
+  if (authorization) {
+    const scheme = AUTH_SCHEME.exec(authorization)?.[1];
+    if (!scheme) return "authorization header: malformed";
+    return /^basic$/i.test(scheme) ? "client_secret_basic" : `authorization scheme: ${scheme}`;
+  }
+  if (form.get("client_id") && form.get("client_secret")) return "client_secret_post";
+  if (form.get("client_id")) return "none";
+  return "absent";
+}
+
+/**
+ * The `client_id` the request claims, from wherever it put it. Used only to
+ * compare against the registered one — see `logTokenFailure` for why the value
+ * itself never reaches the log.
+ */
+function requestClientId({ authorization, form }: TokenRequest): string | null {
+  if (authorization && /^Basic +/i.test(authorization)) {
+    try {
+      const decoded = Buffer.from(authorization.replace(/^Basic +/i, ""), "base64").toString("utf8");
+      const colon = decoded.indexOf(":");
+      if (colon === -1) return null;
+      // Form-url-decoded, per RFC 6749 §2.3.1 — `+` is a space, not a plus.
+      // `decodeBasicCredentials` in @better-auth/core does the same, and this
+      // has to classify the id the same way the plugin resolves it.
+      return new URLSearchParams(`v=${decoded.slice(0, colon)}`).get("v");
+    } catch {
+      return null;
+    }
+  }
+  return form.get("client_id");
+}
+
+/**
+ * One line per `/oauth2/token` rejection: the status, the OAuth error, its
+ * description, and the client authentication method the caller used.
+ *
+ * That last field is the whole point. Before it, a refusal here was a two-way
+ * question nobody could answer from outside — a wrong secret and a client
+ * registered for the other auth method produce the same `invalid_client`, and
+ * this service logged only its boot lines (#75).
+ *
+ * **No secret is ever on this line, structurally.** The client id is not echoed
+ * from the request either: under Basic it lives in the same base64 blob as the
+ * secret, and a caller that swapped the two fields would have us print one. So
+ * the request's id is compared against the registered one and the line says
+ * which of the two it was — enough to tell "Arcade is pointed at a different
+ * client" from "Arcade has the wrong secret", which is the question anyone
+ * reading this line is asking.
+ */
+async function logTokenFailure(token: TokenRequest, response: Response, registeredClientId: string) {
+  const body = (await response.clone().json().catch(() => null)) as
+    | { error?: string; error_description?: string }
+    | null;
+  const claimed = requestClientId(token);
+
+  console.log(
+    `[${SERVICE}] POST ${TOKEN_PATH} rejected: status=${response.status} ` +
+      `error=${body?.error ?? "(none)"} ` +
+      `error_description=${JSON.stringify(body?.error_description ?? "(none)")} ` +
+      `client_auth=${JSON.stringify(observedClientAuth(token))} ` +
+      `client_id=${claimed === registeredClientId ? registeredClientId : "(not the registered client)"}`,
+  );
+}
+
 const server = Bun.serve({
   port: config.port,
   idleTimeout: 60,
@@ -200,6 +294,13 @@ const server = Bun.serve({
           userinfo: `${config.baseURL}/oauth2/userinfo`,
           jwks: `${config.baseURL}${JWKS_PATH}`,
           id_token_signing_alg: ID_TOKEN_ALG,
+          // What the client row registers for at the token endpoint, and
+          // therefore the one value the Arcade dashboard's "client
+          // authentication" field may hold. Reported because the reconcile in
+          // `ensureOAuthClient` is otherwise invisible: a row still on
+          // `client_secret_post` fails server-to-server, fires no hook, and
+          // leaves the panel dark (#61).
+          token_endpoint_auth_method: client.tokenEndpointAuthMethod,
           // What happened to the stored client secret when this process
           // booted. `rotated` is the one that costs a human a re-registration
           // in the Arcade dashboard, and #70 exists because that is otherwise
@@ -229,6 +330,26 @@ const server = Bun.serve({
       );
     }
 
+    // The token endpoint, wrapped only to leave a line behind when it says no.
+    // The response itself is whatever Better Auth returned, byte for byte.
+    if (request.method === "POST" && pathname === TOKEN_PATH) {
+      // Read once and re-issued rather than cloned: a token request is one
+      // small form post per authorization, and the handler needs an
+      // undisturbed body whether or not anything ends up being logged.
+      const body = await request.text();
+      const response = await auth.handler(
+        new Request(request.url, { method: "POST", headers: request.headers, body }),
+      );
+      if (response.status >= 400) {
+        await logTokenFailure(
+          { authorization: request.headers.get("authorization"), form: new URLSearchParams(body) },
+          response,
+          client.clientId,
+        );
+      }
+      return response;
+    }
+
     // Everything else is Better Auth: /oauth2/*, /.well-known/*, /sign-in/*, ...
     return auth.handler(request);
   },
@@ -249,3 +370,16 @@ console.log(
 const secretLine = `[${SERVICE}] OAuth client secret: ${CLIENT_SECRET_STATE_MESSAGE[client.secretState]}`;
 if (client.secretState === "rotated") console.error(secretLine);
 else console.log(secretLine);
+
+// The other thing that can cost a human a field in the Arcade dashboard, and
+// the one this boot may just have changed underneath them. On stderr for the
+// same reason the rotation line is: `render logs` shows it without anyone
+// having to know to look.
+if (client.authMethodReconciled) {
+  console.error(
+    `[${SERVICE}] OAuth client token auth method reconciled to ` +
+      `${client.tokenEndpointAuthMethod} (#61). The Arcade cg-idp provider's ` +
+      `"client authentication" must now be ${client.tokenEndpointAuthMethod} — ` +
+      `the credentials are unchanged, and the other form is refused with invalid_client.`,
+  );
+}

@@ -416,15 +416,22 @@ describe("a pre-#70 disk, booted the way Render boots it", () => {
       ).headers.get("location")!;
     }
 
+    // HTTP Basic, RFC 6749 §2.3.1: the fixture row is registered
+    // `client_secret_post`, and the boot under test reconciles it to
+    // `client_secret_basic` (#61) without touching the credentials. So this is
+    // both halves of the upgrade at once — the migrated secret, sent the new
+    // way, against a row that arrived registered for the old one.
+    const half = (value: string) => new URLSearchParams({ v: value }).toString().slice(2);
     return fetch(`${baseUrl}/oauth2/token`, {
       method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        authorization: `Basic ${Buffer.from(`${half(clientId)}:${half(clientSecret)}`).toString("base64")}`,
+      },
       body: new URLSearchParams({
         grant_type: "authorization_code",
         code: new URL(location).searchParams.get("code")!,
         redirect_uri: REDIRECT_URI,
-        client_id: clientId,
-        client_secret: clientSecret,
         code_verifier: verifier,
       }),
     });
@@ -452,6 +459,10 @@ describe("a pre-#70 disk, booted the way Render boots it", () => {
 
       // The proof that the Arcade registration survived: the credentials a
       // human typed into the dashboard on #13 complete a whole flow.
+      // The pre-#70 row also arrives registered `client_secret_post`; #61
+      // reconciles it here, on the same boot, without a rotation.
+      expect(booted.health.oauth.token_endpoint_auth_method).toBe("client_secret_basic");
+
       const token = await completeFlow(booted.baseUrl, REGISTERED_CLIENT_ID, REGISTERED_CLIENT_SECRET);
       expect(token.status).toBe(200);
       expect(((await token.json()) as { id_token?: string }).id_token).toBeTruthy();
