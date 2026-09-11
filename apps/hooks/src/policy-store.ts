@@ -118,7 +118,12 @@ export function loadSeed(options: SeedOptions, raw: unknown = fixture): Seed {
 
   const subjects = parsed.subjects.map(({ persona, ...subject }) => {
     const override = options.personaEmails[persona.toLowerCase()];
-    const input: SubjectInput = { ...subject, user_id: override ?? subject.user_id };
+    // Lowercased on the way in (#58), by the same rule `subjectKey` applies on
+    // the way out: `PERSONA_<KEY>_EMAIL` carries whatever capitalisation the
+    // Arcade account was invited under, and a roster keyed on `Dana.Okafor@…`
+    // is a roster the lookup can never hit.
+    const user_id = (override ?? subject.user_id).trim().toLowerCase();
+    const input: SubjectInput = { ...subject, user_id };
     return Subject.parse(input);
   });
 

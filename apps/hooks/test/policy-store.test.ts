@@ -66,6 +66,19 @@ describe("the seed", () => {
     expect(data.subjects.find((s) => s.display_name === "Sam Reyes")?.user_id).toBe("sam.reyes@bank.example");
   });
 
+  // #58. The override carries whatever capitalisation the Arcade account was
+  // invited under, and `apps/idp` now stores the same person lowercase. A
+  // roster seeded `Dana.Okafor@…` would be one `subjectKey` can never hit, so
+  // every call Dana makes would be denied as an unregistered subject.
+  test("lowercases the address a PERSONA_<KEY>_EMAIL override carries", () => {
+    const data = loadSeed({ ...OPTIONS, personaEmails: { dana: "Dana.Okafor@MegaForce.Tech" } });
+
+    expect(data.subjects.find((s) => s.display_name === "Dana Okafor")?.user_id).toBe(
+      "dana.okafor@megaforce.tech",
+    );
+    expect(data.subjects.every((s) => s.user_id === s.user_id.toLowerCase())).toBe(true);
+  });
+
   test("keys every rule and the catalogue on the configured toolkit names, not on literals", () => {
     const data = loadSeed({ ...OPTIONS, loanToolkit: "LoanBook", approvalsToolkit: "Escalations" });
     expect(Object.keys(data.catalogue).sort()).toEqual(["Escalations", "LoanBook"]);
