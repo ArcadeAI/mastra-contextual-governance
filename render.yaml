@@ -19,13 +19,28 @@
 # Services with disks give up zero-downtime deploys — Render stops the old
 # instance before starting the new one. Irrelevant for a demo.
 #
-# Cross-service addresses are host-form, derived with `fromService`. Never
-# hardcode an onrender.com URL here: those subdomains are global, so a taken
-# service name gets silently suffixed and the hardcoded value would then
-# address somebody else's service. Confirmed the hard way — `cg-web` was
-# already taken on the first sync of this blueprint.
+# Cross-service addresses are host-form, and every one of them is `sync: false`:
+# the value is READ OFF THE RENDER SERVICE PAGE, never derived and never
+# guessed. Two measurements say why, and they pull in opposite directions.
 #
-# Secrets are `sync: false`, so a blueprint sync prompts for them instead of
+# Guessing is wrong because onrender.com subdomains are global, so a taken
+# service name gets silently suffixed: in the live environment `cg-web` is
+# `cg-web-sa31` and `cg-idp` is `cg-idp-or5b`. Hardcoding `cg-web.onrender.com`
+# would have addressed a stranger's deployment, and for a while the loan API
+# was validating bearer tokens against a colleague's IdP.
+#
+# Deriving is wrong because `fromService … property: host` emits the BARE
+# SERVICE NAME, not the hostname — measured 2026-09-10 on #59. `IDP_PUBLIC_HOST`
+# arrived as `cg-idp-or5b`, consumers prepend a scheme and nothing else, and
+# every request went to `https://cg-idp-or5b/…` where DNS fails. Blueprints have
+# no string interpolation, so no expression here can add `.onrender.com`.
+#
+# What is left is the value a human copies from the service's page, once per
+# environment. Each consumer refuses a host that still looks like a bare service
+# name at boot (`apps/*/…/public-host.ts`), so a wrong one fails loudly and
+# immediately rather than as a network error against a healthy dependency.
+#
+# Secrets are `sync: false` too, so a blueprint sync prompts for them instead of
 # putting them in git. See `.env.example` for where to obtain each one.
 
 services:
@@ -57,13 +72,13 @@ services:
       - key: LOANS_DB_PATH
         value: /data/loans.db
       # Where bearer tokens are validated: the API asks this host's
-      # /oauth2/userinfo who the caller is. Derived from cg-idp the same way
-      # the other cross-service hosts are — host-form, consumer adds https.
+      # /oauth2/userinfo who the caller is. Host-form, consumer adds https.
+      # Read it off the cg-idp service page in the Render dashboard — in the
+      # live environment that is `cg-idp-or5b.onrender.com`, not `cg-idp`. See
+      # the note at the top of this file; the service refuses an address it
+      # could not reach at boot.
       - key: IDP_PUBLIC_HOST
-        fromService:
-          name: cg-idp
-          type: web
-          property: host
+        sync: false
 
   # The control plane. Serves /access, /pre and /post to Arcade Cloud, owns the
   # policy and audit database, and fans decisions out to the UI over SSE.
@@ -127,17 +142,13 @@ services:
         sync: false
       - key: PERSONA_MORGAN_EMAIL
         sync: false
-      # `fromService` emits a bare host, never a scheme, and blueprints have
-      # no string interpolation — so the contract for cross-service addresses
-      # is host-form and the consumer adds the scheme. Deriving it beats
-      # writing the hostname out: onrender.com subdomains are global, so a
-      # taken name gets silently suffixed and a hardcoded URL would then
-      # point at a stranger's service.
+      # Host-form, consumer adds the scheme — `fromService` emits neither a
+      # scheme nor a hostname, and blueprints have no string interpolation. Read
+      # it off the cg-loan-app service page in the Render dashboard. See the
+      # note at the top of this file; the service refuses an unreachable value
+      # at boot.
       - key: LOAN_APP_PUBLIC_HOST
-        fromService:
-          name: cg-loan-app
-          type: web
-          property: host
+        sync: false
 
   # The enterprise's identity provider — a demo fixture standing in for the
   # real one. Better Auth as an OAuth 2.1 authorization server, with the login
@@ -236,8 +247,10 @@ services:
       # service env vars at runtime — the value would be empty at build time
       # and the browser would get `undefined`. The control-plane panel gets
       # this host from a server component as a prop instead (#21).
+      #
+      # Read it off the cg-hooks service page in the Render dashboard. This one
+      # is the worst of the three to get wrong: the value reaches the browser,
+      # so a bare service name fails in a visitor's DevTools rather than in a
+      # log. `apps/web/lib/public-host.ts` refuses one before that.
       - key: HOOKS_PUBLIC_HOST
-        fromService:
-          name: cg-hooks
-          type: web
-          property: host
+        sync: false

@@ -8,6 +8,8 @@
  * perfectly fine under `next dev` — a difference that shows up first on stage.
  * The panel takes its stream address as a prop instead.
  */
+import { assertPublicHost } from "../public-host.ts";
+
 
 /** The no-backend stream, served by this app from #5's fixture sequence. */
 export const FIXTURE_STREAM_PATH = "/api/governance/fixture-stream";
@@ -41,6 +43,12 @@ function baseUrl(host: string): string {
 export function governanceStreamSource(
   env: Readonly<Record<string, string | undefined>>,
 ): StreamSource {
+  // Checked whichever mode wins. A bare service name is wrong the moment it is
+  // set, and this is the address the *browser* is handed — so the alternative
+  // to refusing here is a failed EventSource in a visitor's console. See
+  // `../public-host.ts`.
+  assertPublicHost("HOOKS_PUBLIC_HOST", env["HOOKS_PUBLIC_HOST"]);
+
   const host = env["HOOKS_PUBLIC_HOST"]?.trim();
 
   if (env["GOVERNANCE_STREAM"]?.trim() === "hooks" && host !== undefined && host !== "") {

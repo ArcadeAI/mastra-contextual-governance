@@ -10,6 +10,8 @@
  * boot instead of letting the demo run and enforce nothing.
  */
 
+import { assertPublicHost } from "./public-host.ts";
+
 /**
  * The bearer token Arcade presents on every hook call. Refused under
  * NODE_ENV=production — Render prompts for the real one (`sync: false`).
@@ -80,6 +82,14 @@ export function readConfig(env: Record<string, string | undefined> = process.env
   if (!storeToken && env.NODE_ENV === "production") {
     throw new Error("APPROVALS_STORE_TOKEN is required in production");
   }
+
+  // Checked here and returned nowhere, deliberately. `render.yaml` sets
+  // `LOAN_APP_PUBLIC_HOST` on this service and nothing reads it until #16's
+  // redaction work needs the loan book — but the value is wrong from the
+  // moment it is set, and #59 is the record of what that costs when it is
+  // only discovered at the first call. This is the single place the service
+  // reads its environment, so it is the place to say so.
+  assertPublicHost("LOAN_APP_PUBLIC_HOST", env.LOAN_APP_PUBLIC_HOST);
 
   const personaEmails: Record<string, string> = {};
   for (const [key, value] of Object.entries(env)) {
