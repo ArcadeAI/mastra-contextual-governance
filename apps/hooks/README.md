@@ -7,6 +7,7 @@ contextual-access hooks, and records every decision it makes.
 POST /access   which tools this user may see       → { deny: Toolkits }
 POST /pre      may this user make this call         → { code: OK | CHECK_FAILED, error_message? }
 POST /post     pass-through until #16               → { code: OK }
+GET  /audit    the audit log, filtered              → { rows, count, total, limit, filters }
 GET  /events   the live governance stream           → text/event-stream   (no auth)
 GET  /health   policy revision, row counts, 503 while failing closed   (no auth)
 
@@ -16,7 +17,8 @@ GET  /approvals/{id}          read one by opaque id — what the approval page i
 POST /approvals/{id}/decision record an outcome
 ```
 
-Every hook endpoint requires `Authorization: Bearer $ARCADE_HOOK_SIGNING_SECRET`. Request and
+Every hook endpoint requires `Authorization: Bearer $ARCADE_HOOK_SIGNING_SECRET`, and so does
+`GET /audit` — same secret, because the rows it returns are the record those three wrote. Request and
 response bodies are the generated types in `@cg/policy-schema` — `deny` takes the request's
 `Toolkits` shape down to the innermost array of versions, which spike #2 measured is the one
 shape that does not take every tool in the project down with it.
@@ -269,6 +271,63 @@ The CORS preflight is not optional and is not cosmetic: the panel sends `cache-c
 its first connect and `last-event-id` on every resume, neither of which is a CORS-safelisted
 request header, so the browser asks first. Without the `OPTIONS` handler the panel cannot
 connect in a browser at all while every server-side test still passes.
+
+## Reading the log over HTTP (#62)
+
+`GET /audit` answers "what did the control plane decide, and why" without a shell on the
+Render disk. Before it existed, establishing that an `/access` burst was 8,259 denials for an
+org admin rather than a runaway loop meant hand-writing a `bun:sqlite` query against
+`/data/governance.db`.
+
+```sh
+curl -fsS -H "authorization: Bearer $ARCADE_HOOK_SIGNING_SECRET" \
+  "https://$HOOKS_PUBLIC_HOST/audit?user_id=dana.okafor@bank.example&hook=pre&decision=deny&limit=20"
+```
+
+```json
+{ "rows": [ { "id": "evt_4k7xq2m9hz", "ts": "…", "hook": "pre", "decision": "deny", … } ],
+  "count": 20, "total": 137, "limit": 20, "order": "newest_first",
+  "filters": { "user_id": "dana.okafor@bank.example", "hook": "pre", "decision": "deny" } }
+```
+
+`rows` are `audit_log` rows exactly as the table holds them — the same `GovernanceEvent` the
+stream carries, including `before` and `after`, **not** the panel's derived shape. Someone
+asking what was decided should get the record, not a summary of it.
+
+| filter | matches |
+|---|---|
+| `user_id` | the acting persona, case-insensitively — nothing normalises what Arcade puts on a payload |
+| `tool` | the stored `Toolkit.Tool` exactly: `Loan.GetLoan`, never `get_loan` |
+| `hook` | `access`, `pre` or `post` |
+| `decision` | `allow`, `deny` or `modify` |
+| `since` | rows at or after an ISO 8601 instant; a bare `2026-09-10` is normalised to midnight UTC |
+| `limit` | 1..1000, default 100 |
+
+They are ANDed. `order` is always newest first.
+
+**Three refusals, and they are the same refusal.** A filter that does not do what its author
+thinks it does is this project's recurring failure — a rule keyed on `get_loan` matches
+nothing, and nothing is indistinguishable from permitted — and the trap is one query string
+away here:
+
+- **An unknown query parameter is a `400`**, not an ignored one. `?toolname=…` answered
+  with the unfiltered log is a reviewer concluding the whole log is one tool's decisions.
+- **A `limit` over 1000 is a `400`**, not a clamp. Clamping answers a question nobody asked
+  and looks like an answer to the one they did. So is `hook=preflight` or
+  `decision=denied`: a misspelled value must not come back as an empty page.
+- **`total` is counted without the limit**, so a page that stops at the bound still says how
+  many rows matched. That is the difference between 8,259 denials and a runaway loop.
+
+The bearer is the **hook** secret, not the approvals store's. Reasons on these rows say more
+than the model was told — which grants were examined and rejected, who an escalation was
+routed to and who was not asked — and from #16 a `before` will carry an unredacted account
+number. That is also why this endpoint has a bearer where `/events` deliberately does not:
+nothing here is fetched from a browser, so nothing here has to ship a token to one.
+
+The read goes to the database handle directly and never to the policy cache's. The hook path
+is served from memory and stays that way; `test/audit-api.test.ts` counts zero queries on the
+cache's handle across twenty `/audit` calls, next door to the test that counts zero across
+twenty warm hook calls.
 
 ## The correlation token (#6)
 
