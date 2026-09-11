@@ -160,6 +160,14 @@ registration in the Arcade dashboard goes stale right before you present. Its re
 keeps the client; see [`apps/idp/README.md`](./apps/idp/README.md), including how to
 print the credentials and what to enter in Arcade.
 
+**Email is the join key, and it is case-insensitive.** `apps/idp` and `apps/hooks`
+lowercase the addresses they seed, `apps/loan-app` lowercases the one `/oauth2/userinfo`
+returns, and the pre-hook folds case on the `user_id` Arcade sends. So the four
+`PERSONA_*_EMAIL` values can be typed in whatever case the Arcade invites used — the
+three databases still describe one person. Before #58 they could not: a persona
+configured with a capital letter was one nobody could log in as, and the login page
+called it a wrong password.
+
 ## Two things that will bite you
 
 **Zod is pinned to 3.25.76.** Zod 4 changes internals the Arcade/Mastra path does
