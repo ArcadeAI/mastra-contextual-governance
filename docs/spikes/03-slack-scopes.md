@@ -7,7 +7,7 @@ payload succeeded with that token and renders in Slack as the user, not as a bot
 
 **Decision: act 2 posts as the requester.** No custom Slack app, no bot fallback.
 
-Resolves [#3](https://github.com/ArcadeAI/mastra-contextual-governance/issues/3).
+Resolves [#3](https://github.com/ArcadeAI-labs/mastra-contextual-governance/issues/3).
 Clears open risk 3 in `DESIGN.md`. Unblocks #18.
 
 **Reproduced.** Run end to end on 2026-09-02 against the same throwaway project spike 02 used,

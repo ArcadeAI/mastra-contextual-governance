@@ -39,7 +39,7 @@ once.
 - Orca Run: `run_c30937cd1e39`. Bind with
   `orca orchestration run-use --id run_c30937cd1e39 --json`. If it is gone,
   create a new one and update this file.
-- GitHub: `ArcadeAI/mastra-contextual-governance`. PRD is issue #1.
+- GitHub: `ArcadeAI-labs/mastra-contextual-governance`. PRD is issue #1.
 - Design record: `DESIGN.md`. You may edit it to *record* decisions already
   made and to groom. Anything with meaningful architectural impact **gates
   first**, then gets written.
@@ -69,7 +69,7 @@ once.
 ## Start here
 
 1. `orca status --json`; bind the Run.
-2. `gh issue list --repo ArcadeAI/mastra-contextual-governance --state open
+2. `gh issue list --repo ArcadeAI-labs/mastra-contextual-governance --state open
    --json number,title,body` and rebuild the DAG from each issue's "Blocked by".
    An issue is ready when every blocker is closed. **Re-derive this every wave**
    rather than trusting memory; numbers drift and issues get added.
