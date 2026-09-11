@@ -51,14 +51,19 @@ export function redirect(location: string, headers = new Headers()): Response {
 /**
  * What `/health` would have said, said to whoever hit the route instead.
  *
- * A missing variable is not a 500: it is an operational state with a named
- * cause, and the person looking at this screen is the person who can fix it.
+ * A misconfigured variable is not a 500: it is an operational state with a
+ * named cause, and the person looking at this screen is the person who can fix
+ * it. Each problem is a whole sentence from `lib/config.ts`, not a variable
+ * name, because one of them is not a name — a `SESSION_SECRET` that is set but
+ * too short has to say why, or a human reads "SESSION_SECRET" and goes to look
+ * at a field that is already filled in.
  */
-export function notConfigured(what: string, missing: string[], headers = new Headers()): Response {
+export function notConfigured(what: string, problems: string[], headers = new Headers()): Response {
   return page(
     `${what} is not configured`,
-    `<p>${escapeHtml(missing.join(", "))} ${missing.length > 1 ? "are" : "is"} not set on this service.</p>` +
-      `<p><code>GET /health</code> reports which of <code>signin</code>, <code>gateway</code> and ` +
+    `<p>This deployment cannot do that yet:</p><ul>` +
+      problems.map((problem) => `<li>${escapeHtml(problem)}</li>`).join("") +
+      `</ul><p><code>GET /health</code> reports which of <code>signin</code>, <code>gateway</code> and ` +
       `<code>verifier</code> this deployment has. See <code>apps/web/README.md</code> for where each value comes from.</p>`,
     503,
     headers,

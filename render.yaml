@@ -265,10 +265,18 @@ services:
       - key: IDP_CLIENT_SECRET
         sync: false
       # Seals the per-browser session cookie (AES-256-GCM), which carries the
-      # persona's email and their gateway access and refresh tokens. Any string;
-      # `openssl rand -hex 32` produces one. There is deliberately no fallback in
-      # the code — an unset value stops sign-in rather than weakening it — and
-      # rotating it signs every browser out.
+      # persona's email and their gateway access and refresh tokens. Run
+      # `openssl rand -hex 32` and paste the result; nothing else produces a
+      # value this service will accept.
+      #
+      # At least 32 characters, and at least 8 distinct ones. That floor is
+      # enforced, not advised: below it /health reports signin, gateway and
+      # verifier all `missing` and every identity route answers 503 naming the
+      # minimum. `SESSION_SECRET=x` used to be accepted, and a guessable key
+      # over two bearer tokens with every surface reporting `configured` is the
+      # silent control this project argues against.
+      #
+      # Rotating it signs every browser out. That is the whole blast radius.
       - key: SESSION_SECRET
         sync: false
       # This service's own public origin, as a URL with the scheme. Every OAuth
@@ -282,11 +290,36 @@ services:
       # for anything but an http:// loopback value).
       - key: PUBLIC_URL
         sync: false
-      # Not set here, on purpose. ARCADE_CLOUD_URL (where `confirm_user` lives,
-      # https://cloud.arcade.dev) and IDP_SCOPES ("openid email") are correct by
-      # default and exist only so a test can point them at a stand-in. Listing
-      # them would make a blueprint sync prompt for two values nobody should
-      # change.
+      # The three below have working defaults in the code and are named here so
+      # the blueprint is the whole list rather than most of it. **Leave all
+      # three blank on cg-web**; each comment says the one case for setting it.
+      #
+      # What sign-in asks cg-idp for. Defaults to `openid email`. `email` is the
+      # join key between Arcade's user_id, the OAuth subject and the loan book's
+      # actor column, so a value here that omits it breaks identity rather than
+      # narrowing it. Set it only to ask for more, never fewer.
+      - key: IDP_SCOPES
+        sync: false
+      # Where `confirm_user` lives, which is NOT api.arcade.dev. Defaults to
+      # https://cloud.arcade.dev, measured on spike #75. It exists so a test can
+      # point the verifier's two calls at a stand-in without moving the
+      # gateway's; set it only if Arcade Cloud moves.
+      - key: ARCADE_CLOUD_URL
+        sync: false
+      # Pins the MCP client id hop 1 authorizes under, instead of letting cg-web
+      # register one dynamically per process. Blank is correct and is what this
+      # deployment starts with: there is no value to put here until a
+      # registration exists.
+      #
+      # The one reason to fill it in later: Arcade renders its gateway consent
+      # screen once per persona per MCP client id, so with this blank every
+      # redeploy costs each persona one more consent click. If that becomes a
+      # nuisance during rehearsal, pin it to a client id Arcade already knows.
+      # Whether the dashboard lists the dynamically-registered client is
+      # unmeasured — nobody has looked — so treat that as a thing to check
+      # before relying on it, not as an instruction.
+      - key: ARCADE_MCP_CLIENT_ID
+        sync: false
       #
       # One step is not an environment variable at all: the Arcade dashboard's
       # Auth → Settings → Custom verifier route must be

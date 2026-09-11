@@ -15,6 +15,7 @@
  * the browser needs down as props.
  */
 import { publicHost } from "./public-host.ts";
+import { sessionSecretProblem } from "./identity/seal.ts";
 
 /**
  * Who the browser is signed in as, and the two OAuth hops that follow from it.
@@ -170,6 +171,14 @@ function trimUrl(value: string | undefined): string {
  * half-configured identity is exactly that: the browser gets a persona label
  * and every tool call is made as somebody else. So each of these is checked at
  * the edge of the route that needs it and reported as `missing` here.
+ *
+ * **`missing` covers unusable as well as unset.** Round 1 of #84's review set
+ * `SESSION_SECRET=x` and got `{"signin":"configured"}` and a working sign-in —
+ * a session cookie holding two bearer tokens, sealed under a key anybody could
+ * guess, with every surface saying the deployment was fine. A capability that
+ * reports itself configured on a value it cannot safely use is the silent
+ * control this project exists to argue against, so the same check that decides
+ * whether a key may be derived decides what this function reports.
  */
 export interface IdentityReadiness {
   signin: "configured" | "missing";
@@ -178,24 +187,57 @@ export interface IdentityReadiness {
 }
 
 export function identityReadiness(config: IdentitySurface): IdentityReadiness {
-  const { identity } = config;
-  const signin = Boolean(
-    identity.idpIssuer && identity.idpClientId && identity.idpClientSecret &&
-      identity.sessionSecret && identity.publicUrl,
-  );
   return {
-    signin: signin ? "configured" : "missing",
-    // The gateway hop is driven by this service after sign-in, so it needs
-    // everything sign-in needs plus the gateway to authorize against.
-    gateway: signin && identity.gatewayId && config.arcadeApiUrl ? "configured" : "missing",
-    // The verifier reads the session and calls `confirm_user` with the project
-    // API key. It does not need client C — a browser that already has a session
-    // never reaches the IdP — but with no session it starts a sign-in, so in
-    // practice both matter and `/health` reports them separately.
-    verifier: identity.sessionSecret && identity.publicUrl && config.arcadeApiKey && identity.cloudUrl
-      ? "configured"
-      : "missing",
+    signin: signinProblems(config).length === 0 ? "configured" : "missing",
+    gateway: gatewayProblems(config).length === 0 ? "configured" : "missing",
+    verifier: verifierProblems(config).length === 0 ? "configured" : "missing",
   };
+}
+
+/**
+ * Everything wrong with this environment for signing somebody in, as sentences.
+ *
+ * Sentences rather than variable names because one of them is not a name: an
+ * unusable `SESSION_SECRET` needs to say *why* it is unusable and what a good
+ * one looks like, and "SESSION_SECRET" on its own would send a human to look at
+ * a field that is already filled in. The route that refuses renders this list
+ * and `/health` counts it, so the two can never disagree.
+ */
+export function signinProblems(config: IdentitySurface): string[] {
+  const { identity } = config;
+  const secret = sessionSecretProblem(identity.sessionSecret);
+  return [
+    ...(identity.idpIssuer ? [] : ["IDP_ISSUER is not set"]),
+    ...(identity.idpClientId ? [] : ["IDP_CLIENT_ID is not set"]),
+    ...(identity.idpClientSecret ? [] : ["IDP_CLIENT_SECRET is not set"]),
+    ...(identity.publicUrl ? [] : ["PUBLIC_URL is not set"]),
+    ...(secret ? [secret] : []),
+  ];
+}
+
+/** The gateway hop is driven after sign-in, so it needs everything sign-in needs. */
+export function gatewayProblems(config: IdentitySurface): string[] {
+  return [
+    ...signinProblems(config),
+    ...(config.identity.gatewayId ? [] : ["ARCADE_GATEWAY_ID is not set"]),
+    ...(config.arcadeApiUrl ? [] : ["ARCADE_API_URL is not set"]),
+  ];
+}
+
+/**
+ * The verifier reads the session and calls `confirm_user` with the project API
+ * key. It does not need client C — a browser that already has a session never
+ * reaches the IdP — but with no session it starts a sign-in, so `/health`
+ * reports the two separately and this list stays the narrower one.
+ */
+export function verifierProblems(config: IdentitySurface): string[] {
+  const secret = sessionSecretProblem(config.identity.sessionSecret);
+  return [
+    ...(config.identity.publicUrl ? [] : ["PUBLIC_URL is not set"]),
+    ...(config.arcadeApiKey ? [] : ["ARCADE_API_KEY is not set"]),
+    ...(config.identity.cloudUrl ? [] : ["ARCADE_CLOUD_URL is not set"]),
+    ...(secret ? [secret] : []),
+  ];
 }
 
 /**

@@ -73,8 +73,11 @@ describe("the seal", () => {
     }
   });
 
-  test("sealing without a secret is refused rather than done weakly", async () => {
-    expect(seal({ email: "dana" }, "")).rejects.toThrow(/SESSION_SECRET/);
+  test("sealing without a usable secret is refused rather than done weakly", async () => {
+    // Both arms, because only the first one existed until round 1 of #84's
+    // review — and `SESSION_SECRET=x` is the one a human produces.
+    expect(seal({ email: "dana" }, "")).rejects.toThrow(/SESSION_SECRET is not set/);
+    expect(seal({ email: "dana" }, "x")).rejects.toThrow(/at least 32 characters/);
   });
 });
 

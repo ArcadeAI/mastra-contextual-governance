@@ -22,15 +22,34 @@
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 
-import { identityReadiness, readWebConfig } from "../lib/config.ts";
+import { identityReadiness, readIdentitySurface, readWebConfig } from "../lib/config.ts";
 import { readSession } from "../lib/identity/session.ts";
+import { SESSION_SECRET_MIN_LENGTH, sessionSecretProblem } from "../lib/identity/seal.ts";
 import {
   Browser,
   PEOPLE,
+  SESSION_SECRET,
   signInAs,
   startIdentityHarness,
   type IdentityHarness,
 } from "./identity-harness.ts";
+
+/** Put `process.env` back exactly as it was, including keys that were unset. */
+function restoreEnv(previous: NodeJS.ProcessEnv, keys: string[]) {
+  for (const key of keys) {
+    if (previous[key] === undefined) delete process.env[key];
+    else process.env[key] = previous[key];
+  }
+}
+
+/**
+ * A `SESSION_SECRET` shaped like one a human would actually produce —
+ * `openssl rand -hex 32`. Written out rather than generated so a failure here
+ * is reproducible, and used everywhere a test needs a *usable* secret, because
+ * the placeholder `"x"` this file used to carry is now refused (and the test
+ * below is why).
+ */
+const GOOD_SECRET = "3f9a1c7e5b2d84069a1fe73c05b8d42e6c917ab3fd50e28c47196baf3d0c5e81";
 
 let harness: IdentityHarness;
 
@@ -502,7 +521,7 @@ describe("/health", () => {
       IDP_ISSUER: harness.idpUrl,
       IDP_CLIENT_ID: "c",
       IDP_CLIENT_SECRET: "s",
-      SESSION_SECRET: "x",
+      SESSION_SECRET: GOOD_SECRET,
       PUBLIC_URL: harness.webUrl,
     });
     expect(identityReadiness(signinOnly)).toEqual({
@@ -519,7 +538,7 @@ describe("/health", () => {
         IDP_ISSUER: harness.idpUrl,
         IDP_CLIENT_ID: "c",
         IDP_CLIENT_SECRET: "s",
-        SESSION_SECRET: "x",
+        SESSION_SECRET: GOOD_SECRET,
         PUBLIC_URL: harness.webUrl,
         ARCADE_GATEWAY_ID: "cg-demo-us",
         ARCADE_API_KEY: "k",
@@ -538,6 +557,148 @@ describe("/health", () => {
         else process.env[key] = previous[key];
       }
     }
+  });
+});
+
+
+describe("a SESSION_SECRET that is set but too weak", () => {
+  /**
+   * Round 1 of this PR's review, verbatim: with `NODE_ENV=production` and
+   * `SESSION_SECRET=x`, the built service reached `Ready`, `/health` answered
+   * `{"signin":"configured","gateway":"configured","verifier":"configured"}`
+   * and `GET /api/auth/signin?persona=dana` answered `303`. The cookie that
+   * sign-in would go on to write holds two bearer tokens.
+   *
+   * A refusal that only fires on an *absent* value misses the case a human
+   * actually produces, and every surface said the deployment was fine. These
+   * tests are that measurement, inverted.
+   */
+  const FILLED = {
+    IDP_ISSUER: "https://cg-idp-or5b.onrender.com",
+    IDP_CLIENT_ID: "client-c",
+    IDP_CLIENT_SECRET: "client-c-secret",
+    PUBLIC_URL: "https://cg-web-sa31.onrender.com",
+    ARCADE_GATEWAY_ID: "cg-demo-us",
+    ARCADE_API_KEY: "arcade-key",
+  };
+
+  test("the check itself: what is refused and what is not", () => {
+    const refused = [
+      undefined,
+      "",
+      "   ",
+      "x",
+      // Thirty-one characters: one short of the floor, which is the boundary
+      // a length check is most often written on the wrong side of.
+      "a".repeat(16) + "bcdefghijklmnop",
+      // Thirty-two characters and about one bit — length alone is satisfiable
+      // by padding, which is exactly what a human under time pressure types.
+      "x".repeat(32),
+      "abababababababababababababababab",
+    ];
+    for (const value of refused) {
+      const problem = sessionSecretProblem(value);
+      expect(problem).not.toBeNull();
+      // Every refusal names the minimum and how to produce one, because whoever
+      // reads it is about to go and set the value.
+      expect(problem).toContain(`at least ${SESSION_SECRET_MIN_LENGTH} characters`);
+      expect(problem).toContain("openssl rand -hex 32");
+    }
+    expect((refused[4] as string).length).toBe(SESSION_SECRET_MIN_LENGTH - 1);
+
+    // What a human is told to run, both forms, and the harness's own.
+    for (const value of [GOOD_SECRET, Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64"), SESSION_SECRET]) {
+      expect(sessionSecretProblem(value)).toBeNull();
+    }
+  });
+
+  test("the secret itself never appears in the refusal", () => {
+    const problem = sessionSecretProblem("hunter2")!;
+    expect(problem).not.toBeNull();
+    expect(problem).not.toContain("hunter2");
+    // The length is on the line, and that is deliberate: it is a property
+    // rather than the value, and without it "too short" is a refusal nobody
+    // can act on.
+    expect(problem).toContain("7 characters");
+  });
+
+  test("the limit of the check, stated rather than left to be discovered", () => {
+    // `hunter2` four times over is thirty-two characters with nine distinct
+    // ones, and this check accepts it. It is a length-and-variety floor, not an
+    // entropy estimate, and the alternative — a repetition detector, a
+    // dictionary, a zxcvbn dependency — buys a guess at strength in exchange
+    // for false refusals of real random values. The floor catches what a human
+    // under time pressure actually types (`x`, `changeme`, a padded string);
+    // it does not catch a passphrase someone constructed on purpose.
+    expect(sessionSecretProblem("hunter2-hunter2-hunter2-hunter2!")).toBeNull();
+  });
+
+  test("/health reports signin, gateway and verifier as missing", async () => {
+    const weak = readIdentitySurface({ ...FILLED, SESSION_SECRET: "x" });
+    expect(identityReadiness(weak)).toEqual({
+      signin: "missing",
+      gateway: "missing",
+      verifier: "missing",
+    });
+
+    // And through the route the reviewer actually curled.
+    const previous = { ...process.env };
+    try {
+      Object.assign(process.env, { ...FILLED, NODE_ENV: "production", SESSION_SECRET: "x" });
+      const { GET } = await import("../app/health/route.ts");
+      expect(await GET().json()).toEqual({
+        status: "ok",
+        service: "web",
+        signin: "missing",
+        gateway: "missing",
+        verifier: "missing",
+      });
+    } finally {
+      restoreEnv(previous, [...Object.keys(FILLED), "NODE_ENV", "SESSION_SECRET"]);
+    }
+  });
+
+  test("every identity route answers 503 over HTTP and names the minimum", async () => {
+    const weak = readIdentitySurface({ ...FILLED, SESSION_SECRET: "x" });
+    const { gatewayStart, signin, signinCallback, verify } = await import("../lib/identity/handlers.ts");
+
+    const server = Bun.serve({
+      port: 0,
+      fetch(request) {
+        const { pathname } = new URL(request.url);
+        if (pathname === "/api/auth/signin") return signin(request, weak);
+        if (pathname === "/api/auth/callback") return signinCallback(request, weak);
+        if (pathname === "/api/arcade/start") return gatewayStart(request, weak);
+        if (pathname === "/api/arcade/verify") return verify(request, weak);
+        return new Response("not found", { status: 404 });
+      },
+    });
+
+    try {
+      const base = `http://localhost:${server.port}`;
+      for (const path of [
+        "/api/auth/signin?persona=dana",
+        "/api/auth/callback?code=x&state=y",
+        "/api/arcade/start",
+        "/api/arcade/verify?flow_id=f1",
+      ]) {
+        const answer = await fetch(`${base}${path}`, { redirect: "manual" });
+        expect(answer.status).toBe(503);
+        const html = await answer.text();
+        expect(html).toContain(`at least ${SESSION_SECRET_MIN_LENGTH} characters`);
+        // No Set-Cookie: nothing was sealed on the way to refusing.
+        expect(answer.headers.getSetCookie()).toEqual([]);
+      }
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test("sealing under a weak secret is refused, so no route can get there by another path", async () => {
+    const { seal } = await import("../lib/identity/seal.ts");
+    expect(seal({ email: PEOPLE.dana.email }, "x")).rejects.toThrow(
+      new RegExp(`at least ${SESSION_SECRET_MIN_LENGTH} characters`),
+    );
   });
 });
 
@@ -575,7 +736,7 @@ describe("an unconfigured deployment", () => {
         IDP_ISSUER: harness.idpUrl,
         IDP_CLIENT_ID: "c",
         IDP_CLIENT_SECRET: "s",
-        SESSION_SECRET: "x",
+        SESSION_SECRET: GOOD_SECRET,
         PUBLIC_URL: harness.webUrl,
       });
       delete process.env.APPROVALS_STORE_TOKEN;

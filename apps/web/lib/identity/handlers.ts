@@ -32,7 +32,8 @@
  * Same environment, same file reading it; just without a guard that belongs to
  * a credential these routes do not present.
  */
-import { identityReadiness, readIdentitySurface, type IdentitySurface } from "../config.ts";
+import { gatewayProblems, readIdentitySurface, signinProblems, verifierProblems,
+  type IdentitySurface } from "../config.ts";
 import { clearLeg, clearSession, GATEWAY_COOKIE, PENDING_FLOW_COOKIE, readLeg, readSession,
   SIGNIN_COOKIE, writeLeg, writeSession, type GatewayLeg, type PendingFlow, type Session,
   type SigninLeg } from "./session.ts";
@@ -76,27 +77,6 @@ function redirectUri(config: IdentitySurface, path: string): string {
   return `${config.identity.publicUrl}${path}`;
 }
 
-/** The missing pieces of a capability, named individually so the page can list them. */
-function missingSignin(config: IdentitySurface): string[] {
-  const { identity } = config;
-  return [
-    ...(identity.idpIssuer ? [] : ["IDP_ISSUER"]),
-    ...(identity.idpClientId ? [] : ["IDP_CLIENT_ID"]),
-    ...(identity.idpClientSecret ? [] : ["IDP_CLIENT_SECRET"]),
-    ...(identity.sessionSecret ? [] : ["SESSION_SECRET"]),
-    ...(identity.publicUrl ? [] : ["PUBLIC_URL"]),
-  ];
-}
-
-function missingVerifier(config: IdentitySurface): string[] {
-  const { identity } = config;
-  return [
-    ...(identity.sessionSecret ? [] : ["SESSION_SECRET"]),
-    ...(identity.publicUrl ? [] : ["PUBLIC_URL"]),
-    ...(config.arcadeApiKey ? [] : ["ARCADE_API_KEY"]),
-  ];
-}
-
 // ---------------------------------------------------------------------------
 // Hop 0 — sign in as a person
 // ---------------------------------------------------------------------------
@@ -117,8 +97,8 @@ function missingVerifier(config: IdentitySurface): string[] {
  * rather than still signed in as the previous persona.
  */
 export async function signin(request: Request, config: IdentitySurface = readIdentitySurface()): Promise<Response> {
-  const missing = missingSignin(config);
-  if (missing.length > 0) return notConfigured("Sign-in", missing);
+  const problems = signinProblems(config);
+  if (problems.length > 0) return notConfigured("Sign-in", problems);
 
   const url = new URL(request.url);
   const headers = new Headers();
@@ -159,8 +139,8 @@ export async function signin(request: Request, config: IdentitySurface = readIde
  * hop 1.
  */
 export async function signinCallback(request: Request, config: IdentitySurface = readIdentitySurface()): Promise<Response> {
-  const missing = missingSignin(config);
-  if (missing.length > 0) return notConfigured("Sign-in", missing);
+  const problems = signinProblems(config);
+  if (problems.length > 0) return notConfigured("Sign-in", problems);
 
   const url = new URL(request.url);
   const leg = await readLeg<SigninLeg>(request, SIGNIN_COOKIE, config);
@@ -265,12 +245,8 @@ export function signout(request: Request, config: IdentitySurface = readIdentity
 
 /** `GET /api/arcade/start?next=` — begin the gateway authorization for the signed-in persona. */
 export async function gatewayStart(request: Request, config: IdentitySurface = readIdentitySurface()): Promise<Response> {
-  if (identityReadiness(config).gateway === "missing") {
-    return notConfigured("The gateway hop", [
-      ...missingSignin(config),
-      ...(config.identity.gatewayId ? [] : ["ARCADE_GATEWAY_ID"]),
-    ]);
-  }
+  const problems = gatewayProblems(config);
+  if (problems.length > 0) return notConfigured("The gateway hop", problems);
 
   const url = new URL(request.url);
   const next = safeNext(url.searchParams.get("next"), "/");
@@ -303,6 +279,13 @@ export async function gatewayStart(request: Request, config: IdentitySurface = r
 
 /** `GET /api/arcade/callback?code&state` — store the gateway token on this browser's session. */
 export async function gatewayCallback(request: Request, config: IdentitySurface = readIdentitySurface()): Promise<Response> {
+  // Checked here too, not only where the flow starts. Without a usable
+  // `SESSION_SECRET` the leg cookie cannot be opened, and the honest answer to
+  // "this authorization did not start here" would be that it did — the service
+  // just cannot read its own note. Say which it is.
+  const problems = gatewayProblems(config);
+  if (problems.length > 0) return notConfigured("The gateway hop", problems);
+
   const url = new URL(request.url);
   const leg = await readLeg<GatewayLeg>(request, GATEWAY_COOKIE, config);
   const headers = new Headers();
@@ -456,8 +439,8 @@ export async function verify(request: Request, config: IdentitySurface = readIde
     );
   }
 
-  const missing = missingVerifier(config);
-  if (missing.length > 0) return notConfigured("The custom verifier", missing);
+  const problems = verifierProblems(config);
+  if (problems.length > 0) return notConfigured("The custom verifier", problems);
 
   const session = await readSession(request, config);
   if (!session) {

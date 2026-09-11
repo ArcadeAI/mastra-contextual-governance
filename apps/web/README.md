@@ -70,8 +70,19 @@ sign-in that appears to work and then forgets.
 
 Encrypted rather than merely signed, because the value is a bearer token for the whole
 gateway and a signed-but-readable cookie would put it in the persona's own DevTools.
-There is no development fallback key: an unset `SESSION_SECRET` stops sign-in rather
-than weakening it.
+There is no development fallback key, and a weak one is refused as firmly as an
+absent one: `SESSION_SECRET` must be **at least 32 characters with at least 8 distinct
+ones**, or `/health` reports all three capabilities `missing` and every identity route
+answers `503` naming the minimum. 32 because the derived key is 256 bits and SHA-256
+does not add entropy — a shorter secret is the part an attacker has to guess; the
+distinct-character floor because length alone is satisfiable by padding.
+
+That is not hypothetical tidiness. Round 1 of #84's review set `SESSION_SECRET=x`,
+and the built service reached `Ready`, `/health` said `configured` three times, and
+every sign-in worked — under a key anybody could guess, protecting two bearer tokens.
+A refusal that fires only on an *absent* value misses the case a human produces.
+`lib/identity/seal.ts::sessionSecretProblem` is the single definition, used by the
+key derivation, by `/health` and by every route, so the three cannot disagree.
 
 One persona per browser is a design, not a limitation — on stage each persona runs in
 its own Chrome profile. Spike #75 named the trap: a verifier that reads a
@@ -140,16 +151,18 @@ reading this is trying to find out which step is outstanding.
 |---|---|
 | `IDP_ISSUER` | `apps/idp`'s public origin, **as a URL** — not the HOST-form the cross-service keys use |
 | `IDP_CLIENT_ID` / `IDP_CLIENT_SECRET` | client C, this service's own registration at the IdP |
-| `SESSION_SECRET` | seals the session cookie. No fallback. `openssl rand -hex 32` |
+| `SESSION_SECRET` | seals the session cookie. No fallback, and ≥32 characters / ≥8 distinct is enforced. `openssl rand -hex 32` |
 | `PUBLIC_URL` | this service's own origin, with the scheme. Every `redirect_uri` is built from it |
 | `ARCADE_GATEWAY_ID` | `cg-demo-us`, the User Source gateway hop 1 authorizes against |
 | `ARCADE_API_KEY` | the project key `confirm_user` is authenticated with |
 | `IDP_SCOPES` | defaults to `openid email`. `email` is the join key, so it is not optional |
 | `ARCADE_CLOUD_URL` | defaults to `https://cloud.arcade.dev`, which is **not** `ARCADE_API_URL`. A test seam |
-| `ARCADE_MCP_CLIENT_ID` | optional. Pins the gateway's MCP client id instead of registering one per process |
+| `ARCADE_MCP_CLIENT_ID` | optional, and blank is correct. Pins the gateway's MCP client id instead of registering one per process |
 
-Every one of them is in `.env.example` with where the value comes from, and the first
-six are `sync: false` on `cg-web` in `render.yaml`.
+Every one of them is in `.env.example` and is a `sync: false` entry on `cg-web` in
+`render.yaml`. The first six a human sets; the last three have working defaults and
+should be left blank — they are named in the blueprint so it is the whole list rather
+than most of it.
 
 Two steps are not environment variables on this service:
 

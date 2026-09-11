@@ -15,6 +15,12 @@
  *   development fallback. A default key in this file would be a key everyone
  *   has, and the failure it prevents — an unset variable — is one that should
  *   stop the service rather than quietly weaken it.
+ * - **And the environment has to supply a real one.** `SESSION_SECRET=x` was
+ *   accepted until round 1 of #84's review: `/health` said `configured`, the
+ *   built service reached `Ready`, and every sign-in worked — under a key
+ *   anybody could guess, protecting two bearer tokens. A refusal that only
+ *   fires on an *absent* value is a refusal that misses the case a human
+ *   actually produces. See `sessionSecretProblem`.
  * - **Version-tagged.** `v1.` prefixes every value, so a format change is a
  *   session that fails to open rather than a payload parsed under the wrong
  *   rules.
@@ -50,15 +56,82 @@ const IV_BYTES = 12;
 export const CHUNK_LIMIT = 3500;
 
 /**
+ * The floor on `SESSION_SECRET`, in characters.
+ *
+ * 32, because the key derived below is 256 bits and a secret shorter than the
+ * key it stretches into is the part an attacker actually has to guess — SHA-256
+ * does not add entropy, it only fixes the length. `openssl rand -hex 32` gives
+ * 64 characters and `openssl rand -base64 32` gives 44; both clear this
+ * comfortably, and both are what the documentation tells a human to run.
+ *
+ * Counted in characters rather than bytes deliberately. The value is typed into
+ * a dashboard field by a person, so characters are the unit they can see, and a
+ * 32-character value can only ever be *fewer* than 32 bytes of entropy — never
+ * more. Erring that way is the safe direction.
+ */
+export const SESSION_SECRET_MIN_LENGTH = 32;
+
+/**
+ * And a floor on how many distinct characters those are.
+ *
+ * Length alone is satisfiable by padding: `xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` is
+ * thirty-two characters and about one bit. Eight distinct characters is a floor
+ * no random value trips over — hex draws from sixteen symbols and base64 from
+ * sixty-four, and over 44+ characters both produce far more than eight — while
+ * catching the one thing a human under time pressure actually types.
+ *
+ * It is not an entropy estimate and does not pretend to be. It is the cheapest
+ * check that separates "a random value" from "a value padded to a length".
+ */
+export const SESSION_SECRET_MIN_DISTINCT = 8;
+
+/**
+ * What is wrong with a `SESSION_SECRET`, in a sentence, or `null` if nothing is.
+ *
+ * One function so the refusal a route renders, the field `/health` reports and
+ * the error `seal()` throws cannot disagree about what a usable secret is. The
+ * message always names the minimum and the command that produces one, because
+ * whoever reads it is about to go and set the value.
+ *
+ * **The secret itself is never in the message.** Its length is — that is a
+ * property, not the value, and without it "too short" is a refusal nobody can
+ * act on.
+ */
+export function sessionSecretProblem(secret: string | undefined): string | null {
+  const value = secret?.trim() ?? "";
+  const remedy =
+    `it must be at least ${SESSION_SECRET_MIN_LENGTH} characters of random material — ` +
+    "`openssl rand -hex 32` produces one";
+
+  if (!value) return `SESSION_SECRET is not set: ${remedy}`;
+  if (value.length < SESSION_SECRET_MIN_LENGTH) {
+    return `SESSION_SECRET is ${value.length} character${value.length === 1 ? "" : "s"}: ${remedy}`;
+  }
+  if (new Set(value).size < SESSION_SECRET_MIN_DISTINCT) {
+    return (
+      `SESSION_SECRET is long enough but uses only ${new Set(value).size} distinct ` +
+      `characters, which is a value padded to a length rather than a random one: ${remedy}`
+    );
+  }
+  return null;
+}
+
+/**
  * The AES key for a secret.
  *
  * SHA-256 over a domain-separated copy of the secret, so `SESSION_SECRET` can
- * be any length and any alphabet — a human types this into Render — while the
- * key is always exactly 256 bits. The prefix means a secret reused elsewhere
- * never yields the same key here.
+ * be any alphabet — a human types this into Render — while the key is always
+ * exactly 256 bits. The prefix means a secret reused elsewhere never yields the
+ * same key here.
+ *
+ * The guard is here as well as at the edge of every route, and that duplication
+ * is the point: this is the only function in the service that can turn a string
+ * into a key, so a caller that forgot to check still cannot seal a cookie under
+ * a guessable one.
  */
 async function keyFor(secret: string): Promise<CryptoKey> {
-  if (!secret) throw new Error("SESSION_SECRET is required to seal a session cookie");
+  const problem = sessionSecretProblem(secret);
+  if (problem) throw new Error(problem);
   const material = await crypto.subtle.digest(
     "SHA-256",
     new TextEncoder().encode(`cg-web-session-${VERSION}:${secret}`),
