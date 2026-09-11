@@ -88,11 +88,16 @@ The schema and the seed rows go in as one transaction, so a seed that fails leav
 the next boot retries — rather than a green service with an empty cast, permanently, on a disk
 that persists.
 
-⚠️ **Seed-if-empty means there are no migrations.** `hasSchema` looks for one table
-(`policy_rules`), so a `governance.db` created by an earlier revision is treated as already
-seeded and never gains tables added since — a database from before #19 comes up green and then
-answers `no such table: approval_requests` on the first `/approvals` call. Delete the file (or
-run `scripts/reset`, #23) after pulling a schema change. A fresh clone is unaffected.
+The schema revision is recorded in `PRAGMA user_version` and compared at boot (#60). An
+existing database runs the DDL again — idempotent, `IF NOT EXISTS` throughout — and no inserts,
+so a table added after the disk existed appears on the next boot without the live rows being
+reseeded. A database stamped *newer* than this build refuses to open, naming the file and the
+reset, rather than booting green and answering `no such table` from the first call that needs it.
+
+⚠️ **New tables only.** An added column, a widened `CHECK`, a renamed index: none of those are
+expressible as `CREATE ... IF NOT EXISTS`, and none of them happen at boot. Ship one of those and
+you still have to delete the file (or run `scripts/reset`, #23). Bump `SCHEMA_VERSION` in the same
+commit as any change to `SCHEMA`.
 
 Two things in the fixture are substituted at seed time and nowhere else: the toolkit names
 (`$LOAN`, `$APPROVALS` → `ARCADE_LOAN_TOOLKIT`, `ARCADE_APPROVALS_TOOLKIT`) and the persona

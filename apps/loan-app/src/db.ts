@@ -88,8 +88,14 @@ const loanFixtureSchema = z.object({
 // not surface as a loan that quietly has no borrower.
 const fixtureSchema = z.object({ loans: z.array(loanFixtureSchema).min(1) });
 
+/**
+ * Every statement here is idempotent — `IF NOT EXISTS` throughout — so the
+ * same string serves both bootstrap paths: inside `seed()`'s transaction on a
+ * fresh database, and on its own against a database that predates a table
+ * added since. See `SCHEMA_VERSION`.
+ */
 const SCHEMA = `
-  CREATE TABLE loans (
+  CREATE TABLE IF NOT EXISTS loans (
     loan_id             TEXT    PRIMARY KEY,
     borrower_name       TEXT    NOT NULL,
     amount              INTEGER NOT NULL,
@@ -107,7 +113,7 @@ const SCHEMA = `
   -- Append-only. An approval is an event, not a flag, so approving the same
   -- loan twice leaves two rows and shows up in the data instead of collapsing
   -- into an accidental no-op.
-  CREATE TABLE loan_decisions (
+  CREATE TABLE IF NOT EXISTS loan_decisions (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     loan_id    TEXT    NOT NULL REFERENCES loans(loan_id),
     decision   TEXT    NOT NULL CHECK (decision IN ('approved', 'denied')),
@@ -117,8 +123,8 @@ const SCHEMA = `
     decided_at TEXT    NOT NULL
   );
 
-  CREATE INDEX idx_loan_decisions_loan_id ON loan_decisions(loan_id);
-  CREATE INDEX idx_loans_status ON loans(status);
+  CREATE INDEX IF NOT EXISTS idx_loan_decisions_loan_id ON loan_decisions(loan_id);
+  CREATE INDEX IF NOT EXISTS idx_loans_status ON loans(status);
 `;
 
 /**
@@ -137,30 +143,96 @@ export function openLoanBook(path: string): Database {
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
 
-  if (!hasSchema(db)) seed(db, fixtureSchema.parse(fixture).loans);
-  else upgradeSchema(db);
+  try {
+    if (hasSchema(db)) upgradeSchema(db, path);
+    else seed(db, fixtureSchema.parse(fixture).loans);
+  } catch (cause) {
+    // Leave no half-open handle behind: the caller is about to exit, and a
+    // lingering WAL lock is one more thing between a crash-looping service
+    // and somebody deleting the file.
+    db.close();
+    throw cause;
+  }
 
   return db;
+}
+
+/**
+ * The schema revision this build writes, recorded in `PRAGMA user_version`.
+ * Bump it in the same commit as any change to `SCHEMA` or to `upgradeSchema`.
+ *
+ * Version 1 is the schema at #60. Databases written before this existed read
+ * back 0 — the SQLite default — which is exactly the "needs the upgrade path"
+ * answer, so no disk has to be touched by hand to adopt this.
+ */
+export const SCHEMA_VERSION = 1;
+
+/** The schema revision recorded on disk. 0 on anything written before #60. */
+export function readSchemaVersion(db: Database): number {
+  return db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version ?? 0;
+}
+
+/**
+ * Thrown at boot, before the port opens, when the database on disk is not one
+ * this build can bring forward. Names the file and the way out, because the
+ * alternative is a `SQLiteError: no such table` from the first request that
+ * needs the missing piece, a crash loop, and a Render Shell that will not
+ * attach to a service that keeps exiting (#60).
+ */
+export class SchemaTooNewError extends Error {
+  constructor(
+    readonly path: string,
+    readonly found: number,
+  ) {
+    super(
+      `loans.db at ${path} was written by a newer build (PRAGMA user_version ${found}; ` +
+        `this build understands ${SCHEMA_VERSION}) and cannot be migrated backwards. ` +
+        `Reset it: stop the service, delete ${path} (and its -wal and -shm siblings), ` +
+        `and restart — the fixture reseeds on an empty disk. A one-command reset lands with #23.`,
+    );
+    this.name = "SchemaTooNewError";
+  }
 }
 
 /**
  * Brings a database created by an earlier schema up to the current one,
  * keeping every row. `hasSchema` only asks whether the `loans` table exists,
  * which is the right question for "is this seeded?" and the wrong one for "is
- * this current?": a `loans.db` on a persistent disk predates every column
- * added after it, and without this it would open green and fail on the first
- * query that named the new column.
+ * this current?": a `loans.db` on a persistent disk predates everything added
+ * after it, and without this it would open green and fail on the first query
+ * that named the new part. What is "current" is `PRAGMA user_version`, not
+ * the presence of one table (#60).
  *
- * Every step here must be additive and idempotent — an `ALTER TABLE ... ADD
- * COLUMN` guarded by a `PRAGMA table_info` check. A change that cannot be
- * expressed that way is a reset, and resets are explicit (#23), never a side
- * effect of booting.
+ * Two kinds of step, both additive and idempotent, and nothing else:
+ *
+ *   - replaying `SCHEMA`, which is `CREATE ... IF NOT EXISTS` throughout, so
+ *     a table or index added after this disk existed simply appears;
+ *   - an `ALTER TABLE ... ADD COLUMN` guarded by a `PRAGMA table_info` check.
+ *
+ * A change that cannot be expressed that way — a widened `CHECK`, a dropped
+ * column, a rewritten primary key — is a reset, and resets are explicit (#23),
+ * never a side effect of booting. `CREATE TABLE IF NOT EXISTS` in particular
+ * does not reshape a table that already exists; it only creates a missing one.
+ *
+ * No inserts. The rows on this disk are the state the demo is in.
  */
-function upgradeSchema(db: Database): void {
-  // Added on #34: who recorded the decision, read off the caller's token.
-  if (!hasColumn(db, "loan_decisions", "decided_by")) {
-    db.exec("ALTER TABLE loan_decisions ADD COLUMN decided_by TEXT");
-  }
+function upgradeSchema(db: Database, path: string): void {
+  const found = readSchemaVersion(db);
+  if (found > SCHEMA_VERSION) throw new SchemaTooNewError(path, found);
+  if (found === SCHEMA_VERSION) return;
+
+  // One transaction, so a half-applied upgrade rolls back to a database that
+  // still reads its old version and tries again on the next boot.
+  db.transaction(() => {
+    db.exec(SCHEMA);
+
+    // Added on #34: who recorded the decision, read off the caller's token.
+    if (!hasColumn(db, "loan_decisions", "decided_by")) {
+      db.exec("ALTER TABLE loan_decisions ADD COLUMN decided_by TEXT");
+    }
+
+    db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+  })();
 }
 
 function hasColumn(db: Database, table: string, column: string): boolean {
@@ -211,6 +283,9 @@ export type LoanSeed = z.infer<typeof loanFixtureSchema>;
 export function seed(db: Database, loans: LoanSeed[]): void {
   db.transaction(() => {
     db.exec(SCHEMA);
+    // Inside the same transaction as the DDL and the rows, so the version is
+    // recorded if and only if both landed.
+    db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
 
     // Prepared after the DDL, because the tables have to exist to compile
     // against, and finalized before the transaction commits so a rollback is
