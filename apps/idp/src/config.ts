@@ -12,6 +12,21 @@ export const DEFAULT_ARCADE_REDIRECT_URI = "https://cloud.arcade.dev/api/v1/oaut
  */
 const DEV_SECRET = "cg-idp-dev-secret-not-for-production-0000000000";
 
+/**
+ * One OAuth client this service keeps, as the environment asks for it.
+ *
+ * Better Auth generates the `client_id` and `client_secret` and they cannot be
+ * pinned from env, so nothing here is a credential: a spec is a **key** (the
+ * fixed primary key of the row, so the same client is found again on the next
+ * boot), a display name for the login and consent pages, and the redirect URIs
+ * allowlisted on it.
+ */
+export interface OAuthClientSpec {
+  key: string;
+  name: string;
+  redirectUris: string[];
+}
+
 export interface IdpConfig {
   port: number;
   dbPath: string;
@@ -20,7 +35,78 @@ export interface IdpConfig {
   /** True when nothing set the public URL and `baseURL` is the localhost fallback. */
   baseURLIsFallback: boolean;
   secret: string;
+  /** The first client's redirect URIs. Same value as `clients[0].redirectUris`. */
   redirectUris: string[];
+  /**
+   * Every client, in the order `IDP_OAUTH_CLIENTS` names them. Always at least
+   * one — `clients[0]` is the Arcade registration everything before #79
+   * assumed, and with nothing configured it is the only one.
+   */
+  clients: OAuthClientSpec[];
+}
+
+/** The one client every deployment has, and the only one before #79. */
+export const PRIMARY_CLIENT_KEY = "arcade";
+
+/**
+ * A client key is a row primary key and half of an environment variable name,
+ * so it is kept to the shape both can hold without quoting or escaping.
+ */
+const CLIENT_KEY = /^[a-z0-9][a-z0-9-]*$/;
+
+/**
+ * `arcade-user-source` -> `IDP_OAUTH_REDIRECT_URIS_ARCADE_USER_SOURCE`. The
+ * per-client override; without it a client falls back to the shared
+ * `IDP_OAUTH_REDIRECT_URIS`, which is what keeps a one-client deployment
+ * configured exactly as it was.
+ */
+export function redirectUrisVar(key: string): string {
+  return `IDP_OAUTH_REDIRECT_URIS_${key.toUpperCase().replace(/-/g, "_")}`;
+}
+
+/** `arcade-user-source` -> `Arcade User Source`, for the consent page. */
+function displayName(key: string): string {
+  return key
+    .split("-")
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+}
+
+function splitList(value: string | undefined): string[] {
+  return (value ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+/**
+ * Reads `IDP_OAUTH_CLIENTS`, which names the clients by key.
+ *
+ * Unset — the shape every deployment has today — means exactly
+ * `[PRIMARY_CLIENT_KEY]`, so nothing changes for anyone who does not opt in.
+ * The primary key is always first and always present: it is the row #13
+ * registered in the Arcade dashboard, and dropping it from the list would
+ * quietly stop reconciling the live client rather than fail.
+ */
+function readClients(env: Record<string, string | undefined>, sharedUris: string[]): OAuthClientSpec[] {
+  const keys = splitList(env.IDP_OAUTH_CLIENTS);
+  for (const key of keys) {
+    if (!CLIENT_KEY.test(key)) {
+      throw new Error(
+        `IDP_OAUTH_CLIENTS: "${key}" is not a usable client key — lowercase letters, digits and hyphens only`,
+      );
+    }
+  }
+
+  const ordered = [PRIMARY_CLIENT_KEY, ...keys.filter((key) => key !== PRIMARY_CLIENT_KEY)];
+  return [...new Set(ordered)].map((key) => {
+    const override = splitList(env[redirectUrisVar(key)]);
+    return {
+      key,
+      name: key === PRIMARY_CLIENT_KEY ? "Arcade" : displayName(key),
+      redirectUris: override.length > 0 ? override : sharedUris,
+    };
+  });
 }
 
 export function readConfig(env: Record<string, string | undefined> = process.env): IdpConfig {
@@ -36,10 +122,8 @@ export function readConfig(env: Record<string, string | undefined> = process.env
   const configuredURL = env.IDP_PUBLIC_URL?.trim() || env.RENDER_EXTERNAL_URL?.trim();
   const baseURL = (configuredURL || `http://localhost:${port}`).replace(/\/+$/, "");
 
-  const redirectUris = (env.IDP_OAUTH_REDIRECT_URIS ?? DEFAULT_ARCADE_REDIRECT_URI)
-    .split(",")
-    .map((uri) => uri.trim())
-    .filter(Boolean);
+  const redirectUris = splitList(env.IDP_OAUTH_REDIRECT_URIS ?? DEFAULT_ARCADE_REDIRECT_URI);
+  const clients = readClients(env, redirectUris);
 
   return {
     port,
@@ -47,7 +131,8 @@ export function readConfig(env: Record<string, string | undefined> = process.env
     baseURL,
     baseURLIsFallback: !configuredURL,
     secret: secret || DEV_SECRET,
-    redirectUris,
+    redirectUris: clients[0]!.redirectUris,
+    clients,
   };
 }
 

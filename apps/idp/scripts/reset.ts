@@ -7,7 +7,7 @@
  *   bun run --cwd apps/idp reset
  */
 import { createAuth } from "../src/auth.ts";
-import { ensureOAuthClient } from "../src/client.ts";
+import { ensureOAuthClients } from "../src/client.ts";
 import { readConfig } from "../src/config.ts";
 import { countPeople, openPeople, resetPeople } from "../src/db.ts";
 
@@ -15,19 +15,27 @@ const config = readConfig();
 const db = await openPeople(config.dbPath);
 const auth = createAuth({ db, baseURL: config.baseURL, secret: config.secret });
 
-const before = await ensureOAuthClient(auth, { redirectUris: config.redirectUris, secret: config.secret });
-await resetPeople(db);
-const after = await ensureOAuthClient(auth, { redirectUris: config.redirectUris, secret: config.secret });
+const ensure = () => ensureOAuthClients(auth, { clients: config.clients, secret: config.secret });
 
-if (before.clientId !== after.clientId) {
+const before = await ensure();
+await resetPeople(db);
+const after = await ensure();
+
+// Every configured client, not just the first: a second registration is as
+// stale as the first if its id moved, and it fails in the same invisible place.
+for (const [index, was] of before.entries()) {
+  const now = after[index]!;
+  if (was.clientId === now.clientId) continue;
   // Should be unreachable — resetPeople never touches oauthClient — but if it
   // ever is, the Arcade registration is now stale and someone must know.
-  console.error(`[idp] OAuth client ROTATED during reset: ${before.clientId} -> ${after.clientId}`);
+  console.error(
+    `[idp] OAuth client "${was.key}" ROTATED during reset: ${was.clientId} -> ${now.clientId}`,
+  );
   process.exit(1);
 }
 
 console.log(
   `[idp] reset ${config.dbPath}: ${countPeople(db)} people re-seeded, ` +
-    `OAuth client ${after.clientId} unchanged`,
+    `OAuth client${after.length > 1 ? "s" : ""} ${after.map((each) => each.clientId).join(", ")} unchanged`,
 );
 db.close();
