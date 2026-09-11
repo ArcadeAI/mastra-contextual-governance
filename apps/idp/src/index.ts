@@ -9,7 +9,7 @@
  * what a loan is or who is allowed to do what.
  */
 import { createAuth, CONSENT_PAGE, ID_TOKEN_ALG, JWKS_PATH, LOGIN_PAGE } from "./auth.ts";
-import { CLIENT_SECRET_STATE_MESSAGE, ensureOAuthClient, findClientName } from "./client.ts";
+import { CLIENT_SECRET_STATE_MESSAGE, ensureOAuthClients, findClientName } from "./client.ts";
 import { readConfig, usingDevSecret } from "./config.ts";
 import { countPeople, openPeople } from "./db.ts";
 import { renderConsentPage, renderLoginPage, renderMessagePage } from "./pages.ts";
@@ -20,12 +20,17 @@ const config = readConfig();
 const db = await openPeople(config.dbPath);
 const auth = createAuth({ db, baseURL: config.baseURL, secret: config.secret });
 
-// Create-if-absent. Credentials are deliberately not logged: read them with
-// `bun run oauth-client`. Only the fact and the id, which is public anyway.
-const client = await ensureOAuthClient(auth, {
-  redirectUris: config.redirectUris,
-  secret: config.secret,
-});
+// Create-if-absent, one per configured key. Credentials are deliberately not
+// logged: read them with `bun run oauth-client`. Only the fact and the id,
+// which is public anyway.
+const clients = await ensureOAuthClients(auth, { clients: config.clients, secret: config.secret });
+
+// The first one, which is the whole story for a deployment that never set
+// `IDP_OAUTH_CLIENTS` — every field `/health` published before #79 is this one.
+const client = clients[0]!;
+
+/** Every client id this service will answer for, for the token-endpoint log. */
+const registeredClientIds = clients.map((each) => each.clientId);
 
 function html(body: string, status = 200): Response {
   return new Response(body, { status, headers: { "Content-Type": "text/html; charset=utf-8" } });
@@ -190,6 +195,9 @@ const TOKEN_PATH = "/oauth2/token";
 /** RFC 7235 scheme token, so a garbage `Authorization` header is reported as garbage. */
 const AUTH_SCHEME = /^([!#$%&'*+\-.^_`|~0-9A-Za-z]{1,32})(?=\s|$)/;
 
+/** The `Basic` scheme, matched the way RFC 7235 §2.1 says to: case-insensitively. */
+const BASIC_SCHEME = /^Basic +/i;
+
 /** The `Authorization` header and the form body of one token request, read once. */
 interface TokenRequest {
   authorization: string | null;
@@ -197,24 +205,164 @@ interface TokenRequest {
 }
 
 /**
+ * What one token request did with the `Authorization` header and the body at
+ * the same time.
+ *
+ * - `single` — at most one of them carries a credential. Nothing to do.
+ * - `duplicated` — Basic **and** a body `client_id`/`client_secret` pair that is
+ *   byte-for-byte the header's. This is Arcade's custom OAuth provider as the
+ *   dashboard ships it, and it is the one case this service tolerates (#79).
+ * - `mixed` — Basic and something else. Two different credentials, or a
+ *   credential and an assertion, or a half pair. Refused.
+ */
+type DualCredentials = "single" | "duplicated" | "mixed";
+
+/** Values Better Auth treats as present: a field set to the empty string is not a credential. */
+function present(values: string[]): string[] {
+  return values.filter((value) => value.length > 0);
+}
+
+/**
+ * The client id and secret inside an `Authorization: Basic` header.
+ *
+ * Hand-decoded rather than imported from `@better-auth/core`, which is a
+ * transitive dependency here, but decoded the *same* way
+ * (`oauth2/basic-credentials.ts`): split on the first colon only, then
+ * form-url-decode each half per RFC 6749 §2.3.1, where `+` is a space. Both
+ * halves must be non-empty, which is also where that function throws.
+ */
+function basicCredentials(authorization: string): { clientId: string; clientSecret: string } | null {
+  const encoded = BASIC_SCHEME.test(authorization) ? authorization.replace(BASIC_SCHEME, "") : null;
+  if (encoded === null) return null;
+
+  let decoded: string;
+  try {
+    decoded = Buffer.from(encoded, "base64").toString("utf8");
+  } catch {
+    return null;
+  }
+
+  const colon = decoded.indexOf(":");
+  if (colon === -1) return null;
+
+  const half = (value: string) => new URLSearchParams(`v=${value}`).get("v");
+  const clientId = half(decoded.slice(0, colon));
+  const clientSecret = half(decoded.slice(colon + 1));
+  if (!clientId || !clientSecret) return null;
+
+  return { clientId, clientSecret };
+}
+
+/**
+ * Classifies a token request against RFC 6749 §2.3's one-method rule — which
+ * `@better-auth/oauth-provider` enforces in
+ * `normalizeClientAuthenticationParameters` (`utils-C2yu_zRr.mjs:541`) by
+ * throwing `invalid_request: "A request must use only one client
+ * authentication method"` the moment an `Authorization` header arrives beside a
+ * body `client_secret` or a client assertion.
+ *
+ * **Arcade's custom OAuth provider sends both.** Its token request carries
+ * `auth_method: client_secret_basic` *and* the dashboard template's
+ * `client_id={{client_id}}` / `client_secret={{client_secret}}` Request
+ * Parameter rows, on Token Settings and Refresh Token Settings alike. Measured
+ * on `cg-idp`, spike #75, 17:38Z:
+ *
+ * ```
+ * [idp] POST /oauth2/token rejected: status=400 error=invalid_request
+ *   error_description="A request must use only one client authentication method"
+ *   client_auth="client_secret_basic" client_id=RskTFjl6…
+ * ```
+ *
+ * Nothing on the Arcade side removes those rows, so this service accepts the
+ * request as sent — and only that request. The tolerance is for **identical
+ * credentials presented twice**, nothing else: the body pair must be complete
+ * and must equal the header's, or the request is refused as `mixed`. That
+ * keeps the §2.3 rule where it matters, which is a caller presenting two
+ * *different* identities and letting the server pick.
+ */
+function classifyDualCredentials({ authorization, form }: TokenRequest): DualCredentials {
+  if (!authorization || !BASIC_SCHEME.test(authorization)) return "single";
+
+  const secrets = present(form.getAll("client_secret"));
+  const assertions = present([
+    ...form.getAll("client_assertion"),
+    ...form.getAll("client_assertion_type"),
+  ]);
+  if (secrets.length === 0 && assertions.length === 0) return "single";
+
+  // An assertion is a different method, not the same one twice.
+  if (assertions.length > 0) return "mixed";
+
+  // Repeated parameters are refused by Better Auth by name — `client_secret
+  // must not be repeated` — before it reaches the one-method rule, and its
+  // message is more precise than anything said here. Hand it over untouched.
+  const ids = present(form.getAll("client_id"));
+  if (ids.length > 1 || secrets.length > 1) return "single";
+
+  const header = basicCredentials(authorization);
+  // A malformed Basic header is `invalid_client` from the plugin, with a
+  // `WWW-Authenticate` challenge. Better answer than ours.
+  if (!header) return "single";
+
+  return ids[0] === header.clientId && secrets[0] === header.clientSecret ? "duplicated" : "mixed";
+}
+
+/**
+ * The request as Better Auth should see it: the body `client_secret` removed,
+ * everything else byte-identical in meaning.
+ *
+ * **Only `client_secret` is dropped.** `client_id` beside a Basic header is not
+ * a second authentication method — the plugin expects it there and cross-checks
+ * it, `index.mjs:161`: `if (request.client_id && authenticated.clientId !==
+ * request.client_id) invalid_client "Client ID mismatch"`. Leaving it keeps that
+ * check alive on the passed-through request, which is one more thing standing
+ * between a confused caller and a token.
+ */
+function withoutBodyClientSecret(form: URLSearchParams): URLSearchParams {
+  const stripped = new URLSearchParams(form);
+  stripped.delete("client_secret");
+  return stripped;
+}
+
+/**
+ * The incoming headers, with `content-length` corrected for a body that is now
+ * shorter. Stale by exactly the length of the secret otherwise, and a header
+ * that disagrees with the body it describes is the kind of thing that works
+ * until the day something reads it.
+ */
+function forwardedHeaders(request: Request, byteLength: number): Headers {
+  const headers = new Headers(request.headers);
+  if (headers.has("content-length")) headers.set("content-length", String(byteLength));
+  return headers;
+}
+
+/**
  * Which client authentication method the request actually used, classified the
  * same way `@better-auth/oauth-provider` classifies it
- * (`extractClientCredentials`): assertion first, then the `Authorization`
- * header, then credentials in the form body, then a bare `client_id`.
+ * (`extractClientCredentials`): the `Authorization` header first, then
+ * an assertion, then credentials in the form body, then a bare `client_id`.
  *
  * This is the field spike #75 went looking for and could not find. A client
  * registered for one method and sending the other is refused with
  * `invalid_client` **before the secret is checked**, so from the outside it is
  * indistinguishable from a wrong secret — and the caller is Arcade, server to
  * server, with nothing user-visible to report it.
+ *
+ * `mixed` is the #79 addition: a Basic header beside body credentials that are
+ * not the same credentials. It is its own value because the refusal is this
+ * service's, not the plugin's, and a reader of the log should not have to
+ * guess which.
  */
-function observedClientAuth({ authorization, form }: TokenRequest): string {
-  if (form.get("client_assertion") || form.get("client_assertion_type")) return "private_key_jwt";
+function observedClientAuth(token: TokenRequest): string {
+  const { authorization, form } = token;
+
   if (authorization) {
     const scheme = AUTH_SCHEME.exec(authorization)?.[1];
     if (!scheme) return "authorization header: malformed";
-    return /^basic$/i.test(scheme) ? "client_secret_basic" : `authorization scheme: ${scheme}`;
+    if (!/^basic$/i.test(scheme)) return `authorization scheme: ${scheme}`;
+    return classifyDualCredentials(token) === "mixed" ? "mixed" : "client_secret_basic";
   }
+  if (form.get("client_assertion") || form.get("client_assertion_type")) return "private_key_jwt";
   if (form.get("client_id") && form.get("client_secret")) return "client_secret_post";
   if (form.get("client_id")) return "none";
   return "absent";
@@ -222,24 +370,46 @@ function observedClientAuth({ authorization, form }: TokenRequest): string {
 
 /**
  * The `client_id` the request claims, from wherever it put it. Used only to
- * compare against the registered one — see `logTokenFailure` for why the value
+ * compare against the registered ones — see `logTokenFailure` for why the value
  * itself never reaches the log.
  */
 function requestClientId({ authorization, form }: TokenRequest): string | null {
-  if (authorization && /^Basic +/i.test(authorization)) {
-    try {
-      const decoded = Buffer.from(authorization.replace(/^Basic +/i, ""), "base64").toString("utf8");
-      const colon = decoded.indexOf(":");
-      if (colon === -1) return null;
-      // Form-url-decoded, per RFC 6749 §2.3.1 — `+` is a space, not a plus.
-      // `decodeBasicCredentials` in @better-auth/core does the same, and this
-      // has to classify the id the same way the plugin resolves it.
-      return new URLSearchParams(`v=${decoded.slice(0, colon)}`).get("v");
-    } catch {
-      return null;
-    }
+  if (authorization && BASIC_SCHEME.test(authorization)) {
+    return basicCredentials(authorization)?.clientId ?? null;
   }
   return form.get("client_id");
+}
+
+/**
+ * The refusal this service writes itself: a Basic header and body credentials
+ * that are not the same credentials.
+ *
+ * `invalid_request` and 400, the same as the rule it stands in for
+ * (RFC 6749 §5.2, and `throwInvalidAuthenticationRequest` in the plugin). The
+ * description differs because the cause does: the caller did not merely send
+ * two methods, it sent two *different* identities, and a human reading the log
+ * should not have to diff two base64 blobs to find that out. Neither value is
+ * echoed — one of them is a secret.
+ */
+function mixedCredentialsRefusal(): Response {
+  return new Response(
+    JSON.stringify({
+      error: "invalid_request",
+      error_description:
+        "The Authorization header and the request body carry different client credentials",
+    }),
+    {
+      status: 400,
+      headers: {
+        "Content-Type": "application/json",
+        // RFC 6749 §5.1, and what the plugin puts on its own token errors —
+        // measured. A refusal this service writes itself should be
+        // indistinguishable in form from one Better Auth wrote.
+        "Cache-Control": "no-store",
+        Pragma: "no-cache",
+      },
+    },
+  );
 }
 
 /**
@@ -254,12 +424,12 @@ function requestClientId({ authorization, form }: TokenRequest): string | null {
  * **No secret is ever on this line, structurally.** The client id is not echoed
  * from the request either: under Basic it lives in the same base64 blob as the
  * secret, and a caller that swapped the two fields would have us print one. So
- * the request's id is compared against the registered one and the line says
- * which of the two it was — enough to tell "Arcade is pointed at a different
+ * the request's id is compared against the registered ones and the line says
+ * which of them it was — enough to tell "Arcade is pointed at a different
  * client" from "Arcade has the wrong secret", which is the question anyone
  * reading this line is asking.
  */
-async function logTokenFailure(token: TokenRequest, response: Response, registeredClientId: string) {
+async function logTokenFailure(token: TokenRequest, response: Response, registered: string[]) {
   const body = (await response.clone().json().catch(() => null)) as
     | { error?: string; error_description?: string }
     | null;
@@ -270,7 +440,7 @@ async function logTokenFailure(token: TokenRequest, response: Response, register
       `error=${body?.error ?? "(none)"} ` +
       `error_description=${JSON.stringify(body?.error_description ?? "(none)")} ` +
       `client_auth=${JSON.stringify(observedClientAuth(token))} ` +
-      `client_id=${claimed === registeredClientId ? registeredClientId : "(not the registered client)"}`,
+      `client_id=${claimed !== null && registered.includes(claimed) ? claimed : "(not the registered client)"}`,
   );
 }
 
@@ -308,6 +478,24 @@ const server = Bun.serve({
           // lands at the authorize step, where no hook fires).
           client_secret_state: client.secretState,
           client_secret_note: CLIENT_SECRET_STATE_MESSAGE[client.secretState],
+          // Every configured client, first one first (#79). A deployment that
+          // never set `IDP_OAUTH_CLIENTS` has exactly one entry here, and that
+          // entry is the object above — which is how a human checks from
+          // outside whether a second registration exists at all, rather than
+          // inferring it from a dashboard they may not be looking at.
+          clients: clients.map((each) => ({
+            key: each.key,
+            name: each.name,
+            client_id: each.clientId,
+            redirect_uris: each.redirectUris,
+            token_endpoint_auth_method: each.tokenEndpointAuthMethod,
+            client_secret_state: each.secretState,
+          })),
+          // What the token endpoint does with Arcade's duplicated credentials
+          // (#79). Stated because it is a deviation from RFC 6749 §2.3 and a
+          // reviewer should not have to read the source to find its bounds.
+          duplicate_client_credentials:
+            "accepted when the Authorization: Basic pair and the body client_id/client_secret pair are identical; refused invalid_request when they differ",
         },
       });
     }
@@ -330,22 +518,46 @@ const server = Bun.serve({
       );
     }
 
-    // The token endpoint, wrapped only to leave a line behind when it says no.
-    // The response itself is whatever Better Auth returned, byte for byte.
+    // The token endpoint, wrapped for two things: Arcade's duplicated
+    // credentials (#79), and a line left behind when it says no (#61).
+    // Whatever Better Auth answers is passed back byte for byte.
     if (request.method === "POST" && pathname === TOKEN_PATH) {
       // Read once and re-issued rather than cloned: a token request is one
       // small form post per authorization, and the handler needs an
       // undisturbed body whether or not anything ends up being logged.
       const body = await request.text();
+      const authorization = request.headers.get("authorization");
+      const sent: TokenRequest = { authorization, form: new URLSearchParams(body) };
+      const dual = classifyDualCredentials(sent);
+
+      // Two different identities in one request. The plugin would refuse this
+      // too, one line later and for a less specific reason; refusing it here is
+      // what keeps the tolerance below down to "the same credentials twice".
+      if (dual === "mixed") {
+        const refusal = mixedCredentialsRefusal();
+        await logTokenFailure(sent, refusal, registeredClientIds);
+        return refusal;
+      }
+
+      // Grant-agnostic on purpose: the same Request Parameter rows sit on
+      // Arcade's Token Settings and its Refresh Token Settings, so
+      // `authorization_code` and `refresh_token` arrive in the same shape and
+      // this runs before either is dispatched.
+      const forwardedForm = dual === "duplicated" ? withoutBodyClientSecret(sent.form) : sent.form;
+      const forwardedBody = dual === "duplicated" ? forwardedForm.toString() : body;
+
       const response = await auth.handler(
-        new Request(request.url, { method: "POST", headers: request.headers, body }),
+        new Request(request.url, {
+          method: "POST",
+          headers: forwardedHeaders(request, Buffer.byteLength(forwardedBody)),
+          body: forwardedBody,
+        }),
       );
       if (response.status >= 400) {
-        await logTokenFailure(
-          { authorization: request.headers.get("authorization"), form: new URLSearchParams(body) },
-          response,
-          client.clientId,
-        );
+        // Logged as what the plugin was asked, not as what arrived: after the
+        // strip this *is* a `client_secret_basic` request, and saying anything
+        // else would send a reader looking for a method problem that is gone.
+        await logTokenFailure({ authorization, form: forwardedForm }, response, registeredClientIds);
       }
       return response;
     }
@@ -358,7 +570,8 @@ const server = Bun.serve({
 console.log(
   `[${SERVICE}] listening on :${server.port} — issuer ${config.baseURL}, ` +
     `${countPeople(db)} people in ${config.dbPath}, ` +
-    `OAuth client ${client.clientId} (${client.created ? "created" : "existing"}), ` +
+    `OAuth client${clients.length > 1 ? "s" : ""} ` +
+    `${clients.map((each) => `${each.clientId} (${each.key}, ${each.created ? "created" : "existing"})`).join(", ")}, ` +
     `JWKS ${config.baseURL}${JWKS_PATH} (${ID_TOKEN_ALG})` +
     (usingDevSecret(config) ? " — using the development secret" : ""),
 );
@@ -367,19 +580,23 @@ console.log(
 // so `render logs` shows it without anyone having to know to look. The secret
 // itself is never printed here, whatever happened to it — `bun run
 // oauth-client --rotate` is the only thing that prints one.
-const secretLine = `[${SERVICE}] OAuth client secret: ${CLIENT_SECRET_STATE_MESSAGE[client.secretState]}`;
-if (client.secretState === "rotated") console.error(secretLine);
-else console.log(secretLine);
+for (const each of clients) {
+  const label = clients.length > 1 ? `OAuth client secret (${each.key})` : "OAuth client secret";
+  const secretLine = `[${SERVICE}] ${label}: ${CLIENT_SECRET_STATE_MESSAGE[each.secretState]}`;
+  if (each.secretState === "rotated") console.error(secretLine);
+  else console.log(secretLine);
+}
 
 // The other thing that can cost a human a field in the Arcade dashboard, and
 // the one this boot may just have changed underneath them. On stderr for the
 // same reason the rotation line is: `render logs` shows it without anyone
 // having to know to look.
-if (client.authMethodReconciled) {
+for (const each of clients.filter((candidate) => candidate.authMethodReconciled)) {
   console.error(
     `[${SERVICE}] OAuth client token auth method reconciled to ` +
-      `${client.tokenEndpointAuthMethod} (#61). The Arcade cg-idp provider's ` +
-      `"client authentication" must now be ${client.tokenEndpointAuthMethod} — ` +
+      `${each.tokenEndpointAuthMethod} (#61)${clients.length > 1 ? ` for "${each.key}"` : ""}. ` +
+      `The Arcade cg-idp provider's ` +
+      `"client authentication" must now be ${each.tokenEndpointAuthMethod} — ` +
       `the credentials are unchanged, and the other form is refused with invalid_client.`,
   );
 }

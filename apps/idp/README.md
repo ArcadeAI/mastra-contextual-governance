@@ -18,7 +18,7 @@ plugin as an OAuth 2.1 authorization server, owning `idp.db` on its own disk.
 | Path | What |
 |---|---|
 | `GET /oauth2/authorize` | Authorization endpoint. Sends the browser to `/login`, then `/consent`, then back to the client with a code. |
-| `POST /oauth2/token` | Token endpoint. `client_secret_basic` (HTTP Basic), PKCE `S256` required. Access tokens are opaque; the ID token is an RS256 JWT. Rejections are logged — see below. |
+| `POST /oauth2/token` | Token endpoint. `client_secret_basic` (HTTP Basic), PKCE `S256` required. Tolerates Arcade's duplicated credentials — see below. Access tokens are opaque; the ID token is an RS256 JWT. Rejections are logged. |
 | `GET /oauth2/userinfo` | The persona's identity. `email` is the claim Arcade extracts. |
 | `GET /jwks` | The key set the ID token is verified against. One RSA key, `alg: RS256`. |
 | `POST /oauth2/introspect`, `POST /oauth2/revoke` | For a resource server that needs to validate or revoke an opaque token. |
@@ -82,16 +82,55 @@ wrong password.
 
 ## The OAuth client
 
-Exactly one, named `Arcade`, created on first boot if absent: confidential,
+One by default, named `Arcade`, created on first boot if absent: confidential,
 `token_endpoint_auth_method: client_secret_basic`, PKCE required, redirect URIs from
 `IDP_OAUTH_REDIRECT_URIS`. Better Auth generates the `client_id` and `client_secret`; they
 cannot be pinned from env.
 
 ```sh
-bun run --cwd apps/idp oauth-client           # client id and endpoints
+bun run --cwd apps/idp oauth-client           # client ids and endpoints
 bun run --cwd apps/idp oauth-client --json    # the same, machine-readable
 bun run --cwd apps/idp oauth-client --rotate  # mint a new secret, same client id
 ```
+
+### A second client, if the two Arcade registrations should not share one
+
+`IDP_OAUTH_CLIENTS` names the clients by key; unset, it is exactly `arcade` and nothing
+below applies. Each extra key gets its own row — its own generated `client_id`, its own
+hashed secret, its own redirect allowlist — because an Arcade **User Source** and an
+Arcade **custom OAuth provider** are two registrations with two generated redirect URIs,
+and a rotated secret should cost one dashboard field rather than two.
+
+```sh
+IDP_OAUTH_CLIENTS=arcade,arcade-user-source
+IDP_OAUTH_REDIRECT_URIS=https://cloud.arcade.dev/api/v1/oauth/<provider>/callback
+IDP_OAUTH_REDIRECT_URIS_ARCADE_USER_SOURCE=https://cloud.arcade.dev/oauth2/intermediate_callback
+```
+
+A key becomes the row's primary key and, upper-snake-cased, the suffix of its redirect
+variable; without that variable a client falls back to the shared
+`IDP_OAUTH_REDIRECT_URIS`. `/health` lists every client under `oauth.clients`, and the
+pre-#79 fields at `oauth.*` keep describing the first one, so nothing that read `/health`
+before has to change.
+
+With more than one configured, `--rotate` demands `--client <key>` and exits 2 otherwise:
+rotating costs a human one field in one Arcade registration, and which one must not be a
+guess this script makes for them.
+
+```sh
+bun run --cwd apps/idp oauth-client --client arcade-user-source --rotate
+```
+
+Dropping a key from `IDP_OAUTH_CLIENTS` deletes nothing. The row stays on the disk and
+**Better Auth still resolves it**, so that registration keeps working; what stops is this
+service reconciling its redirect URIs and auth method at boot, and `oauth-client`
+printing it. Remove a client for real by deleting its row.
+
+What *is* refused is the reverse: creating a client while a row exists that this
+configuration does not name, because that row may be the one Arcade holds. The service
+fails to boot and names the ids it found — a dead service is a thing a human can act on,
+and a silently rotated `client_id` fails at the authorize step, where no hook fires and
+the panel stays dark.
 
 ### Client authentication is `client_secret_basic`, and only that
 
@@ -135,6 +174,60 @@ and `/health` reports the current value, so the state of the live row is one cur
 curl -s https://<idp-host>/health | jq -r '.oauth.token_endpoint_auth_method'
 # client_secret_basic
 ```
+
+### It tolerates Arcade sending the credentials twice, and nothing else
+
+Arcade's custom OAuth provider presents the same credentials **twice**. Its token
+request carries `auth_method: client_secret_basic`, which puts them in the
+`Authorization` header, *and* the dashboard template's Request Parameter rows
+`client_id={{client_id}}` / `client_secret={{client_secret}}`, which put the same pair
+in the form body — on Token Settings and Refresh Token Settings alike. RFC 6749 §2.3
+forbids two client authentication methods in one request, Better Auth enforces it in
+`normalizeClientAuthenticationParameters` (`utils-*.mjs:541`) before it checks anything
+else, and the live `cg-idp` refused Arcade for it (spike #75, 2026-09-11T17:38Z):
+
+```
+[idp] POST /oauth2/token rejected: status=400 error=invalid_request \
+  error_description="A request must use only one client authentication method" \
+  client_auth="client_secret_basic" client_id=<id>
+```
+
+Nothing on the Arcade side removes those rows, so this service accepts the request as
+sent. The rule, in `src/index.ts`:
+
+| The request carries | What happens |
+|---|---|
+| Basic, and a body `client_id`/`client_secret` pair **identical** to the header's | The body `client_secret` is dropped and the request is passed through. 200. |
+| Basic, and a body pair that **differs** in either half | `400 invalid_request`, one log line, `client_auth="mixed"`. |
+| Basic, and half a pair — a body `client_secret` with no `client_id` | Refused the same way. A half pair is not a duplicate. |
+| Basic, and a client assertion | Refused the same way. An assertion is a different method, not the same one twice. |
+| Basic alone | Unchanged: this is the registered method. |
+| A body pair alone | Unchanged: `400 invalid_client`, "client registered for client_secret_basic cannot use client_secret_post". |
+
+Three bounds worth stating, because a tolerance that quietly widens is the failure
+this repo keeps out of its controls:
+
+- **It is not "accept both methods".** The client is still registered for
+  `client_secret_basic` and only that. Credentials in the body *alone* are refused
+  exactly as #61 left them.
+- **It is not a way past the credential check.** Identical credentials are accepted as
+  one presentation, and a wrong presentation is still wrong: the same wrong secret in
+  both places comes back `401 invalid_client`, logged as `client_secret_basic`.
+- **Only `client_secret` is stripped.** A body `client_id` beside a Basic header is not
+  a second method — the plugin expects it and cross-checks it against the authenticated
+  client (`index.mjs:161`) — so leaving it keeps that check alive on the request that
+  is passed through.
+
+The running service states its own bound, so it can be checked from outside without
+reading this file:
+
+```sh
+curl -s https://<idp-host>/health | jq -r '.oauth.duplicate_client_credentials'
+# accepted when the Authorization: Basic pair and the body client_id/client_secret pair are identical; refused invalid_request when they differ
+```
+
+`test/dual-client-credentials.test.ts` measures every row of that table over HTTP,
+including a field-for-field replay of Arcade's request as the dashboard stores it.
 
 ### When the token endpoint says no, it says why
 
