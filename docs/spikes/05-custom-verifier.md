@@ -890,3 +890,13 @@ runs. Called out rather than folded in silently.
   round 1 got the framing wrong because of it.
 - **Spike 04's recommendation is superseded.** It chose Arcade Headers because the
   User Source "cannot be reached at all". It can.
+  **Corrected 2026-09-11:** "superseded" was too soft, and left as it stood this
+  line read as though Arcade Headers were still a candidate awaiting a better
+  measurement. It is not one. The human ruled the mode out that same day — see the
+  last line of [Recommendation for #14](#recommendation-for-14) — so hop 1 is the
+  User Source, with members mode as the fallback, and **Arcade Headers is not a
+  live recommendation anywhere in this document.** The measurement above is why
+  spike 04's *reason* fell; the human's ruling is why the mode is closed. The
+  other dated correction to this spike is
+  [the addendum](#addendum-2026-09-11--the-cause-was-duplicated-credentials-not-a-shared-client),
+  which corrects the client-splitting paragraph of the same recommendation section.
