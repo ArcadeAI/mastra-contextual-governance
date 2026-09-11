@@ -17,6 +17,8 @@
  * Optional: IDP_ISSUER, IDP_CLIENT_ID (defaults are read from the live IdP's
  * `/health`, which publishes the client id and no secret).
  */
+import { pkce } from "./05-drive.ts";
+
 const ISSUER = (process.env.IDP_ISSUER ?? "https://cg-idp-or5b.onrender.com").replace(/\/+$/, "");
 
 const CANDIDATES = [
@@ -32,6 +34,8 @@ const CANDIDATES = [
 const clientId =
   process.env.IDP_CLIENT_ID?.trim() ?? ((await (await fetch(`${ISSUER}/health`)).json()) as any).oauth.client_id;
 
+const { challenge } = await pkce();
+
 console.log(`redirect-URI allowlist on ${ISSUER}, client ${clientId}\n`);
 for (const uri of CANDIDATES) {
   const res = await fetch(
@@ -42,8 +46,12 @@ for (const uri of CANDIDATES) {
       scope: "openid email",
       state: "probe",
       // A real S256 challenge, so a rejection is about the redirect URI and
-      // nothing else. The verifier is discarded; no token is ever requested.
-      code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+      // nothing else. Generated per run rather than pinned: this file is scanned by
+      // `05-redaction.test.ts` for exactly this shape, and a hardcoded challenge —
+      // even the one out of RFC 7636's examples — is a value of the kind the test
+      // exists to keep out of `docs/spikes`. The verifier is discarded and no token
+      // is ever requested, so nothing depends on it being stable.
+      code_challenge: challenge,
       code_challenge_method: "S256",
     })}`,
     { redirect: "manual" },
@@ -53,6 +61,3 @@ for (const uri of CANDIDATES) {
   console.log(`${allowed ? "ALLOWED " : "REJECTED"}  ${uri}`);
   if (!allowed) console.log(`            -> ${location.split("&error_description=").join("\n               ")}`);
 }
-
-// Top-level `await` needs this file to be a module; it exports nothing on purpose.
-export {};

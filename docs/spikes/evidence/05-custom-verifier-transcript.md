@@ -1,9 +1,29 @@
 # Spike 05 — raw transcript
 
 Every run is against the live services on **2026-09-11** unless it says otherwise.
-Secrets are redacted by `05-drive.ts:redact`; the persona domain is redacted by
-hand, as in spikes 03 and 04. The ngrok hostname is left in where it appears: the
-tunnel was dead within the hour and it is the only way to read the flow.
+
+**Redaction.** `05-drive.ts:redact` removes the value of every field in
+`SENSITIVE_FIELDS` — tokens, `code`, `code_verifier`, `code_challenge`, `state`,
+`client_secret`, `password`, `flow_state`, `sig` and the two Ory challenges — and
+`05-redaction.test.ts` greps every file under `docs/spikes` for those shapes and fails
+on a hit, so this file cannot drift back. The persona domain is redacted by hand, as in
+spikes 03 and 04.
+
+Where a measurement turns on two values being *the same*, the value is replaced by a
+stable label rather than by `<redacted>`, so the claim survives without the secret:
+`<dana-flow-1>`, `<dana-flow-2>`, `<sam-flow>`. Arcade uses the authorization
+`flow_id` as the OAuth `state`, so those are one value wearing two names and both are
+labelled.
+
+Three classes of identifier are deliberately **not** redacted, because none is a
+credential and each is load-bearing evidence: OAuth **client ids** (`apps/idp`
+publishes its own on `/health`; Arcade's upstream and the spike's
+dynamically-registered one are public), Arcade **`auth_id`s** (`ar_…`, which name a
+grant rather than authorising anything), and the **`sub`** claims our IdP returns —
+the whole point of §11.10 is that Sam's `sub` differs from Dana's.
+
+The ngrok hostname is left in where it appears: the tunnel was dead within the hour
+and it is the only way to read the flow.
 
 **Read the write-up's framing first.** Sections 1–9 are round 1, and round 1
 conflated two hops. Hop 1 (MCP client → gateway) is governed by the **User
@@ -668,12 +688,12 @@ decision, and an identity-provider chooser is not one.
 
 ### 11.5 Hop 2 with the verifier saved: Arcade calls it
 
-16:47:01Z, flow `9d80728c-4b82-46c6-9784-8c22fd4da762`:
+16:47:01Z, flow `<dana-flow-1>`:
 
 ```
 302 GET  cg-idp-or5b.onrender.com/oauth2/authorize
 303 GET  cloud.arcade.dev/api/v1/oauth/f4c6b_ap_GvSAhPpynQRj/callback
-303 GET  <tunnel>/verify?flow_id=9d80728c-…          ← OURS
+303 GET  <tunnel>/verify?flow_id=<dana-flow-1>          ← OURS
 302 GET  cg-idp-or5b.onrender.com/oauth2/authorize   ← the verifier's own leg, SILENT
 303 GET  <tunnel>/callback
 200 GET  cloud.arcade.dev/api/v1/oauth/callback_success
@@ -683,8 +703,8 @@ decision, and an identity-provider chooser is not one.
 same flow:
 
 ```
-[verifier] GET /verify — Arcade sent 1 parameter(s) {"flow_id":"9d80728c-4b82-46c6-9784-8c22fd4da762"}
-[verifier] 303 to the IdP for flow 9d80728c-…
+[verifier] GET /verify — Arcade sent 1 parameter(s) {"flow_id":"<dana-flow-1>"}
+[verifier] 303 to the IdP for flow <dana-flow-1>
            {"issuer":"https://cg-idp-or5b.onrender.com",
             "redirect_uri":"<tunnel>/callback","scope":"openid email"}
 [verifier] IdP token exchange, client_secret_basic -> 200
@@ -865,9 +885,10 @@ Config re-read first, at 17:37:06Z:
 ```
 
 **Dana, 17:37:14Z — not a valid test of the fix.** Arcade handed back the *same*
-`authorization_url` as the 16:59Z run: same `state=2dfe85b4-d2e3-4ee3-9b68-f27c573912fc`,
-same `code_challenge`, and the old bad `client_id=https%3A%2F%2F…%2Foauth2%2Ftoken` still
-baked into it.
+`authorization_url` as the 16:59Z run — byte-identical `state` and `code_challenge`,
+both written `<dana-flow-2>` and `<redacted>` here — and the old bad
+`client_id=https%3A%2F%2F…%2Foauth2%2Ftoken` still baked into it. **The identity of the
+two values is the finding; neither value is.**
 
 ```
 302 GET https://cg-idp-or5b.onrender.com/oauth2/authorize?client_id=https%3A%2F%2F…%2Foauth2%2Ftoken&…
@@ -883,9 +904,9 @@ provider, existing pending flows are stale and keep failing with the old configu
 ```
 GET  cg-idp-or5b/oauth2/authorize?client_id=RskTFjl6AqkUO8FKYWjpDCLd139YE36F
        &redirect_uri=…%2Fapi%2Fv1%2Foauth%2Ff4c6b_ap_1cWxRQzV98W4%2Fcallback
-       &scope=openid+email&state=18175b25-…            (PKCE S256)
+       &scope=openid+email&state=<sam-flow>            (PKCE S256)
 302 → cloud.arcade.dev/api/v1/oauth/f4c6b_ap_1cWxRQzV98W4/callback?code=<redacted>&…
-303 → <tunnel>/verify?flow_id=18175b25-d14a-4cfa-ba45-650a74c0052f
+303 → <tunnel>/verify?flow_id=<sam-flow>
 303 → cg-idp-or5b/oauth2/authorize
 302 → <tunnel>/callback?code=<redacted>&…               ← SILENT, hop 1's session reused
 303 → cloud.arcade.dev/api/v1/oauth/callback_success
@@ -893,7 +914,7 @@ GET  cg-idp-or5b/oauth2/authorize?client_id=RskTFjl6AqkUO8FKYWjpDCLd139YE36F
 ```
 
 ```
-[verifier] GET /verify — Arcade sent 1 parameter(s) {"flow_id":"18175b25-d14a-4cfa-ba45-650a74c0052f"}
+[verifier] GET /verify — Arcade sent 1 parameter(s) {"flow_id":"<sam-flow>"}
 [verifier] IdP token exchange, client_secret_basic -> 200
 [verifier] IdP /oauth2/userinfo -> 200
            {"sub":"25bb917b-4a90-4b9f-a18a-e9550b9f3275","email":"sam.reyes@…"}

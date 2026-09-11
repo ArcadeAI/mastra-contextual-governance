@@ -64,11 +64,13 @@ Scripts, all discardable, all outside `apps/`:
 | [`evidence/05-redirect-allowlist.ts`](evidence/05-redirect-allowlist.ts) | reads an OAuth client's redirect-URI allowlist from outside, unauthenticated |
 | [`evidence/05-token-auth-methods.ts`](evidence/05-token-auth-methods.ts) | maps `apps/idp`'s token-endpoint refusals to causes. Self-contained: boots its own IdP, needs no credential |
 | [`evidence/05-auth-provider-config.ts`](evidence/05-auth-provider-config.ts) | reads an Arcade auth provider's stored configuration back, read-only, secrets scrubbed |
-| [`evidence/05-drive.ts`](evidence/05-drive.ts) | the browserless user agent, carried forward from spike 04 with three fixes |
+| [`evidence/05-drive.ts`](evidence/05-drive.ts) | the browserless user agent, carried forward from spike 04 with three fixes. Owns `SENSITIVE_FIELDS`, the one list of what must never be committed |
+| [`evidence/05-redaction.test.ts`](evidence/05-redaction.test.ts) | asserts the helper covers every field on that list, and that no committed file under `docs/spikes` carries a value of those shapes |
 
-Three of those are runnable right now from a clean checkout with nothing configured:
+Four of those are runnable right now from a clean checkout with nothing configured:
 
 ```sh
+bun test docs/spikes/evidence/05-redaction.test.ts       # 49 tests, offline, no credential
 bun docs/spikes/evidence/05-token-auth-methods.ts        # exits 0, boots and tears down its own IdP
 bun docs/spikes/evidence/05-redirect-allowlist.ts        # exits 0, reads the live allowlist
 
@@ -76,6 +78,9 @@ PROBE_ONLY=1 ARCADE_MCP_URL=https://api.arcade.dev/mcp/cg-demo-us \
   PERSONA_EMAIL=nobody@example.invalid PERSONA_PASSWORD=unused \
   bun docs/spikes/evidence/05-verifier-flow.ts           # exits 0, types no password
 ```
+
+The redaction test also runs inside a bare `bun test` at the repo root, which is the
+point: a transcript cannot drift back into leaking without the suite going red.
 
 ## What the human has to do, in order
 
@@ -343,7 +348,7 @@ load-bearing.
 ```
 302 GET  https://cg-idp-or5b.onrender.com/oauth2/authorize
 303 GET  https://cloud.arcade.dev/api/v1/oauth/<provider-id>/callback
-303 GET  https://<tunnel>/verify?flow_id=9d80728c-…          ← ours
+303 GET  https://<tunnel>/verify?flow_id=<dana-flow-1>          ← ours
 302 GET  https://cg-idp-or5b.onrender.com/oauth2/authorize   ← the verifier's own leg
 303 GET  https://<tunnel>/callback
 200 GET  https://cloud.arcade.dev/api/v1/oauth/callback_success
@@ -353,7 +358,7 @@ load-bearing.
 rather than picking out the field it expected, and the record is:
 
 ```
-[verifier] GET /verify — Arcade sent 1 parameter(s) {"flow_id":"9d80728c-4b82-46c6-9784-8c22fd4da762"}
+[verifier] GET /verify — Arcade sent 1 parameter(s) {"flow_id":"<dana-flow-1>"}
 ```
 
 No user hint, no provider, no return URL. A verifier gets a `flow_id` and must
@@ -367,8 +372,8 @@ completes silently. Dana authenticates **once**, at hop 1.
 **And it binds the identity our IdP asserts.** The full verifier log for one flow:
 
 ```
-[verifier] GET /verify — Arcade sent 1 parameter(s) {"flow_id":"9d80728c-…"}
-[verifier] 303 to the IdP for flow 9d80728c-…
+[verifier] GET /verify — Arcade sent 1 parameter(s) {"flow_id":"<dana-flow-1>"}
+[verifier] 303 to the IdP for flow <dana-flow-1>
 [verifier] IdP token exchange, client_secret_basic -> 200 {"access_token":"<redacted>",…}
 [verifier] IdP /oauth2/userinfo -> 200 {"sub":"9d8c2228-…","email":"dana.okafor@…"}
 [verifier] POST confirm_user -> 200
@@ -766,6 +771,43 @@ opens.
 **Proposed #14 scope item.** The verifier moves into `apps/web` as two route handlers,
 not a service — see [the recommendation](#recommendation-for-14) for the shape and for
 the one property that must survive the move.
+
+## On redaction
+
+Round 2 of this spike's review found a real OAuth `state` in the committed transcript,
+and a `redact` helper whose field list omitted `state` and `code_challenge`. Those are
+one defect: **the redactor and the reviewer were working from different lists.** A
+redactor that is a hand-maintained regex, checked by a hand-run grep, drifts by
+construction — and the thing it drifts into is publishing a credential.
+
+So there is now exactly one list, `05-drive.ts:SENSITIVE_FIELDS`, with three consumers:
+`redact` for JSON bodies, `redactQuery` for URLs, and
+[`evidence/05-redaction.test.ts`](evidence/05-redaction.test.ts), which asserts the
+helper neutralises every field on it and then greps every **committed** file under
+`docs/spikes` for values of those shapes. Adding a field protects the scripts and tightens
+the test in the same commit; a transcript that drifts turns the root `bun test` red.
+
+Three details worth keeping:
+
+- **The scan keys on entropy, not on a placeholder allowlist.** A UUID, a JWT, or a long
+  base64url run with digits and letters is a hit; `notacode`,
+  `not-the-secret-this-client-has` and `{{client_secret}}` are not. An allowlist of
+  accepted placeholders grows every time it goes red, and a check that grows under
+  pressure to stay green is not a check.
+- **Where a measurement turns on two values being equal, the value is replaced by a
+  label** — `<dana-flow-1>`, `<sam-flow>` — rather than by `<redacted>`, so the claim
+  survives without the secret. Arcade uses the authorization `flow_id` *as* the OAuth
+  `state`, so redacting one without the other would have leaked it anyway; both are
+  labelled.
+- **`state` and `code_challenge` are on the list even though neither is a bearer
+  credential.** Nothing in this spike depends on the value of a `state`, only on whether
+  two of them match, so redacting costs nothing — and a transcript that prints OAuth
+  values teaches the habit that eventually prints a `code_verifier`.
+
+One value outside this slice was scrubbed to make the check pass:
+`evidence/03-slack-scopes-transcript.md` carried a live Slack OAuth `state`. It is the
+same defect class in the same directory, and a check that ships red is a check nobody
+runs. Called out rather than folded in silently.
 
 ## Follow-ups
 

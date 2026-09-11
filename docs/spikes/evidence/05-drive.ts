@@ -24,14 +24,69 @@
  * own tunnel and the IdP behind it.
  */
 
-/** Anything that looks like a secret, gone before it reaches a transcript. */
+/**
+ * Every field whose value must never reach a committed transcript.
+ *
+ * One list, three consumers: `redact` for JSON bodies, `redactQuery` for URLs, and
+ * `05-redaction.test.ts`, which greps every file under `docs/spikes` for exactly
+ * these shapes and fails on a hit. That is deliberate — round 2 of this spike's
+ * review found a real OAuth `state` in the committed transcript *and* a helper that
+ * omitted `state` and `code_challenge`, which is the same bug twice: a redactor and
+ * a reviewer working from different lists. There is now one list, and a test that
+ * fails if the transcript disagrees with it.
+ *
+ * `state` and `code_challenge` are on it even though neither is a bearer credential.
+ * A `state` is the CSRF token binding one authorization attempt to one browser, and
+ * a `code_challenge` is the public half of a PKCE pair; publishing either teaches a
+ * reader that OAuth values are safe to paste, which is the habit that eventually
+ * pastes a `code_verifier`. The cost of redacting them is nil — no measurement in
+ * this spike depends on the *value* of a `state`, only on whether two of them match.
+ *
+ * Ordered longest-first so `code_verifier` and `code_challenge` are matched before
+ * `code`. The boundary assertions around each name are what keep
+ * `code_challenge_method`, `client_secret_state` and `stateMatches` intact.
+ */
+export const SENSITIVE_FIELDS = [
+  "access_token",
+  "refresh_token",
+  "id_token",
+  "code_verifier",
+  "code_challenge",
+  "client_secret",
+  "consent_challenge",
+  "login_challenge",
+  "flow_state",
+  "api_key",
+  "password",
+  "state",
+  "code",
+  "sig",
+] as const;
+
+const FIELD_ALTERNATION = SENSITIVE_FIELDS.join("|");
+/** `"state": "…"` and `"state":"…"`, in a JSON body. */
+const JSON_FIELD = new RegExp(`("(?:${FIELD_ALTERNATION})"\\s*:\\s*")[^"]*"`, "g");
+/**
+ * `state=…`, in a query string or a form body.
+ *
+ * The value alternation takes an existing `<…>` placeholder first so that
+ * re-redacting already-redacted text is a no-op. Without it, `state=<redacted>`
+ * matched an empty value and grew a second `<redacted>` every pass.
+ */
+const QUERY_FIELD = new RegExp(
+  `(?<![A-Za-z0-9_])(${FIELD_ALTERNATION})(?![A-Za-z0-9_])=(?:<[^>]*>|[^&\\s"'<>]*)`,
+  "g",
+);
+
+/**
+ * Anything that looks like a secret, gone before it reaches a transcript.
+ *
+ * Replaces the value outright rather than only values over some length: a short
+ * value is not a safe value, and a threshold is one more thing to get wrong. It is
+ * idempotent, so re-redacting already-redacted text is a no-op.
+ */
 export function redact(text: string): string {
-  return text
-    .replace(
-      /("(?:access_token|refresh_token|id_token|code|client_secret|password|code_verifier|api_key)"\s*:\s*")([^"]{8,})"/g,
-      '$1<redacted>"',
-    )
-    .replace(/\b(code|client_secret|password|access_token|id_token|refresh_token)=([^&\s"]{8,})/g, "$1=<redacted>");
+  return text.replace(JSON_FIELD, '$1<redacted>"').replace(QUERY_FIELD, "$1=<redacted>");
 }
 
 export class Transcript {
@@ -127,8 +182,14 @@ export function stripQuery(url: string): string {
   return url.split("?")[0];
 }
 
+/**
+ * The same rule, for a URL that is being printed as a URL.
+ *
+ * Separate from `redact` only because a caller reaching for "redact this URL" should
+ * not have to know that a URL is a string; both go through `SENSITIVE_FIELDS`.
+ */
 export function redactQuery(url: string): string {
-  return url.replace(/(code|id_token|access_token|login_challenge|consent_challenge|sig)=[^&]+/g, "$1=<redacted>");
+  return redact(url);
 }
 
 /** Undo the escaping a server-rendered HTML attribute went through. See the header note. */
