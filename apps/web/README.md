@@ -12,7 +12,7 @@ bun run --cwd apps/web build
 
 `PORT` comes from this directory's own `.env.local`, the way it does for the three Bun
 services: `dev` and `start` go through `scripts/next.ts`, which is a process Bun runs
-directly so the file is loaded before Next starts ([#50](https://github.com/ArcadeAI/mastra-contextual-governance/issues/50),
+directly so the file is loaded before Next starts ([#50](https://github.com/ArcadeAI-labs/mastra-contextual-governance/issues/50),
 fixed in #55). A real environment variable still wins, which is what
 `PORT=4420 bun run --cwd apps/web dev` and Render's injected `PORT` rely on.
 

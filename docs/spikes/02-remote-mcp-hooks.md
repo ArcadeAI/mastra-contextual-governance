@@ -5,7 +5,7 @@ Remote MCP server registered in Arcade, with a payload identical in shape to the
 toolkits produce. `DESIGN.md`'s architecture holds: `apps/loan-mcp` can be an external Bun
 service.
 
-Resolves [#2](https://github.com/ArcadeAI/mastra-contextual-governance/issues/2).
+Resolves [#2](https://github.com/ArcadeAI-labs/mastra-contextual-governance/issues/2).
 Clears open risk 1 in `DESIGN.md`.
 
 **Reproduced.** Run end to end on 2026-09-02 against a throwaway project: a probe MCP server

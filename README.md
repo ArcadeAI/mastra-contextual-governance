@@ -23,7 +23,7 @@ cannot decide (`/post` passes output through until #16). `apps/web` is still a s
 serves a health endpoint and nothing else.
 
 See [`DESIGN.md`](./DESIGN.md) for the architecture and the decisions behind it, and
-[issue #1](https://github.com/ArcadeAI/mastra-contextual-governance/issues/1) for the
+[issue #1](https://github.com/ArcadeAI-labs/mastra-contextual-governance/issues/1) for the
 PRD and the work breakdown.
 
 ## Layout
@@ -189,4 +189,4 @@ committing them. `.env.example` says where to obtain each one.
 
 The domain swap is structural, not a README instruction: replace `apps/loan-app`,
 `tools/loan` and the seed data, leave `packages/` alone. Full guide lands in
-[#24](https://github.com/ArcadeAI/mastra-contextual-governance/issues/24).
+[#24](https://github.com/ArcadeAI-labs/mastra-contextual-governance/issues/24).

@@ -13,13 +13,13 @@ wrong prompt — say so and stop.
 
 ## Read first, in this order
 
-1. `gh issue view {{N}} --repo ArcadeAI/mastra-contextual-governance --comments`
+1. `gh issue view {{N}} --repo ArcadeAI-labs/mastra-contextual-governance --comments`
    — **the comments are not optional.** Decisions and measured findings land
    there after the body is written, and the body is often the older document.
 2. `DESIGN.md` — the authoritative record: architecture, contracts, and the
    reasoning behind each decision. Do not deviate from it. Do not edit it. If it
    seems wrong or silent on something you need, `orca orchestration ask`.
-3. `gh issue view 1 --repo ArcadeAI/mastra-contextual-governance` — the PRD.
+3. `gh issue view 1 --repo ArcadeAI-labs/mastra-contextual-governance` — the PRD.
 
 ## What this project is, so you know what matters
 

@@ -17,10 +17,10 @@ finding — never a soft approve with caveats buried in prose.
 
 ## Read first
 
-1. `gh issue view {{N}} --repo ArcadeAI/mastra-contextual-governance --comments`
+1. `gh issue view {{N}} --repo ArcadeAI-labs/mastra-contextual-governance --comments`
    — the acceptance criteria, **and the comments**, where later decisions and
    measured findings live. The issue body is often the older document.
-2. `gh pr view {{PR}} --repo ArcadeAI/mastra-contextual-governance --comments` —
+2. `gh pr view {{PR}} --repo ArcadeAI-labs/mastra-contextual-governance --comments` —
    the diff, the implementer's evidence, and prior rounds.
 3. `DESIGN.md` — the contracts this slice must respect.
 
