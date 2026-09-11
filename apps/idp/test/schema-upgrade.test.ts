@@ -508,6 +508,58 @@ describe("a disk written before #58 made user.email case-insensitive", () => {
   /** As `PERSONA_DANA_EMAIL` was set on `cg-idp` during the #13 sitting. */
   const CAPITALISED = "Dana.Okafor@Bank.Example";
 
+  /**
+   * SHA-256 of `git show 3d2dd9d^:apps/idp/src/schema.sql` with `--` comment
+   * lines and blank lines removed, which is what `sqlPayload` produces.
+   *
+   * Computed by applying `sqlPayload` to the real Git object and to the
+   * checked-in fixture and confirming both digests matched, so this constant
+   * encodes the pre-#58 schema itself rather than whatever the fixture
+   * happens to hold today.
+   */
+  const PRE_58_PAYLOAD_SHA256 =
+    "d8d2fe389a813ec5013edbfb2247d04ce4fe59c4d5fff040a43f9b9b6e5b0f92";
+
+  /**
+   * The executable part of a schema file: every line that is not a `--`
+   * comment and not blank. SQLite ignores both, so two files with the same
+   * payload create the same database.
+   */
+  function sqlPayload(text: string): string {
+    return text
+      .split("\n")
+      .filter((line) => !line.startsWith("--") && line.trim() !== "")
+      .join("\n");
+  }
+
+  test("the fixture's SQL payload is the pre-#58 schema, unmodified", async () => {
+    // The fixture is not byte-identical to the Git object: it carries an
+    // explanatory header saying where it came from and that it is frozen.
+    // The header is the whole reason a reader can trust the file, so the
+    // provenance claim is made about the payload instead — and checked here,
+    // in CI, without reading repository history, which is the thing that made
+    // round 2 pass locally and fail in the gate.
+    const payload = sqlPayload(readFileSync(PRE_58_SCHEMA, "utf8"));
+    const digest = Buffer.from(
+      await crypto.subtle.digest("SHA-256", new TextEncoder().encode(payload)),
+    ).toString("hex");
+
+    expect(digest).toBe(PRE_58_PAYLOAD_SHA256);
+
+    // Said again in a form that survives the hash: a digest mismatch alone
+    // tells you something moved, not what, and the next person to see this
+    // fail should not have to reconstruct why these tables are the point.
+    expect(payload).toContain('"email" text not null unique');
+    expect(payload.toLowerCase()).not.toContain("collate nocase");
+    expect(payload).not.toContain('create table "jwks"');
+    for (const table of ["user", "session", "account", "oauthClient", "oauthConsent"]) {
+      expect(payload).toContain(`create table "${table}"`);
+    }
+    // Nothing but SQL survived the strip.
+    expect(payload).not.toContain("--");
+    expect(payload.split("\n").every((line) => line.trim() !== "")).toBe(true);
+  });
+
   /** The frozen pre-#58 schema. See `PRE_58_SCHEMA`. */
   function schemaBefore58(): string {
     const sql = readFileSync(PRE_58_SCHEMA, "utf8");

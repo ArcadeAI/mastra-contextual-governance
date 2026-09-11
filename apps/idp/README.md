@@ -282,9 +282,22 @@ If two people differ only by the case of their address they would collapse into 
 so the boot **refuses and rolls back** rather than picking a winner, and prints the query
 that finds them.
 
-`test/schema-upgrade.test.ts` holds all of it, including the fixture built from
-`git show 3d2dd9d^:apps/idp/src/schema.sql` — the real pre-#58 schema, read out of git
-rather than transcribed, so it cannot drift into agreeing with the code it tests.
+`test/schema-upgrade.test.ts` holds all of it. Its fixture is
+[`test/fixtures/schema-pre-3d2dd9d.sql`](./test/fixtures/schema-pre-3d2dd9d.sql): the real
+pre-#58 `src/schema.sql`, **checked in and frozen**, with its provenance — the commit it
+was taken from, the `git show` that captured it, and why it must never be regenerated — in
+the file's own header.
+
+It is checked in rather than read out of git at test time because
+`actions/checkout@v4` fetches a single commit, so a test that resolves `3d2dd9d^` passes
+on a developer's clone and fails in CI — which is exactly what it did. A test must not
+depend on repository history.
+
+Frozen rather than transcribed, so it cannot drift into agreeing with the code it tests.
+Two assertions hold that: the SQL payload (every line that is not a `--` comment and not
+blank, which is all SQLite reads) is pinned to the SHA-256 of the same payload taken from
+the Git object, and the table set it must and must not contain is spelled out so a digest
+mismatch says what moved. Editing the header is free; editing a line of SQL is not.
 
 ### Why it is not a workspace member
 
