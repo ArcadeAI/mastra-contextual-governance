@@ -58,6 +58,28 @@ const idpHost = new URL(IDP_ISSUER).host;
 const verifierHost = process.env.VERIFIER_HOST?.trim();
 const trustedPageHosts = [idpHost, ...(verifierHost ? [verifierHost] : [])];
 
+
+/**
+ * Pull the `authorization_url` out of a `tools/call` result.
+ *
+ * Arcade signals an unmet auth requirement as `isError: true` with a text block
+ * whose body is JSON: `{authorization_url, llm_instructions, message}`. Parse the
+ * block; do not pattern-match the enclosing serialisation, or the URL arrives with
+ * its ampersands still escaped.
+ */
+function authorizationUrlFrom(result: any): string | undefined {
+  for (const block of result?.result?.content ?? []) {
+    if (block?.type !== "text" || typeof block.text !== "string") continue;
+    try {
+      const payload = JSON.parse(block.text);
+      if (typeof payload?.authorization_url === "string") return payload.authorization_url;
+    } catch {
+      /* not the JSON block */
+    }
+  }
+  return undefined;
+}
+
 const persona = { email: required("PERSONA_EMAIL"), password: required("PERSONA_PASSWORD") };
 const t = new Transcript();
 
@@ -246,10 +268,13 @@ async function main() {
     });
     t.hop(`tools/call ${TOOL} -> ${call.status}`, call.json ?? call.text);
 
-    // Hop 2: the tool's own OAuth requirement. Arcade hands back a URL to visit;
-    // whether the persona has to log in again, or the IdP session from hop 1 is
-    // reused, is question 3.
-    const toolAuthUrl = /https?:\/\/[^\s"'<>)]+/.exec(JSON.stringify(call.json ?? call.text) ?? "")?.[0];
+    // Hop 2: the tool's own OAuth requirement. Arcade hands the URL back inside a
+    // JSON document inside an MCP text block, so it has to be parsed rather than
+    // pattern-matched out. A regex over the serialised form finds the URL with its
+    // `&` still written `\u0026`, and walking that gets `response_type is required`
+    // from our own IdP — a plausible-looking failure that is entirely the client's
+    // fault. Measured the hard way.
+    const toolAuthUrl = authorizationUrlFrom(call.json);
     if (toolAuthUrl && !toolAuthUrl.startsWith(MCP_URL)) {
       t.hop("hop 2 — the tool call handed back a URL; walking it with the same cookie jar", toolAuthUrl);
       const cookiesBefore = jar.hosts();

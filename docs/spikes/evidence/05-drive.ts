@@ -144,21 +144,42 @@ export function unescapeHtml(value: string): string {
 export interface ParsedForm {
   action: string;
   fields: Record<string, string>;
+  /** Every value offered for a name, in document order. A consent form offers two. */
+  choices: Record<string, string[]>;
+  /** True if any control is a password input — the thing the host guard actually cares about. */
+  asksForCredentials: boolean;
 }
 
-/** The IdP's pages are server-rendered HTML with one form; a regex parse is enough. */
+/** An affirmative answer on a consent form, as opposed to the one next to it that is not. */
+const AFFIRMATIVE = /^(allow|approve|accept|consent|authorize|authorise|grant|yes|true|confirm|continue)$/i;
+
+/**
+ * The pages in this chain are server-rendered HTML with one form; a regex parse is enough.
+ *
+ * `choices` exists because of Arcade's gateway consent screen, which submits **one**
+ * form with two buttons — `name="action" value="deny"` first, `value="allow"` second.
+ * A parser that keeps the last value it saw picks `allow` here by accident of
+ * document order, and would pick `deny` on any page that lists them the other way
+ * round. That is a coin flip deciding whether a measurement runs, so the choice is
+ * made explicitly in `driveAuthorize` instead.
+ */
 export function parseForm(html: string): ParsedForm | null {
   const form = /<form\b[^>]*>([\s\S]*?)<\/form>/i.exec(html);
   if (!form) return null;
   const action = unescapeHtml(/\baction\s*=\s*["']([^"']*)["']/i.exec(form[0])?.[1] ?? "");
   const fields: Record<string, string> = {};
+  const choices: Record<string, string[]> = {};
+  let asksForCredentials = false;
   for (const match of form[1].matchAll(/<(?:input|button|textarea)\b[^>]*>/gi)) {
     const tag = match[0];
+    if (/\btype\s*=\s*["']password["']/i.test(tag)) asksForCredentials = true;
     const name = /\bname\s*=\s*["']([^"']*)["']/i.exec(tag)?.[1];
     if (!name) continue;
-    fields[name] = unescapeHtml(/\bvalue\s*=\s*["']([^"']*)["']/i.exec(tag)?.[1] ?? "");
+    const value = unescapeHtml(/\bvalue\s*=\s*["']([^"']*)["']/i.exec(tag)?.[1] ?? "");
+    fields[name] = value;
+    (choices[name] ??= []).push(value);
   }
-  return { action, fields };
+  return { action, fields, choices, asksForCredentials };
 }
 
 export interface DriveResult {
@@ -235,9 +256,19 @@ export async function driveAuthorize(
 
     pagesShown += 1;
     pageHosts.push(host);
-    if (options.trustedPageHosts && !options.trustedPageHosts.includes(host)) {
+
+    // The guard is about **credentials**, not about hosts in general. Spike 04 wrote
+    // it as "stop on any form from an untrusted host", and that was right while the
+    // only forms in the chain were logins. It is wrong now: with the User Source
+    // working, Arcade renders its own gateway consent screen on `cloud.arcade.dev`
+    // — `flow_state` and an `action` button, no password field anywhere — and a
+    // blanket host rule stops the measurement at the last step for no safety gain.
+    // So: never put a password into a host that was not named, and let a form that
+    // asks for no credential through, recording whose it was.
+    const untrusted = options.trustedPageHosts && !options.trustedPageHosts.includes(host);
+    if (untrusted && form.asksForCredentials) {
       transcript.hop(
-        `page ${pagesShown}: ${host} rendered a form, and it is not one of ${options.trustedPageHosts.join(", ")} — stopping`,
+        `page ${pagesShown}: ${host} asked for a password, and it is not one of ${options.trustedPageHosts!.join(", ")} — stopping`,
         { action: new URL(form.action || url, url).toString(), fields: Object.keys(form.fields) },
       );
       return {
@@ -245,19 +276,58 @@ export async function driveAuthorize(
         pagesShown,
         pageHosts,
         stoppedAt: url,
-        stoppedBecause: `${host} is not a host this spike will type a password into`,
+        stoppedBecause: `${host} asked for a password and is not a host this spike will type one into`,
       };
     }
 
     const action = new URL(form.action || url, url).toString();
     const body = new URLSearchParams(form.fields);
     const identifier = "email" in form.fields ? "email" : "username" in form.fields ? "username" : undefined;
-    if (identifier) {
+    if (identifier && form.asksForCredentials) {
       body.set(identifier, persona.email);
       body.set("password", persona.password);
       transcript.hop(`page ${pagesShown}: login at ${stripQuery(url)}`, { action, fields: Object.keys(form.fields) });
     } else {
-      transcript.hop(`page ${pagesShown}: consent at ${stripQuery(url)}`, { action, fields: Object.keys(form.fields) });
+      // A form with no credential field. Where a name offers more than one value —
+      // Deny and Allow are two buttons on one form — say which one this is, rather
+      // than inheriting whichever the markup happened to list last.
+      const chosen: Record<string, string> = {};
+      for (const [name, values] of Object.entries(form.choices)) {
+        if (values.length < 2) continue;
+        const yes = values.find((v) => AFFIRMATIVE.test(v));
+        if (yes) {
+          body.set(name, yes);
+          chosen[name] = yes;
+        }
+      }
+
+      // On a host we did not name, "no password field" is not enough to submit.
+      // Arcade's own account login is a form with no password on it at all: one
+      // field, `provider`, offering `github-…`, `google-…` and `microsoft-…`. This
+      // walked it once and ended up on `login.microsoftonline.com`, which is a
+      // third party's sign-in page and none of this spike's business. So an
+      // untrusted host has to be offering an explicit yes/no decision — an
+      // affirmative among a set of alternatives — and an identity-provider chooser
+      // is not one.
+      if (untrusted && Object.keys(chosen).length === 0) {
+        transcript.hop(
+          `page ${pagesShown}: ${host} offered a choice that is not a consent decision — stopping`,
+          { action, fields: Object.keys(form.fields), offered: form.choices },
+        );
+        return {
+          visited,
+          pagesShown,
+          pageHosts,
+          stoppedAt: url,
+          stoppedBecause: `${host} rendered a chooser, not a consent decision, and is not a host this spike will act on`,
+        };
+      }
+      transcript.hop(`page ${pagesShown}: consent at ${stripQuery(url)}${untrusted ? ` (${host}, not our IdP — no credential asked for)` : ""}`, {
+        action,
+        fields: Object.keys(form.fields),
+        offered: Object.fromEntries(Object.entries(form.choices).filter(([, v]) => v.length > 1)),
+        chosen,
+      });
     }
 
     const post = await jar.fetch(action, {
