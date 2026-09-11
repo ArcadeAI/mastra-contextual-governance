@@ -287,58 +287,121 @@ code runs afterwards either way, so the manual path is not a second design. **Th
 spike will use the manual path**, and the write-up says so rather than implying an
 automated flow was observed.
 
-### What the chain does today, with no custom verifier set
+### Without a custom verifier: Arcade's account wall
 
-Measured 15:29:21Z. `Loan_GetLoan` for `LN-2291` returns `isError: true` and a text
-block whose body is JSON — `{authorization_url, llm_instructions, message}`, and
-*"The tool was not executed because it requires authorization."* Walking that URL
-**with the same cookie jar hop 1 used**:
+Measured 15:29:21Z, before the route was saved. `Loan_GetLoan` for `LN-2291` returns
+`isError: true` and a text block whose body is JSON — `{authorization_url,
+llm_instructions, message}`. Walking that URL **with the same cookie jar hop 1
+used**:
 
 ```
 GET  https://cg-idp-or5b.onrender.com/oauth2/authorize
-       ?client_id=RskTFjl6…
-       &redirect_uri=https%3A%2F%2Fcloud.arcade.dev%2Fapi%2Fv1%2Foauth%2F<provider-id>%2Fcallback
-       &scope=openid+email&state=4bb88623-…  (PKCE S256)
+       ?client_id=RskTFjl6…&scope=openid+email&state=…
+       &redirect_uri=…%2Fapi%2Fv1%2Foauth%2F<provider-id>%2Fcallback   (PKCE S256)
 302 → https://cloud.arcade.dev/api/v1/oauth/<provider-id>/callback?code=<redacted>&…
-303 → https://cloud.arcade.dev/api/v1/oauth/callback_verify?flow_id=4bb88623-…
+303 → https://cloud.arcade.dev/api/v1/oauth/callback_verify?flow_id=…
 303 → https://auth.arcade.dev/self-service/login/browser
 303 → https://account.arcade.dev/login          ← Arcade's account wall
 ```
 
-Two results, and both matter more than the round-1 document expected.
-
-**The IdP session is reused completely.** Our IdP answered hop 2's authorize with a
-bare `302` straight to the callback. **No login page, no consent page, zero pages
-rendered.** Dana signs in once, at hop 1, and hop 2 is silent. The round-trip
-question #75 asked is answered, and it is the good answer: *one* interactive login
-per persona, not two.
-
 **`callback_verify` is the verifier's hook point, and a User Source persona does not
-bypass it.** With no custom route configured it sends the persona to
-`account.arcade.dev` — Arcade's documented default, *"each end user [must] sign in
-to an Arcade account that is a member of your project"*. Hop 1's identity does not
-carry into hop 2's tool authorization at all. **This settles a question round 1 left
-open**: the verifier is not optional scaffolding that a User Source might make
-redundant. It is load-bearing, and `#14` needs it.
+bypass it.** Hop 1's identity does not carry into hop 2's tool authorization. The
+verifier is not optional scaffolding a User Source makes redundant; it is
+load-bearing.
 
-Note what is on that URL already: `flow_id=4bb88623-…`, the same value as the
-`state` on the authorization URL. That is precisely the parameter Arcade's
-documentation says a custom verifier receives, so the contract
-`evidence/05-verifier.ts` implements is the right one.
+### With the route saved: Arcade calls the verifier
 
-The walk stopped at `account.arcade.dev` without typing anything. It is a form with
-no password on it at all — one field, `provider`, offering `github-…`, `google-…`
-and `microsoft-…` — so the browserless agent needed a rule sharper than "refuse
-password forms" to leave it alone; see the transcript.
+**H2-a — measured, yes.** Repeatedly, from 16:08Z onward. `callback_verify` and
+`account.arcade.dev` disappear from the chain entirely:
 
-### What is not known, and what will answer it
+```
+302 GET  https://cg-idp-or5b.onrender.com/oauth2/authorize
+303 GET  https://cloud.arcade.dev/api/v1/oauth/<provider-id>/callback
+303 GET  https://<tunnel>/verify?flow_id=9d80728c-…          ← ours
+302 GET  https://cg-idp-or5b.onrender.com/oauth2/authorize   ← the verifier's own leg
+303 GET  https://<tunnel>/callback
+200 GET  https://cloud.arcade.dev/api/v1/oauth/callback_success
+```
 
-| | Question | How it gets answered |
-|---|---|---|
-| **H2-a** | With the route saved, does `callback_verify` redirect to the verifier instead of `account.arcade.dev`? | one run of `05-verifier-flow.ts`; the verifier logs every request it receives and `GET /state` shows whether Arcade arrived |
-| **H2-b** | Does `confirm_user` complete it, and does the tool call then succeed? | the exact `curl` per `flow_id`, run by the human; then the `tools/call` result |
-| **H2-c** | Is `/pre`'s `context.user_id` the email the verifier confirmed? | `GET https://cg-hooks.onrender.com/audit`, or `/events` with `last-event-id: 0` (#62). `/access` already carries it; `/pre` needs the tool to run |
-| **H2-d** | A second persona without logging the first out? | repeat H2-b as Sam for `Loan_SearchLoans`. Explicitly optional |
+**Arcade sends exactly one parameter.** The verifier records the whole query string
+rather than picking out the field it expected, and the record is:
+
+```
+[verifier] GET /verify — Arcade sent 1 parameter(s) {"flow_id":"9d80728c-4b82-46c6-9784-8c22fd4da762"}
+```
+
+No user hint, no provider, no return URL. A verifier gets a `flow_id` and must
+establish identity entirely on its own — which is exactly why it must not read a
+session of its own if the caller runs a persona switcher.
+
+**The persona is not asked to log in again.** Line 4 above is a bare `302`: hop 1's
+IdP session is still live, so the verifier's own authorization-code + PKCE login
+completes silently. Dana authenticates **once**, at hop 1.
+
+**And it binds the identity our IdP asserts.** The full verifier log for one flow:
+
+```
+[verifier] GET /verify — Arcade sent 1 parameter(s) {"flow_id":"9d80728c-…"}
+[verifier] 303 to the IdP for flow 9d80728c-…
+[verifier] IdP token exchange, client_secret_basic -> 200 {"access_token":"<redacted>",…}
+[verifier] IdP /oauth2/userinfo -> 200 {"sub":"9d8c2228-…","email":"dana.okafor@…"}
+[verifier] POST confirm_user -> 200
+             {"auth_id":"ar_3JBpvQoFcPv8Pyb1mgAuz5smr8B",
+              "next_uri":"https://cloud.arcade.dev/api/v1/oauth/callback_success"}
+```
+
+`confirm_user` returned **200, not `user_mismatch`**, for the address our IdP put on
+`/oauth2/userinfo`. That is the direct answer to a question raised during the
+sitting: with Arcade's *default* verifier the binding follows whichever Arcade
+account the browser is signed into; with a custom verifier there is no Arcade
+account in the chain at all, and the only identity available is the one
+`confirm_user` is handed.
+
+Note `sub` there is an opaque uuid. If the User Source were keyed on `sub` instead
+of `email`, that uuid is the string Arcade would hold and the panel would show —
+DESIGN.md's open risk 4 in one line.
+
+### …and the grant still does not store
+
+**H2-b — half measured.** The *verification* half is complete and correct: Arcade
+called the verifier, the verifier proved who the persona was, `confirm_user`
+accepted it, and the browser reached `callback_success` with a 200. The *token*
+half fails. Retrying `Loan_GetLoan` immediately afterwards — and again in a
+completely fresh MCP session with a fresh gateway token — returns `isError: true`
+with a brand-new `authorization_url` every time.
+
+What sits between those two is Arcade exchanging, at our IdP, the code it took at
+its own provider callback. #61's token logging caught it:
+
+```
+2026-09-11T16:35:45.537Z [idp] POST /oauth2/token rejected: status=400
+  error=invalid_grant error_description="invalid code"
+  client_auth="client_secret_post" client_id=RskTFjl6AqkUO8FKYWjpDCLd139YE36F
+```
+
+Read `client_auth="client_secret_post"`. That is not the verifier — the verifier is
+in the same window sending `client_secret_basic` and getting 200. It is **Arcade's
+`cg-idp` auth provider**, still putting the secret in the body after #61 registered
+that client `client_secret_basic`. It could not have succeeded with any code. The
+`invalid_grant` in front of it hides the method problem, because the IdP validates
+the code before the client (finding 1g).
+
+**The dashboard said otherwise, and that is a finding.** The provider's
+Authentication Method dropdown read *"Client Secret Basic"*, greyed out, with the
+tooltip *"Currently, client secret basic is the only supported authentication
+method."* Underneath, its Token Settings and Refresh Token Settings each carried
+Request Parameters rows `client_id={{client_id}}` and `client_secret={{client_secret}}`
+— left over from the #13 sitting's template — and **those rows are what decides the
+wire behaviour**. A control that reports itself as one thing and does another, in
+the console this demo depends on, is precisely the failure mode this project exists
+to keep out.
+
+The human removed both pairs and re-entered the post-rotation secret. The chain
+still ends the same way: verification perfect, grant absent.
+
+**So H2-c and H2-d are unmeasured, and `/pre` has never fired for a loan tool.**
+A layer-2 refusal produces no hook — DESIGN.md's open risk 2, met again — so the
+control plane shows nothing at all for any of this. Only `/access` frames exist.
 
 ### How many pages a persona sees, at our IdP
 
