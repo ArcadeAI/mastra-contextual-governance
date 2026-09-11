@@ -79,35 +79,38 @@ PROBE_ONLY=1 ARCADE_MCP_URL=https://api.arcade.dev/mcp/cg-demo-us \
 
 ## What the human has to do, in order
 
-These are #24 material. Steps 1–2 are **done** and recorded so a forker knows they
-are required; 3–5 are the sitting this spike is waiting for.
+#24 material. Everything here was done during the sitting of 2026-09-11 except the
+last item, which is what hop 2 is still waiting on.
 
-1. ~~**Land #61 (PR #78) and register the `cg-idp` client `client_secret_basic`.**~~
-   **Done, `aa98780`.** `/health` on the live IdP now reports
-   `token_endpoint_auth_method: "client_secret_basic"` with
-   `client_secret_state: "unchanged"`, and hop 1's token exchange succeeds. The
-   auth-method mismatch was the cause, and it is now measured rather than inferred.
-2. ~~**Flip the `cg-idp` auth provider to `client_secret_basic` in the dashboard.**~~
-   **Done.** Hop 2's authorize reaches our IdP and returns a code.
-3. **Arcade dashboard → Auth → Settings → Custom verifier route.** Paste the tunnel
-   URL `05-verifier.ts` prints at startup. **This has never been set**, and it is
-   the only reason H2-a–d are unmeasured.
-4. **`IDP_OAUTH_REDIRECT_URIS` on the `cg-idp` Render service.** Append the
-   verifier's `/callback`, keeping every existing entry — the list already carries
-   the User Source's `.../oauth2/intermediate_callback` and the auth provider's
-   per-provider `.../api/v1/oauth/<provider-id>/callback`, and both must survive.
-   `evidence/05-redirect-allowlist.ts <url>` confirms the change landed without
-   opening the dashboard.
-5. **Write `docs/spikes/evidence/.env.local`** with `IDP_CLIENT_ID` and
-   `IDP_CLIENT_SECRET`. Gitignored at any depth; the verifier re-reads it per flow,
-   so no restart and no change to the URL already pasted in step 3.
+1. ~~**Land #61 and register the `cg-idp` client `client_secret_basic`.**~~ **Done,
+   `aa98780`.** `/health` reports `token_endpoint_auth_method: "client_secret_basic"`;
+   hop 1's token exchange succeeds. The auth-method mismatch is now measured, not
+   inferred.
+2. ~~**Give `apps/idp` a request log.**~~ **Done, #61.** It paid for itself four
+   times in one evening: every diagnosis in this document rests on one of its lines.
+3. ~~**Arcade dashboard → Auth → Settings → Custom verifier route.**~~ **Done.** This
+   is what H2-a needed, and Arcade calls it.
+4. ~~**`IDP_OAUTH_REDIRECT_URIS` on `cg-idp`.**~~ **Done**, and verified from outside
+   with `evidence/05-redirect-allowlist.ts` rather than by asking twice. The live list
+   carries three: the User Source's `.../oauth2/intermediate_callback`, the auth
+   provider's per-provider `.../api/v1/oauth/<provider-id>/callback`, and the
+   verifier's. **Note that a provider recreate rotates that middle one**, so the
+   allowlist has to be updated with it — a step that fires no hook if missed.
+5. ~~**Credentials in `docs/spikes/evidence/.env.local`.**~~ **Done.** Gitignored at
+   any depth; the verifier re-reads it per flow so nothing needs restarting.
+6. **Find out why Arcade's `cg-idp` auth provider cannot exchange the code.** The
+   only thing left. The verification half of hop 2 is complete and correct; the token
+   half has failed for three distinct reasons in sequence and still fails with all
+   three fixed. Start at the `cg-idp` log window **17:38:50Z–17:40:00Z** and the
+   `POST /oauth2/token` line that is *not* the verifier's own 200 — the transcript
+   says what each status would mean, including that no line at all means Arcade never
+   attempted it.
 
-**Worth raising with Arcade while you are in there.** Hop 1 now renders Arcade's own
-gateway consent screen at `cloud.arcade.dev/oauth2/consent` — *"Authorize access /
-Allow this application to access your **Arcade.dev account**?"* — to a persona who
-has just signed in at the bank's IdP. One extra click per persona per MCP client, and
-the wording undercuts the claim the demo is making. Arcade documents an allowlist of
-MCP client IDs that bypasses that screen. Not blocking; #24 material.
+**Worth raising with Arcade.** Hop 1 renders Arcade's own gateway consent screen at
+`cloud.arcade.dev/oauth2/consent` — *"Allow this application to access your
+**Arcade.dev account**?"* — to a persona who has just signed in at the bank's IdP.
+One extra click per persona per MCP client, and the wording undercuts the claim the
+demo makes. Arcade documents an allowlist of MCP client IDs that bypasses it.
 
 ## Setup
 
@@ -487,9 +490,36 @@ GET  cg-idp-or5b/oauth2/authorize?client_id=https%3A%2F%2F…%2Foauth2%2Ftoken
 302 → cg-idp-or5b/error?error=invalid_client&error_description=client_id+is+required
 ```
 
-**So H2-c and H2-d are unmeasured, and `/pre` has never fired for a loan tool.**
-A layer-2 refusal produces no hook — DESIGN.md's open risk 2, met again — so the
-control plane shows nothing at all for any of this. Only `/access` frames exist.
+**With every known cause fixed, it still does not store.** At 17:37Z the Client ID
+was corrected and confirmed. Dana's retry was not a valid test — **Arcade caches a
+pending authorization flow, `authorization_url` included**, so she got the same
+`state` and the same stale bad `client_id` as the run before. That is a #24 note in
+itself: after editing a provider, flows already minted keep failing with the old
+configuration.
+
+Sam had no cached flow, so his run at 17:38:46Z is the clean one, and it is textbook:
+correct client id, a code issued, Arcade's provider callback, `303` to the verifier,
+a **silent** IdP leg, `client_secret_basic` token exchange 200, `/oauth2/userinfo`
+returning `{"sub":"25bb917b-…","email":"sam.reyes@…"}`, `confirm_user` 200,
+`callback_success` 200. `Loan_SearchLoans` retried immediately afterwards still
+returns `isError: true` with a new `authorization_url`.
+
+So: a correct Client ID, a correct secret, an `auth_method` of `client_secret_basic`,
+a fresh flow, and a complete and correct verification — and no grant. The one step
+invisible from outside is Arcade's own token exchange at our IdP. The transcript
+records the exact log window, **17:38:50Z–17:40:00Z**, so whoever picks this up starts
+one command in rather than at the beginning.
+
+**H2-d's identity half is measured, and it is the good news.** Sam's `sub`
+(`25bb917b-…`) differs from Dana's (`9d8c2228-…`), each email is the right one, and
+8280 `/access` frames on Sam's run all carry `sam.reyes@…` lowercase. **The verifier
+binds two distinct personas correctly**, which is what a persona switcher needs from
+it. What is unmeasured is whether both can hold a tool *grant* at once, because
+neither can hold one at all yet.
+
+**And `/pre` has never fired for a loan tool.** A layer-2 refusal produces no hook —
+DESIGN.md's open risk 2, met again — so the control plane shows nothing whatsoever
+for any of hop 2. Only `/access` frames exist.
 
 ### How many pages a persona sees, at our IdP
 
@@ -625,7 +655,9 @@ The costs above are real; the impossibility was not.
 | **H2-b — the tool executes** | ⬜ **unmeasured.** Three causes found and fixed in sequence; the last is a misfiled Client ID holding a URL. Nothing suggests a fourth, and nothing here proves there isn't one |
 | **H2-c — `/pre` carries Dana's lowercase email** | ⬜ **unmeasured.** `/access` does. `/pre` has never fired for a loan tool, because a layer-2 refusal fires no hook |
 | **H2-d — two personas at once** | ⬜ **unmeasured** |
-| Whether one IdP client can serve all three relying parties | ⬜ **not settled.** The costs are measured; the impossibility this document first claimed was read off an old provider record and does not generalise |
+| **Two personas bind distinct identities through the verifier** | ✅ Sam's `sub` and email differ from Dana's, each correct, 8280 `/access` frames each |
+| Arcade caches a pending flow's `authorization_url` | ✅ Dana's retry after the fix reused the stale `state` and the stale bad `client_id` |
+| Whether one IdP client *could* serve all three relying parties | ⬜ **not settled by measurement**, and no longer open as a decision: the human chose to split after hop 2 failed with one shared client. The costs are measured; the impossibility an earlier draft claimed was read off an old provider record |
 | What Arcade changed at ~14:24Z to start honouring the User Source | ⬜ **unexplained.** Ours to notice, not ours to know |
 
 ## Recommendation for #14
@@ -669,13 +701,37 @@ and `apps/web` stores four gateway tokens and switches between them. Add one cli
 per persona for Arcade's own gateway consent screen unless the MCP client id is
 allowlisted, which Arcade documents.
 
-**Provisional: whether `apps/idp` needs a second OAuth client.** ⬜ Three relying
-parties share one today, and the measured costs are one auth method, one
-once-readable secret to rotate into two dashboards, and one shared consent. The
-last of those is currently load-bearing in our favour — it is *why* hop 2 is
-silent — so splitting clients would add a consent per persona. **Do not open that
-slice on this spike's authority.** It needs the human's DESIGN gate, and the case
-for it is weaker than an earlier draft of this document claimed.
+**`apps/idp` needs one OAuth client per relying party. Decided by the human
+(2026-09-11), on the failure branch of a condition set before the last run.** The
+condition was: if hop 2 completed with one shared client, one client stands; if not,
+split them. It did not.
+
+| client | relying party | auth method |
+|---|---|---|
+| A | the `cg-idp` **User Source** | `client_secret_basic` |
+| B | the `cg-idp` **auth provider** | whatever its record stores — read it back, do not trust the label |
+| C | **`apps/web`**, for its own sign-in | ours to choose |
+
+Two corrections to carry with that, so nobody inherits a bad reason for a right
+decision. First, an earlier draft argued the split was *forced*, because an Arcade
+auth provider could only ever put credentials in the body. That was read off a
+provider record created 2026-09-10 which carries no `auth_method` on its token
+request at all; one recreated the same evening carries
+`auth_method: "client_secret_basic"`. The impossibility does not generalise — the
+costs do. Second, one shared client is currently *why* hop 2's IdP leg is silent,
+because consent is per client. **Splitting adds a consent per persona per client**,
+so the round-trip numbers above get worse and #24's rehearsal gets longer.
+
+**And `apps/web` becomes a real login.** The human's call: the persona switcher stops
+being a dropdown and becomes a sign-in against `apps/idp` under client C, with the
+verifier route reading the email from that server-side session instead of starting an
+OIDC login of its own. Simpler than `evidence/05-verifier.ts`, and the right shape
+for a hosted app — but it reintroduces the trap this spike's verifier was built to
+avoid. **A session-reading verifier can hold exactly one persona at a time.** If
+`apps/web` is to hold four, the session it reads must be keyed per persona rather
+than per browser. Design for that explicitly: it is the easiest way to build
+something that demos correctly once and thereafter binds every tool call to whoever
+signed in last.
 
 **Provisional, and it is the one that matters: H2-b.** ⬜ Whether the tool actually
 executes and `/pre` carries the right `user_id` is unmeasured. Three causes were
