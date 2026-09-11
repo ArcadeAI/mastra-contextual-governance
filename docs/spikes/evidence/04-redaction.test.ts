@@ -14,24 +14,41 @@ import { describe, expect, test } from "bun:test";
 import { REDACTED_PARAMS, redact, redactionPattern, redactQuery } from "./04-oauth-drive.ts";
 
 /**
- * An authorize URL shaped exactly like the ones a run produces, with synthetic
- * values. Synthetic on purpose: a fixture holding a real captured challenge
- * would put back the thing these tests exist to keep out.
+ * Fixture values are generated per run rather than written down.
+ *
+ * Round 1 of this file used hand-written placeholders. They read as obviously
+ * fake to a human and as live OAuth values to a scanner: once
+ * `05-redaction.test.ts` arrived and began sweeping every committed file under
+ * `docs/spikes`, those four placeholders were the only hits in the repo. A file
+ * asserting "no secret-shaped literal lives here" must not contain one, so the
+ * values come from the CSPRNG and every assertion compares against the variable.
  */
+function generatedValue(): string {
+  return Buffer.from(crypto.getRandomValues(new Uint8Array(24))).toString("base64url");
+}
+
+const STATE = generatedValue();
+const CHALLENGE = generatedValue();
+const ACCESS_TOKEN = generatedValue();
+const REFRESH_TOKEN = generatedValue();
+const LOGIN_CHALLENGE = generatedValue();
+const CLIENT_ID = crypto.randomUUID();
+
+/** An authorize URL shaped exactly like the ones a run produces. */
 const AUTHORIZE_URL =
   "https://cloud.arcade.dev/oauth2/authorize?response_type=code" +
-  "&client_id=00000000-0000-4000-8000-000000000000" +
+  `&client_id=${CLIENT_ID}` +
   "&redirect_uri=http%3A%2F%2Flocalhost%3A64265%2Fcallback" +
   "&scope=mcp+offline_access" +
-  "&state=EXAMPLESTATEVALUE0000000" +
-  "&code_challenge=EXAMPLECODECHALLENGEVALUE000000000000000000" +
+  `&state=${STATE}` +
+  `&code_challenge=${CHALLENGE}` +
   "&code_challenge_method=S256" +
   "&resource=https%3A%2F%2Fapi.arcade.dev%2Fmcp%2Fcg-demo-us";
 
 const TOKEN_RESPONSE = JSON.stringify(
   {
-    access_token: "EXAMPLE_ACCESS_TOKEN_0000",
-    refresh_token: "EXAMPLE_REFRESH_TOKEN_000",
+    access_token: ACCESS_TOKEN,
+    refresh_token: REFRESH_TOKEN,
     token_type: "Bearer",
     expires_in: 3600,
     scope: "mcp offline_access",
@@ -49,12 +66,12 @@ describe("redact", () => {
     const scrubbed = redact(AUTHORIZE_URL);
     expect(scrubbed).toContain("code_challenge=<redacted>");
     expect(scrubbed).toContain("state=<redacted>");
-    expect(scrubbed).not.toContain("EXAMPLECODECHALLENGE");
-    expect(scrubbed).not.toContain("EXAMPLESTATE");
+    expect(scrubbed).not.toContain(CHALLENGE);
+    expect(scrubbed).not.toContain(STATE);
     // What makes the transcript worth reading survives: which endpoint, which
     // client, which gateway.
     expect(scrubbed).toContain("code_challenge_method=S256");
-    expect(scrubbed).toContain("client_id=00000000-0000-4000-8000-000000000000");
+    expect(scrubbed).toContain(`client_id=${CLIENT_ID}`);
     expect(scrubbed).toContain("resource=https%3A%2F%2Fapi.arcade.dev%2Fmcp%2Fcg-demo-us");
   });
 
@@ -62,8 +79,8 @@ describe("redact", () => {
     const scrubbed = redact(TOKEN_RESPONSE);
     expect(scrubbed).toContain('"access_token": "<redacted>"');
     expect(scrubbed).toContain('"refresh_token": "<redacted>"');
-    expect(scrubbed).not.toContain("EXAMPLE_ACCESS_TOKEN");
-    expect(scrubbed).not.toContain("EXAMPLE_REFRESH_TOKEN");
+    expect(scrubbed).not.toContain(ACCESS_TOKEN);
+    expect(scrubbed).not.toContain(REFRESH_TOKEN);
     expect(scrubbed).toContain('"token_type": "Bearer"');
     expect(scrubbed).toMatch(/"expires_in": 3600/);
   });
@@ -87,7 +104,7 @@ describe("redactQuery", () => {
 
   test("scrubs the login and consent challenges the IdP hands out", () => {
     const scrubbed = redactQuery(
-      "https://auth.arcade.dev/ui/login?login_challenge=EXAMPLELOGINCHALLENGE000&foo=1",
+      `https://auth.arcade.dev/ui/login?login_challenge=${LOGIN_CHALLENGE}&foo=1`,
     );
     expect(scrubbed).toBe("https://auth.arcade.dev/ui/login?login_challenge=<redacted>&foo=1");
   });
@@ -100,7 +117,7 @@ describe("redactionPattern", () => {
 
   test("catches every parameter the scripts claim to scrub", () => {
     for (const name of REDACTED_PARAMS) {
-      const value = "0123456789abcdef";
+      const value = generatedValue();
       expect(`${name}=${value}`.match(redactionPattern())).not.toBeNull();
       expect(JSON.stringify({ [name]: value }).match(redactionPattern())).not.toBeNull();
     }

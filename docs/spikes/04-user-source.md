@@ -2,6 +2,11 @@
 
 **Answer: `apps/idp` is now capable of it, and the gateway `cg-demo-us` does not use it.**
 
+> ⚠️ **Read [the addendum](#addendum-2026-09-11) first.** That answer was true when
+> it was measured and is now out of date: the gateway began redirecting to `cg-idp`
+> later the same day, hop 1 completes, and the recommendation below is superseded.
+> Nothing above the addendum has been rewritten, on purpose.
+
 Two separate findings, both measured on 2026-09-11 and both in this document. The
 first came out of the human's dashboard sitting earlier in the day, before #70;
 the second is from the AFK measurement after it:
@@ -476,3 +481,86 @@ confidence tables; the recommendation does not.
   on Arcade's default "sign in to a project account" would undo hop 1's User
   Source. Whoever measures #75 should record the round-trip count question 3 could
   not.
+
+## Addendum, 2026-09-11
+
+Everything above this line is left as it was written. Three things changed after it
+was written, and two of them contradict it. The corrections belong here rather than
+upstairs, because what this spike measured on the day is the only reason anyone can
+tell *when* Arcade's behaviour changed.
+
+### 1. The gateway started redirecting to `cg-idp` while this PR was in review
+
+The review verdict of **14:24Z** (labelled round 2) ran a no-credential DCR and PKCE
+probe with the same `resource=https://api.arcade.dev/mcp/cg-demo-us` this document
+uses, and got:
+
+```
+302 -> https://cg-idp-or5b.onrender.com/oauth2/authorize
+   -> https://cg-idp-or5b.onrender.com/login
+```
+
+with the control gateway `cg-demo` still going to `https://auth.arcade.dev/oauth2/auth`.
+That is the opposite of what question 2 above records, and the reviewer was right to
+call the checked-in result stale.
+
+**It is a live change on Arcade's side, not a measurement error here.** The window is
+narrow and bounded by timestamps on this PR: the round-1 reply at **14:14Z** was
+written against a chain that still ended at `account.arcade.dev`, and the verdict at
+**14:24Z** found `cg-idp-or5b`. Whatever moved, moved inside those nine minutes. The
+candidate-(A)-or-(B) framing above was therefore answered as **(B)**: the gateway's
+`user_source_id` was never being ignored; the User Source's own configuration was the
+thing not working, and Arcade's broker started acting on it the moment that was fixed.
+
+**The committed evidence is not amended, and it should not be.** Every hop in
+`evidence/04-user-source-transcript.md` is a true record of what the live services did
+at the timestamp on it, and the ten-parameter negative, the `resource`-validation
+error and `urn:arcade:oauth:user_source_id` are all still correct observations about
+how the gateway advertises itself. A spike that quietly rewrites its own transcript to
+match today's behaviour is worth nothing the next time something moves. Read sections
+1 to 4 of the transcript as "before 14:15Z" and this addendum as "after".
+
+### 2. Hop 1 completes, as of 15:25Z
+
+Question 2 above is answered, elsewhere and by someone else. The driver comment on
+**#61 dated 2026-09-11 15:32Z** records the live acceptance: after `aa98780` deployed,
+the User Source token exchange against `cg-idp-or5b` returned **200** as Dana at
+**15:25Z**. The cause of every earlier failure was the client authentication method —
+`aa98780` registers the IdP's OAuth client `client_secret_basic` — and the same
+comment records that the `cg-idp` auth provider was already `client_secret_basic` in
+the dashboard, so nothing had to change there and the #13 handoff's
+"credentials in body" note was wrong about how Arcade stored it.
+
+Hop 1 now does what DESIGN.md's "one identity, not two" asks for: Dana signs in at our
+IdP, Arcade issues a gateway token, the tools list, and **every `/access` frame carries
+her exact lowercase email**. The `user_id` string question 2 could not measure is
+`dana.okafor@…`, lowercase, with no exceptions across the frames one `tools/list`
+produced. Details, counts and raw hops are in
+[`05-custom-verifier.md`](05-custom-verifier.md).
+
+One thing that is still unmeasured and is easy to misread: `/access` carries it,
+`/pre` has never fired for a loan tool. A layer-2 refusal fires no hook, which is
+open risk 2 in DESIGN.md doing exactly what it says it does.
+
+### 3. The recommendation above is superseded
+
+Do not plan #14 from the *Recommendation for #14* section above. It was written while
+hop 1 was broken, and it recommends a custom user verifier on the strength of that.
+
+- **Hop 2** is settled by spike 05, merged as **`1c1ac4f`** (PR #77 for #75; see the
+  driver comment on **#75 dated 2026-09-11 18:16Z**). Its own finding is that the
+  custom verifier is not what moved hop 1 — the User Source was — so the verifier this
+  document proposed is not the mechanism to build on.
+- **What hop 2 actually needs** is issue **#79**: `apps/idp`'s token endpoint must
+  tolerate Arcade's provider request shape, which presents credentials in a Basic
+  header *and* in the body. Better Auth refuses that per RFC 6749 §2.3, and the
+  human's decision, recorded on **#75 dated 2026-09-11 18:15Z**, is that Arcade's
+  provider configuration is used as shipped and will not be hand-edited. So the change
+  is ours, not the dashboard's.
+
+What survives from this document is the measurement, not the plan: question 1 and its
+cost, question 4 in full — `MCPClient.authenticate()` refusing a non-loopback redirect
+URL, and an unauthorized `listTools()` returning an empty object rather than throwing,
+which #14 still has to guard with `getServerAuthState` — and the discovery that
+`urn:arcade:oauth:user_source_id` in a gateway's protected-resource document is how you
+check an attachment without the dashboard.

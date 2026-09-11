@@ -483,14 +483,14 @@ The full error for an unknown gateway:
 Same request each time, one extra parameter, reporting the `Location`.
 
 ```
-(baseline, resource only)              302 -> auth.arcade.dev/oauth2/auth 
-user_source_id                         302 -> auth.arcade.dev/oauth2/auth 
-user_source                            302 -> auth.arcade.dev/oauth2/auth 
-urn:arcade:oauth:user_source_id        302 -> auth.arcade.dev/oauth2/auth 
-connection                             302 -> auth.arcade.dev/oauth2/auth 
-idp_hint                               302 -> auth.arcade.dev/oauth2/auth 
-kc_idp_hint                            302 -> auth.arcade.dev/oauth2/auth 
-login_hint                             302 -> auth.arcade.dev/oauth2/auth 
-user_source_id=cg-idp (name not id)    302 -> auth.arcade.dev/oauth2/auth 
-audience                               302 -> auth.arcade.dev/oauth2/auth 
+(baseline, resource only)              302 -> auth.arcade.dev/oauth2/auth
+user_source_id                         302 -> auth.arcade.dev/oauth2/auth
+user_source                            302 -> auth.arcade.dev/oauth2/auth
+urn:arcade:oauth:user_source_id        302 -> auth.arcade.dev/oauth2/auth
+connection                             302 -> auth.arcade.dev/oauth2/auth
+idp_hint                               302 -> auth.arcade.dev/oauth2/auth
+kc_idp_hint                            302 -> auth.arcade.dev/oauth2/auth
+login_hint                             302 -> auth.arcade.dev/oauth2/auth
+user_source_id=cg-idp (name not id)    302 -> auth.arcade.dev/oauth2/auth
+audience                               302 -> auth.arcade.dev/oauth2/auth
 ```
