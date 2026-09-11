@@ -16,7 +16,12 @@ import type { Database } from "bun:sqlite";
 import { GovernanceEvent } from "@cg/policy-schema";
 
 import { AUDIT_DEFAULT_LIMIT, AUDIT_MAX_LIMIT } from "../src/audit-api.ts";
-import { newEventId, record } from "../src/audit-log.ts";
+import {
+  AUDIT_RETENTION_ROWS,
+  newEventId,
+  record,
+  retentionWarning,
+} from "../src/audit-log.ts";
 import type { HooksConfig } from "../src/config.ts";
 import { createPolicyCache, type PolicyCache } from "../src/policy-cache.ts";
 import { openGovernance } from "../src/policy-store.ts";
@@ -320,6 +325,34 @@ describe("a filter that cannot mean anything is refused, never ignored", () => {
 
   test("a since that is not a date is a 400", async () => {
     expect((await audit("?since=yesterday")).status).toBe(400);
+  });
+});
+
+describe("the stated retention bound", () => {
+  // `audit_log` is append-only and nothing prunes it, so the bound is the
+  // disk. What this has to be is *said* — a log that fills a volume silently
+  // is a control plane that stops recording without anyone deciding that.
+  test("says nothing while the log is comfortably inside the bound", () => {
+    expect(retentionWarning(0)).toBeNull();
+    expect(retentionWarning(8_259)).toBeNull();
+    expect(retentionWarning(AUDIT_RETENTION_ROWS * 0.79)).toBeNull();
+  });
+
+  test("warns from 80% of the bound, naming the count, the bound and the reset", () => {
+    const warning = retentionWarning(AUDIT_RETENTION_ROWS * 0.8);
+    expect(warning).not.toBeNull();
+    expect(warning).toInclude("1,600,000 rows");
+    expect(warning).toInclude("80%");
+    expect(warning).toInclude("2,000,000-row bound");
+    expect(warning).toInclude("scripts/reset");
+  });
+
+  test("the bound is the measured one: 487 bytes a row against a 1 GB disk", () => {
+    // `bun run --cwd apps/hooks bench` measures 487 bytes/row on disk, so the
+    // 1 GB Render volume holds ~2.2M rows. The bound is that, rounded down.
+    const rowsInAGigabyte = 1024 ** 3 / 487;
+    expect(AUDIT_RETENTION_ROWS).toBeLessThan(rowsInAGigabyte);
+    expect(AUDIT_RETENTION_ROWS).toBeGreaterThan(rowsInAGigabyte * 0.8);
   });
 });
 

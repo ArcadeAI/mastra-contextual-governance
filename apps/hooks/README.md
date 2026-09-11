@@ -455,6 +455,44 @@ Writing an approval record or a decision is **not** a decision, so neither appen
 The routing and the outcome reach the panel through the real `/pre` rows on
 `Approvals.RequestApproval` and `Approvals.Decide`, whose reasons name them.
 
+### What the log costs, and the bound on it
+
+Nothing prunes `audit_log`. The DELETE trigger refuses one, and a compliance log that can be
+quietly shortened is not one — so the bound is the disk, and it is stated rather than
+enforced at write time.
+
+Measured (`bun run --cwd apps/hooks bench`, the "audit_log on disk" section: 217,280 real
+rows written by the real handlers, vacuumed into a file and compared with an empty
+`governance.db`):
+
+| | |
+|---|---:|
+| bytes per row, on disk | **487** |
+| rows in the 1 GB Render volume | ~2,206,000 |
+| whole-project `/access` calls (10,844 rows each) | ~203 |
+| org-admin `tools/list` bursts (8,259 rows each) | ~267 |
+
+**The stated bound is 2,000,000 rows** (`AUDIT_RETENTION_ROWS`, ~930 MB). At 80% of it —
+1.6 M rows, ~744 MB — the boot log says so, naming the count and the reset, which leaves a
+quarter of the disk to notice it in:
+
+```
+[hooks] RETENTION: audit_log holds 1,600,000 rows, 80% of the 2,000,000-row bound this disk
+        is sized for. Nothing prunes it: run scripts/reset before it fills.
+```
+
+Three things follow, and the third is the one that bites:
+
+- Getting back under the bound is `scripts/reset` (#23), the same deliberate act that resets
+  everything else. There is no truncation endpoint and no rolling window; either would let
+  the log lose decisions without anybody deciding that it should.
+- `/health` reports `audit_rows`, so headroom is one unauthenticated `curl` away.
+- **Never drive the demo from an Arcade org admin.** One `tools/list` from an admin account
+  sent the entire org catalogue to `/access` — 8,259 tools, one audit row each, in a single
+  request (measured on #13). Two hundred of those fill the disk; a hundred of them make
+  `/audit` and the panel unreadable long before that. The demo personas see one gateway and
+  write four rows a call.
+
 It is **not** a complete record of every refusal a persona met. Arcade evaluates a tool's auth
 requirements *before* `/pre`: a persona without a token for a tool is refused upstream of every
 hook and leaves no row here (measured, spike #2; `DESIGN.md` open risk 2). Nothing in this
