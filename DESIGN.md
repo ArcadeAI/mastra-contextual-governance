@@ -45,7 +45,10 @@ stage a beat we want to *show* as a layer-2 refusal. See open risk 2.
 | Model | Claude Sonnet 5 via `@ai-sdk/anthropic`, temperature 0, model id from env |
 | **Tool layer** | **Both toolkits are Python `arcade-mcp`, shipped with `arcade deploy` into one Arcade project and exposed through one gateway. `arcade-mcp` is the tool-authoring framework; it is Python-only, which is why the TS-everywhere rule does not reach the toolkits. Decided on #32, confirmed in session.** |
 | **Business system** | **`apps/loan-app` is a plain HTTP API — the bank's system of record. It is not an MCP server and knows nothing about Arcade. `tools/loan` is a stateless client of it. Decided on #32; splitting them is what makes "governance is outside the business system" literal rather than asserted.** |
-| **Identity** | **Every persona is a real Arcade account with a real email. The persona switcher selects which Arcade user the agent acts as. `context.user_id` on every hook payload is that email.** |
+| **Identity** | **Every persona is a real person in `apps/idp` with a real email, and `apps/web` is a real sign-in against it (its own OAuth client, "client C"). The persona switcher is "Sign in as …": switching persona forces a fresh IdP login and never reuses the previous session. On stage each persona runs in its own Chrome profile, so switching is rare. `context.user_id` on every hook payload is that email, lowercase. Personas are *not* Arcade project members. Amended 2026-09-11 (#65, #75, #79).** |
+| **Two hops, two mechanisms** | **Hop 1, MCP client → gateway, is governed by the gateway's user mode: the User Source gateway `cg-demo-us` backed by `apps/idp`. Members mode is the fallback only. Arcade Headers is ruled out and is never proposed again. Hop 2, the tool-level OAuth against the `cg-idp` provider, is governed by a custom user verifier route in `apps/web`. Neither mechanism moves the other; measured on #75. Decided 2026-09-11.** |
+| **Gateway token storage** | **`apps/web` drives the gateway OAuth itself (Mastra's `MCPClient.authenticate()` refuses non-loopback redirects) and hands `MCPClient` a static token. The gateway access + refresh token and the persona email live in a sealed, HTTP-only, per-browser cookie (AES-GCM under `SESSION_SECRET`, chunked when over 4KB). One persona per browser. No fourth database. Refresh is server-side. Decided 2026-09-11.** |
+| **Arcade config is read-only** | **The `cg-idp` auth provider's advanced configuration is never edited; its `client_id`/`client_secret` request parameters stay. `apps/idp` adapts instead (#79: Basic header plus identical body credentials accepted). Read provider config back through `GET /v1/admin/auth_providers/<id>`, not off dashboard labels.** |
 | **Authorization** | **The loan tools require OAuth against our own provider, so they call `apps/loan-app` on behalf of the user rather than as a service account. The API derives the actor from the token, never from a parameter. OAuth carries *identity*; hooks carry *authority*. Provider is Better Auth in its own service, `apps/idp` (#36).** |
 | **One identity, not two** | **The Arcade `user_id`, the OAuth subject, and the actor `apps/loan-app` records are the same person, joined on email. If these ever diverge, `governance.db` and `loans.db` describe different people and the audit trail is fiction.** |
 | Policy source | Policy DB owned by the hook server. Editable live on stage. |
@@ -106,16 +109,38 @@ dependency in. Both halves read the same flag so they cannot drift apart. Decide
 
 ## Identity and OAuth
 
-The call chain, end to end:
+There are **two authentication hops** with two different mechanisms. Conflating them
+cost a day on #75.
 
-    Dana (persona switcher)
-      → Mastra MCPClient → https://api.arcade.dev/mcp/{gateway}   as Arcade user dana@…
+    Dana, in her own Chrome profile
+      → apps/web  "Sign in as Dana"  (OIDC code + PKCE against apps/idp, client C)
+        → sealed cookie { email, gateway tokens }
+      → hop 1: apps/web drives the gateway OAuth against cg-demo-us (User Source,
+               HTTPS redirect /api/arcade/callback, PKCE); Arcade renders its own
+               consent screen once per persona per MCP client id
+      → Mastra MCPClient → https://api.arcade.dev/mcp/cg-demo-us   bearer = gateway token
         → /access   hooks see user_id = dana@…            ← layer 1
-        → auth requirement: does Dana hold a token?        ← layer 2 (no hook fires)
+        → auth requirement: does Dana hold a cg-idp token? ← layer 2 (no hook fires)
+          first time: Arcade 303s the browser to the custom verifier
+            GET /api/arcade/verify?flow_id=…   (apps/web)
+              · session present → POST cloud.arcade.dev/api/v1/oauth/confirm_user
+                {flow_id, user_id: <session email>} server-side, then fetch next_uri
+                server-side, then send the browser on. The grant does not store
+                unless next_uri is fetched (measured, #75).
+              · no session → park flow_id in a short-lived signed cookie, send the
+                browser to sign-in, and complete the same two calls from the sign-in
+                callback. The verifier never reads the persona from the query string.
+          then Arcade exchanges the code at apps/idp as the cg-idp provider (hop 2)
         → /pre      hooks see user_id = dana@…            ← layer 3
           → tools/loan (arcade deploy) receives Dana's OAuth token
             → apps/loan-app validates it, actor = dana@…
         → /post     hooks rewrite the output               ← layer 4
+
+Arcade's default verifier demands an Arcade account that is a project member. Our
+personas are not, and a persona verified against the wrong account binds the grant to
+the wrong user and the tool re-challenges forever (observed 2026-09-11 15:40Z). The
+custom verifier is what makes the IdP-asserted email the identity on hop 2, exactly as
+the User Source makes it the identity on hop 1.
 
 Three rules this has to hold to:
 
@@ -179,8 +204,8 @@ and pin them in `.env.example` before #7 writes a rule.** Tracked on #35.
 | Riley Chen | VP Credit | $250,000 | Minimum-sufficient approver for $95K |
 | Morgan Ellis | Chief Credit Officer | $5,000,000 | Deliberately *not* bothered — proves routing |
 
-Each persona needs an Arcade account and an account in the OAuth provider, under the same
-email.
+Each persona is a person in `apps/idp`. None is an Arcade project member. Each accepts
+Arcade's gateway consent screen once per browser profile per MCP client id.
 
 Seed loan `LN-2291`, Northwind Bakery LLC, $95,000. Carries `bank_account_number` and
 `tax_id` (act 3) and an `underwriter_notes` field containing an injected instruction (act 4).
@@ -211,10 +236,12 @@ Seed loan `LN-2291`, Northwind Bakery LLC, $95,000. Carries `bank_account_number
 3. **Toolkit names are unmeasured.** See **Tool surface**. Tracked on #35, blocks #7.
 
 4. **Identity could silently split.** Arcade `user_id` and the OAuth subject must be the
-   same email. Arcade's JSONPath extraction from `/oauth2/userinfo` gives this a mechanism
-   (#36, configured on #13) — but nothing verifies that a persona's Arcade account and their
-   `idp.db` row were created with the same address. If they drift, the pre-hook governs one
-   person while the loan book records another, and every test still passes.
+   same email. Both hops now have a mechanism: the User Source signs the persona in at
+   `apps/idp` for hop 1, and the custom verifier binds the IdP-asserted email at hop 2
+   (#75, #14a). The remaining hazard is the default verifier: with the custom route
+   disabled, a browser signed into account.arcade.dev as someone else binds the grant to
+   that someone, and every later call re-challenges. Keep the custom verifier route
+   configured; check it via the admin API, not the dashboard label.
 
 5. ~~**Does Arcade's stock Slack provider grant a user token with `chat:write`?**~~
    *Answered: yes — `docs/spikes/03-slack-scopes.md` (#3). Act 2 posts as the requester.
@@ -233,8 +260,9 @@ Seed loan `LN-2291`, Northwind Bakery LLC, $95,000. Carries `bank_account_number
 3. Split into `apps/loan-app` + `tools/loan`; measure the toolkit names (#34, #35).
    In parallel: `apps/idp` (#36).
 4. Arcade wiring: gateway, hook extension, OAuth provider (#13).
-5. Thinnest vertical slice, end to end and ugly: agent → gateway → tool → API, one denying
-   pre-hook (#14).
+5. Identity in `apps/web`: sign-in as client C, gateway token, verifier route (#14a).
+   Then the thinnest vertical slice, end to end and ugly: agent → gateway → tool → API,
+   one denying pre-hook (#14). Hard gate after #14: re-ground this document.
 6. Acts 1, 3, 4 — access hook, redaction, injection.
 7. Approvals: Slack, approval page, `decide` as a governed call, auto-resume.
 8. Control-plane panel and the split-screen UI.
