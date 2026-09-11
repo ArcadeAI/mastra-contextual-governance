@@ -140,6 +140,49 @@ describe("the hooks over HTTP", () => {
     expect(body.error_message).toContain(row!.id);
   });
 
+  // #58's mirror on this side of the join. Arcade preserves the
+  // capitalisation an account was invited under, so `context.user_id` can
+  // arrive as `Dana.Okafor@…` while the roster and the loan book hold the
+  // lowercase form. Denying her as an unregistered subject would be the
+  // control plane refusing a real person over capitalisation.
+  describe("a capitalised context.user_id resolves the lowercase subject", () => {
+    const SHOUTED = "Dana.Okafor@Bank.Example";
+
+    test("a read she is entitled to is allowed, not denied as an unknown subject", async () => {
+      const res = await post("/pre", preBody(SHOUTED, "GetLoan", { loan_id: "LN-2291" }, "tc_case_read"));
+
+      expect(await res.json()).toEqual({ code: "OK" });
+      expect(recent(db, 1)[0]).toMatchObject({ execution_id: "tc_case_read", decision: "allow" });
+    });
+
+    test("and her $50,000 clearance is the one act 2 measures the $95K against", async () => {
+      const res = await post(
+        "/pre",
+        preBody(SHOUTED, "ApproveLoan", { loan_id: "LN-2291", amount: 95_000 }, "tc_case_deny"),
+      );
+
+      const body = PreHookResult.parse(await res.json());
+      expect(body.code).toBe("CHECK_FAILED");
+      // Dana's own number, interpolated from the subject the lookup found —
+      // an unresolved subject denies with "no registered subject" instead.
+      expect(body.error_message).toContain("50000");
+      expect(body.error_message).not.toMatch(/no registered subject/);
+      expect(recent(db, 1)[0]).toMatchObject({
+        execution_id: "tc_case_deny",
+        decision: "deny",
+        rule_id: "pre.approve-within-clearance",
+      });
+    });
+
+    test("a stranger is still unknown, whatever case they arrive in", async () => {
+      const res = await post("/pre", preBody("Stranger@Bank.Example", "GetLoan", { loan_id: "LN-2291" }, "tc_case_stranger"));
+
+      const body = PreHookResult.parse(await res.json());
+      expect(body.code).toBe("CHECK_FAILED");
+      expect(body.error_message).toMatch(/no registered subject/);
+    });
+  });
+
   test("/post returns OK and records a pass-through", async () => {
     const res = await post("/post", {
       execution_id: "tc_post",
