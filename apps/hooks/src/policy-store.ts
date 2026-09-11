@@ -134,10 +134,18 @@ export function loadSeed(options: SeedOptions, raw: unknown = fixture): Seed {
 // Schema
 // ---------------------------------------------------------------------------
 
+/**
+ * Every statement here is idempotent — `IF NOT EXISTS` throughout, plus
+ * `INSERT OR IGNORE` for the single `policy_revision` row. That is what lets
+ * the same string serve both bootstrap paths: inside `seed()`'s transaction on
+ * a fresh database, and on its own against a database that predates a table
+ * added since. See `SCHEMA_VERSION` for what that second path does and does
+ * not cover.
+ */
 const SCHEMA = `
   -- The cast. clearance is the unit-free ceiling exceeds_clearance compares
   -- against; here it counts US dollars. Raise Dana's on stage and rerun.
-  CREATE TABLE subjects (
+  CREATE TABLE IF NOT EXISTS subjects (
     user_id      TEXT    PRIMARY KEY,
     display_name TEXT    NOT NULL,
     role         TEXT    NOT NULL,
@@ -147,7 +155,7 @@ const SCHEMA = `
 
   -- Every governed tool. arguments is a JSON array of names; a trailing '?'
   -- marks one optional. A tool not listed here is denied at every hook.
-  CREATE TABLE catalogue (
+  CREATE TABLE IF NOT EXISTS catalogue (
     toolkit   TEXT NOT NULL,
     tool      TEXT NOT NULL,
     arguments TEXT NOT NULL DEFAULT '[]',
@@ -156,7 +164,7 @@ const SCHEMA = `
 
   -- /access and /pre rules. Lower priority evaluates first; first match wins.
   -- Set enabled = 0 to switch a rule off without losing it.
-  CREATE TABLE policy_rules (
+  CREATE TABLE IF NOT EXISTS policy_rules (
     id          TEXT    PRIMARY KEY,
     description TEXT    NOT NULL DEFAULT '',
     hook        TEXT    NOT NULL CHECK (hook IN ('access', 'pre')),
@@ -172,7 +180,7 @@ const SCHEMA = `
 
   -- /post rules. Held here from the start so the whole policy is in one place;
   -- the RedactionEngine reads them from #16.
-  CREATE TABLE output_rules (
+  CREATE TABLE IF NOT EXISTS output_rules (
     id          TEXT    PRIMARY KEY,
     description TEXT    NOT NULL DEFAULT '',
     toolkit     TEXT    NOT NULL,
@@ -202,7 +210,7 @@ const SCHEMA = `
   --   void     the recorded decision was 'denied', or the request settled
   --            without this grant winning. revoked_at is set too, so
   --            GrantChecker refuses it even if the status is ignored.
-  CREATE TABLE grants (
+  CREATE TABLE IF NOT EXISTS grants (
     id             TEXT PRIMARY KEY,
     subject_id     TEXT NOT NULL,
     granted_by     TEXT NOT NULL,
@@ -225,13 +233,13 @@ const SCHEMA = `
     activated_at   TEXT,
     voided_at      TEXT
   );
-  CREATE INDEX idx_grants_subject_tool ON grants(subject_id, toolkit, tool, status);
+  CREATE INDEX IF NOT EXISTS idx_grants_subject_tool ON grants(subject_id, toolkit, tool, status);
   -- One approval, one grant, enforced by the database. The /pre handler that
   -- issues a grant and the store call that flips the request to 'approved'
   -- are two writes, and only the second one closes the "still pending" rule.
   -- Without this, a Decide replayed inside that window would issue a second
   -- grant for the same approval — single use per grant, but two grants.
-  CREATE UNIQUE INDEX idx_grants_request ON grants(request_id);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_grants_request ON grants(request_id);
 
   -- Approval requests: the escalations the approvals toolkit writes and the
   -- approval page reads. Empty on seed; every row arrives over
@@ -244,7 +252,7 @@ const SCHEMA = `
   -- match the call that was actually refused: a catalogue edited in between
   -- cannot silently retarget the approval at a different tool or a different
   -- argument.
-  CREATE TABLE approval_requests (
+  CREATE TABLE IF NOT EXISTS approval_requests (
     id                     TEXT PRIMARY KEY,
     requester_id           TEXT NOT NULL,
     requester_display_name TEXT NOT NULL,
@@ -274,7 +282,7 @@ const SCHEMA = `
     resource_input         TEXT NOT NULL,
     amount_input           TEXT
   );
-  CREATE INDEX idx_approval_requests_requester ON approval_requests(requester_id, status);
+  CREATE INDEX IF NOT EXISTS idx_approval_requests_requester ON approval_requests(requester_id, status);
 
   -- One row per decision the control plane made, in GovernanceEvent's shape.
   --
@@ -283,7 +291,7 @@ const SCHEMA = `
   -- the tool is refused upstream of every hook, and that refusal writes no row
   -- here (measured, spike #2; DESIGN.md open risk 2). What this table holds is
   -- every decision *this service* made, including its own failures.
-  CREATE TABLE audit_log (
+  CREATE TABLE IF NOT EXISTS audit_log (
     seq          INTEGER PRIMARY KEY AUTOINCREMENT,
     id           TEXT    NOT NULL UNIQUE,
     ts           TEXT    NOT NULL,
@@ -300,23 +308,23 @@ const SCHEMA = `
   -- seq already orders rows by time, so no index on ts: a whole-project
   -- /access appends ~10k rows in one transaction, and every index is paid
   -- for on each of them.
-  CREATE INDEX idx_audit_log_execution ON audit_log(execution_id);
+  CREATE INDEX IF NOT EXISTS idx_audit_log_execution ON audit_log(execution_id);
 
   -- Append-only, enforced by the database rather than by convention. A
   -- compliance reviewer reading this table should not have to trust that
   -- nobody ran an UPDATE.
-  CREATE TRIGGER audit_log_is_append_only_update BEFORE UPDATE ON audit_log
+  CREATE TRIGGER IF NOT EXISTS audit_log_is_append_only_update BEFORE UPDATE ON audit_log
   BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;
-  CREATE TRIGGER audit_log_is_append_only_delete BEFORE DELETE ON audit_log
+  CREATE TRIGGER IF NOT EXISTS audit_log_is_append_only_delete BEFORE DELETE ON audit_log
   BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;
 
   -- Bumped on every write to the tables the in-memory policy cache is built
   -- from, so an edit from any connection is noticed on the next hook call.
-  CREATE TABLE policy_revision (
+  CREATE TABLE IF NOT EXISTS policy_revision (
     id       INTEGER PRIMARY KEY CHECK (id = 1),
     revision INTEGER NOT NULL
   );
-  INSERT INTO policy_revision (id, revision) VALUES (1, 1);
+  INSERT OR IGNORE INTO policy_revision (id, revision) VALUES (1, 1);
 `;
 
 /** Triggers bumping `policy_revision` for every write to the cached tables. */
@@ -324,7 +332,7 @@ const REVISION_TRIGGERS = ["subjects", "catalogue", "policy_rules"]
   .flatMap((table) =>
     ["INSERT", "UPDATE", "DELETE"].map(
       (op) =>
-        `CREATE TRIGGER bump_revision_${table}_${op.toLowerCase()} AFTER ${op} ON ${table}
+        `CREATE TRIGGER IF NOT EXISTS bump_revision_${table}_${op.toLowerCase()} AFTER ${op} ON ${table}
          BEGIN UPDATE policy_revision SET revision = revision + 1 WHERE id = 1; END;`,
     ),
   )
@@ -335,8 +343,34 @@ const REVISION_TRIGGERS = ["subjects", "catalogue", "policy_rules"]
 // ---------------------------------------------------------------------------
 
 /**
- * Opens `governance.db`, bootstrapping it from the fixture only when it has
- * no schema.
+ * The schema revision this build writes, recorded in `PRAGMA user_version`.
+ * Bump it in the same commit as any change to `SCHEMA`.
+ *
+ * **This buys new tables, and nothing else.** The upgrade path replays the
+ * idempotent `SCHEMA` against an existing database, so a table (or index, or
+ * trigger) added after a disk exists appears on the next boot. An added
+ * *column*, a widened `CHECK`, a renamed index: none of those are expressible
+ * as `CREATE ... IF NOT EXISTS`, none of them happen here, and shipping one
+ * without a real migration leaves a disk that opens green and fails on the
+ * first query naming the change. `governance.db` sits on a Render disk
+ * (decided on #29), so every schema change after the first meets a database
+ * that predates it.
+ *
+ * Version 1 is the schema at #60. Databases written before this existed read
+ * back 0 — the SQLite default — which is exactly the "needs the upgrade path"
+ * answer, so no disk has to be touched by hand to adopt this.
+ */
+export const SCHEMA_VERSION = 1;
+
+/**
+ * Opens `governance.db`: seeds it from the fixture when it has no schema, and
+ * otherwise brings its schema up to `SCHEMA_VERSION` without touching a row.
+ *
+ * The two paths are deliberately separate. On a fresh database the DDL and the
+ * seed rows go in as *one* transaction — see `seed()` for why that line matters
+ * and what breaks if it is crossed. On an existing database only the DDL runs,
+ * because its rows are the live state of the demo and reseeding them would make
+ * a restart a reset (#29).
  */
 export function openGovernance(path: string, seedOptions: SeedOptions): Database {
   if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
@@ -348,11 +382,29 @@ export function openGovernance(path: string, seedOptions: SeedOptions): Database
   // lock for a moment; wait rather than fail a hook call over it.
   db.exec("PRAGMA busy_timeout = 1000");
 
-  if (!hasSchema(db)) seed(db, loadSeed(seedOptions));
+  try {
+    if (hasSchema(db)) upgradeSchema(db, path);
+    else seed(db, loadSeed(seedOptions));
+  } catch (cause) {
+    // Leave no half-open handle behind: the caller is about to exit, and on
+    // Render a lingering WAL lock is one more thing between a crash-looping
+    // service and somebody deleting the file.
+    db.close();
+    throw cause;
+  }
 
   return db;
 }
 
+/**
+ * Whether this database has been bootstrapped at all.
+ *
+ * Only ever asked about bootstrapping. "Is this schema current?" is a
+ * different question with a different answer — `readSchemaVersion` — and
+ * conflating the two is the bug this module had: probing for one table said
+ * "already seeded", seeding was skipped, and a table added later could never
+ * appear on a disk that persists (#60).
+ */
 export function hasSchema(db: Database): boolean {
   const row = db
     .query<{ name: string }, []>(
@@ -360,6 +412,54 @@ export function hasSchema(db: Database): boolean {
     )
     .get();
   return row !== null;
+}
+
+/** The schema revision recorded on disk. 0 on anything written before #60. */
+export function readSchemaVersion(db: Database): number {
+  return db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version ?? 0;
+}
+
+/**
+ * Thrown at boot, before the port opens, when the database on disk is not one
+ * this build can bring forward. Names the reset, because the alternative —
+ * what #60 actually saw in production — is a `SQLiteError: no such table` from
+ * a health-count helper, a crash loop, and a Render Shell that will not attach
+ * to a service that keeps exiting.
+ */
+export class SchemaTooNewError extends Error {
+  constructor(
+    readonly path: string,
+    readonly found: number,
+  ) {
+    super(
+      `governance.db at ${path} was written by a newer build (PRAGMA user_version ${found}; ` +
+        `this build understands ${SCHEMA_VERSION}) and cannot be migrated backwards. ` +
+        `Reset it: stop the service, delete ${path} (and its -wal and -shm siblings), ` +
+        `and restart — the fixture reseeds on an empty disk. A one-command reset lands with #23.`,
+    );
+    this.name = "SchemaTooNewError";
+  }
+}
+
+/**
+ * Adds whatever `SCHEMA` gained since this database was written, and records
+ * the new version. No inserts: the rows already here are the demo's live
+ * state.
+ *
+ * DDL and the version bump share one transaction, so a half-applied upgrade
+ * rolls back to a database that still reads its old version and will simply
+ * try again on the next boot.
+ */
+function upgradeSchema(db: Database, path: string): void {
+  const found = readSchemaVersion(db);
+  if (found > SCHEMA_VERSION) throw new SchemaTooNewError(path, found);
+  if (found === SCHEMA_VERSION) return;
+
+  db.transaction(() => {
+    db.exec(SCHEMA);
+    db.exec(REVISION_TRIGGERS);
+    db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+  })();
 }
 
 /**
@@ -394,12 +494,16 @@ function bind(row: Record<string, unknown>): NamedBindings {
  * nobody in the cast and no rules — permanently, on a disk that persists. Found
  * the hard way in `apps/loan-app`, and copied from there.
  *
+ * `PRAGMA user_version` is stamped inside the same transaction, so it is set
+ * if and only if the tables and the rows both landed.
+ *
  * Exported for the test that holds this line.
  */
 export function seed(db: Database, data: Seed): void {
   db.transaction(() => {
     db.exec(SCHEMA);
     db.exec(REVISION_TRIGGERS);
+    db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
 
     const insertSubject = db.prepare<unknown, NamedBindings>(
       `INSERT INTO subjects (user_id, display_name, role, clearance, attributes)
