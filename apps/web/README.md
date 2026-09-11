@@ -25,6 +25,35 @@ Three lanes — Access, Pre, Post — fed by a `text/event-stream` of `Governanc
 (#5). Green allow, red deny with the rule that fired, amber modify with a before/after
 diff. Newest at the top of each lane, so the freshest card never moves.
 
+**`/access` is called on `tools/list` for every tool in the gateway and again on each
+call, so access rows outnumber pre rows by design.** That is the hook doing its job, not
+a leak.
+
+### Repeated access decisions share a row
+
+Arcade calls `/access` once per tool-schema resolution, so one `tools/call` fans out
+into several decisions about the same person and the same tool. Measured at the #13
+sitting with retry off: one `Loan.GetLoan` produced **three** access rows and one
+`Loan.ApproveLoan` produced **two** (#64).
+
+The Access lane collapses **adjacent** decisions that share `user_id`, `tool` and
+`decision` and land within `ACCESS_GROUP_WINDOW_MS` (three seconds,
+`lib/governance/grouping.ts`) into one card carrying their count; the individual event
+ids are on the card behind a disclosure. Three limits, all deliberate:
+
+- **Presentation only.** Nothing is deduplicated in `audit_log` or in the stream, the
+  timeline still holds every event, and both tallies still count every one of them. A
+  card saying *3 decisions* is a claim that three were made.
+- **Only adjacent decisions group.** Reaching past an intervening event to merge two
+  matching ones would reorder the lane, and not reordering is the timeline's first
+  property. A fan-out that arrives interleaved with something else stays several rows.
+- **A row spans at most the window, measured from its newest member.** Chaining
+  neighbour to neighbour would let a slow drip of matching decisions collapse into one
+  row claiming they arrived together.
+
+`/panel?fanout=1` replays the measured shape through the fixture stream, so the two
+rows and their counts are something to look at rather than read about.
+
 ### Which stream it watches
 
 Read in the **server** component and passed down as a prop. Never a `NEXT_PUBLIC_`
@@ -53,6 +82,7 @@ hypothetical. In fixture mode the page's own query string tunes the replay:
 ```
 /panel?repeat=2000&delayMs=0     # 10,000 events, as fast as the socket carries them
 /panel?delayMs=300               # the four acts, faster than the default 900ms pacing
+/panel?fanout=1                  # the acts, then the measured /access fan-out (#64)
 ```
 
 Lanes are bounded **separately** — one shared window would let an `/access` sweep evict
