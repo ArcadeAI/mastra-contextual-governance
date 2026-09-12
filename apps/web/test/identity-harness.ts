@@ -1,0 +1,586 @@
+/**
+ * What the identity suite runs against.
+ *
+ * Three processes, and the line between "real" and "stand-in" is drawn exactly
+ * once, at the network edge:
+ *
+ * - **`apps/idp` is real.** Booted as a subprocess the way Render boots it,
+ *   with its own client C (`IDP_OAUTH_CLIENTS=web`) whose redirect URI is this
+ *   harness's own callback. Every sign-in in this suite is a real
+ *   authorization-code + PKCE flow against Better Auth, with a real password
+ *   typed into a real login form. `prompt=login` is measured against it rather
+ *   than assumed — the issue asked for that specifically.
+ * - **`apps/web`'s handlers are real, behind a real server.** `Bun.serve` on
+ *   `:0`, routing to the same `lib/identity/handlers.ts` functions `app/api/**`
+ *   calls. Nothing is mocked: the suite drives them with a cookie jar over HTTP
+ *   and asserts on the `Set-Cookie` headers a browser would actually get.
+ * - **Arcade Cloud is a stand-in, and only Arcade Cloud.** It speaks the MCP
+ *   authorization discovery Arcade speaks (401 → protected-resource metadata →
+ *   authorization-server metadata → dynamic registration → authorize → token),
+ *   checks PKCE for real, and serves `confirm_user` and a `next_uri`. It is a
+ *   stand-in because the real one needs a project API key and a human's
+ *   dashboard field; the shape it imitates is the one spike #04 and #75
+ *   measured off the live service, hop for hop.
+ *
+ * Every port is `:0` and read back. This worktree owns a block of ten and the
+ * reviewer's owns a different block, so nothing here may pick a number.
+ */
+import { spawn, type Subprocess } from "bun";
+import { mkdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+
+import { readWebConfig, type WebConfig } from "../lib/config.ts";
+import {
+  gatewayCallback,
+  gatewayStart,
+  signin,
+  signinCallback,
+  signout,
+  verify,
+} from "../lib/identity/handlers.ts";
+import { forgetGatewayClients } from "../lib/identity/gateway.ts";
+
+const REPO_ROOT = join(import.meta.dir, "..", "..", "..");
+
+/** The four demo people, as `apps/idp/src/fixtures/people.json` seeds them. */
+export const PEOPLE = {
+  dana: { email: "dana.okafor@bank.example", password: "dana-demo-2026" },
+  sam: { email: "sam.reyes@bank.example", password: "sam-demo-2026" },
+  riley: { email: "riley.chen@bank.example", password: "riley-demo-2026" },
+  morgan: { email: "morgan.ellis@bank.example", password: "morgan-demo-2026" },
+} as const;
+
+export type PersonaKey = keyof typeof PEOPLE;
+
+export const SESSION_SECRET = "identity-suite-session-secret-0123456789";
+export const ARCADE_API_KEY = "identity-suite-arcade-key";
+export const GATEWAY_ID = "cg-demo-us";
+
+/** A port the OS says is free. Never a guess — `tools/loan/tests/conftest.py::_free_port` does the same. */
+export function freePort(): number {
+  const probe = Bun.serve({ port: 0, fetch: () => new Response(null, { status: 404 }) });
+  const { port } = probe;
+  probe.stop(true);
+  if (typeof port !== "number") throw new Error(`Bun.serve({ port: 0 }) reported no port (got ${String(port)})`);
+  return port;
+}
+
+// ---------------------------------------------------------------------------
+// A browser, minus the browser
+// ---------------------------------------------------------------------------
+
+/**
+ * A cookie jar and manual redirects.
+ *
+ * Flat across hosts on purpose: real browsers key cookies by host and ignore
+ * the port, so `localhost:<web>` and `localhost:<idp>` genuinely do share a jar
+ * on a developer's machine. Imitating that is what makes "the IdP's session
+ * cookie is still here when the second sign-in starts" a real condition rather
+ * than one the harness arranged away — which is the whole of the `prompt=login`
+ * measurement.
+ */
+export class Browser {
+  readonly cookies = new Map<string, string>();
+  /** Every response, in order, as `status METHOD url` — what a redirect chain looked like. */
+  readonly visited: string[] = [];
+  /** Hosts that rendered a form. Which server asked for the password. */
+  readonly pageHosts: string[] = [];
+
+  async fetch(url: string, init: RequestInit = {}): Promise<Response> {
+    const headers = new Headers(init.headers);
+    if (this.cookies.size > 0) {
+      headers.set("cookie", [...this.cookies].map(([name, value]) => `${name}=${value}`).join("; "));
+    }
+    const response = await fetch(url, { ...init, headers, redirect: "manual" });
+    this.visited.push(`${response.status} ${init.method ?? "GET"} ${url.split("?")[0]}`);
+    this.store(response);
+    return response;
+  }
+
+  store(response: Response) {
+    for (const raw of response.headers.getSetCookie()) {
+      const pair = raw.split(";")[0]!;
+      const eq = pair.indexOf("=");
+      if (eq < 0) continue;
+      const name = pair.slice(0, eq).trim();
+      const value = pair.slice(eq + 1).trim();
+      if (value === "" || /max-age=0/i.test(raw)) this.cookies.delete(name);
+      else this.cookies.set(name, value);
+    }
+  }
+
+  /**
+   * Walk a redirect chain, filling in whatever HTML form appears, until the
+   * chain lands on a page with no form or on a path this caller is waiting for.
+   *
+   * `stopAt` is a substring rather than a full URL because the interesting stop
+   * is usually a path on a host whose port is assigned at boot.
+   */
+  async follow(
+    from: string,
+    fill: (fields: Record<string, string>, html: string) => Record<string, string>,
+    options: { stopAt?: string; limit?: number } = {},
+  ): Promise<{ url: string; response: Response; html: string }> {
+    let url = from;
+    for (let hop = 0; hop < (options.limit ?? 25); hop += 1) {
+      const response = await this.fetch(url, { headers: { accept: "text/html" } });
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get("location");
+        if (!location) throw new Error(`${response.status} with no Location at ${url}`);
+        url = new URL(location, url).toString();
+        if (options.stopAt && url.includes(options.stopAt)) {
+          return { url, response, html: "" };
+        }
+        continue;
+      }
+
+      const html = await response.text();
+      const form = parseForm(html);
+      if (!form) return { url, response, html };
+
+      this.pageHosts.push(new URL(url).host);
+      const action = new URL(form.action || url, url).toString();
+      const post = await this.fetch(action, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded", accept: "text/html" },
+        body: new URLSearchParams(fill(form.fields, html)).toString(),
+      });
+      const location = post.headers.get("location");
+      if (!location) return { url: action, response: post, html: await post.text() };
+      url = new URL(location, action).toString();
+      if (options.stopAt && url.includes(options.stopAt)) return { url, response: post, html: "" };
+    }
+    throw new Error(`the chain from ${from} did not terminate`);
+  }
+}
+
+interface ParsedForm {
+  action: string;
+  fields: Record<string, string>;
+}
+
+/**
+ * HTML entities, back to characters.
+ *
+ * A browser does this and a regex does not, and the difference is not cosmetic:
+ * `apps/idp` puts the plugin's **signed** OAuth query in a hidden field, so
+ * every `&` in it arrives as `&amp;`. Posting that back splits one parameter
+ * into two, the signature over the canonicalised parameters no longer matches,
+ * and Better Auth answers `invalid_signature` — which the login page renders as
+ * "This sign-in request has expired". Cost an hour on this slice; the login
+ * page is telling the truth about the symptom and nothing about the cause.
+ */
+function unescapeHtml(value: string): string {
+  return value
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;/g, "'")
+    .replace(/&#x27;/gi, "'")
+    .replace(/&amp;/g, "&");
+}
+
+/** The pages here are server-rendered HTML with one form; a regex parse is enough. */
+export function parseForm(html: string): ParsedForm | null {
+  const form = /<form\b[^>]*>([\s\S]*?)<\/form>/i.exec(html);
+  if (!form) return null;
+  const action = /\baction\s*=\s*["']([^"']*)["']/i.exec(form[0])?.[1] ?? "";
+  const fields: Record<string, string> = {};
+  for (const match of form[1]!.matchAll(/<(?:input|button)\b[^>]*>/gi)) {
+    const name = /\bname\s*=\s*["']([^"']*)["']/i.exec(match[0])?.[1];
+    if (!name) continue;
+    fields[name] = unescapeHtml(/\bvalue\s*=\s*["']([^"']*)["']/i.exec(match[0])?.[1] ?? "");
+  }
+  return { action, fields };
+}
+
+// ---------------------------------------------------------------------------
+// The Arcade stand-in
+// ---------------------------------------------------------------------------
+
+export interface ArcadeStandIn {
+  url: string;
+  /** Every dynamic registration, in order. One per MCP client id. */
+  registrations: Array<{ client_id: string; redirect_uris: string[] }>;
+  /** Which client ids have already been consented to, per persona-less browser session. */
+  consents: string[];
+  /** Every `confirm_user` call, as Arcade received it. The identity assertion under test. */
+  confirmations: Array<{ flow_id: string; user_id: string; authorized: boolean }>;
+  /** `next_uri`s that were actually fetched. Measured on #75: the grant needs this. */
+  nextUriFetches: string[];
+  /** Bearers presented to the MCP endpoint, in order. */
+  bearers: string[];
+  /** Force the next `confirm_user` to fail with this status and body. */
+  failConfirm: { status: number; body: string } | null;
+  /** Answer `confirm_user` without a `next_uri`. */
+  omitNextUri: boolean;
+  /** Seconds put on every access token this stand-in issues. */
+  tokenLifetimeSeconds: number;
+  refreshes: number;
+  stop(): void;
+}
+
+/**
+ * Arcade Cloud, as far as this slice can see it.
+ *
+ * Faithful where it matters and no further: the discovery chain is the one
+ * measured on #04, PKCE is verified rather than accepted, `confirm_user`
+ * demands the project API key, and the grant is only recorded once something
+ * fetches `next_uri`. Everything about tool execution is absent, because this
+ * slice does not execute a tool.
+ */
+export function startArcadeStandIn(): ArcadeStandIn {
+  const codes = new Map<string, { challenge: string; clientId: string; redirectUri: string }>();
+  const refreshTokens = new Map<string, string>();
+  const flows = new Map<string, { user_id: string; next_uri: string; authorized: boolean }>();
+
+  const state: ArcadeStandIn = {
+    url: "",
+    registrations: [],
+    consents: [],
+    confirmations: [],
+    nextUriFetches: [],
+    bearers: [],
+    failConfirm: null,
+    omitNextUri: false,
+    tokenLifetimeSeconds: 3600,
+    refreshes: 0,
+    stop: () => server.stop(true),
+  };
+
+  const issue = (clientId: string) => {
+    const access = `gw-access-${crypto.randomUUID()}`;
+    const refresh = `gw-refresh-${crypto.randomUUID()}`;
+    refreshTokens.set(refresh, clientId);
+    return {
+      access_token: access,
+      refresh_token: refresh,
+      token_type: "Bearer",
+      expires_in: state.tokenLifetimeSeconds,
+    };
+  };
+
+  const server = Bun.serve({
+    port: 0,
+    idleTimeout: 30,
+    async fetch(request) {
+      const url = new URL(request.url);
+      const { pathname } = url;
+
+      // The gateway's MCP endpoint. Unauthenticated: a 401 that names where the
+      // protected-resource metadata lives, which is how discovery starts.
+      if (pathname === `/mcp/${GATEWAY_ID}` && request.method === "POST") {
+        const bearer = request.headers.get("authorization")?.replace(/^Bearer /i, "");
+        if (!bearer) {
+          return new Response(JSON.stringify({ error: "unauthorized" }), {
+            status: 401,
+            headers: {
+              "www-authenticate":
+                `Bearer resource_metadata="${state.url}/.well-known/oauth-protected-resource/mcp/${GATEWAY_ID}"`,
+              "content-type": "application/json",
+            },
+          });
+        }
+        state.bearers.push(bearer);
+        const body = (await request.json()) as { id?: number; method?: string };
+        if (body.method === "tools/list") {
+          return Response.json({ jsonrpc: "2.0", id: body.id, result: { tools: [{ name: "Loan_GetLoan" }] } });
+        }
+        return Response.json({ jsonrpc: "2.0", id: body.id, result: { protocolVersion: "2025-06-18" } });
+      }
+
+      if (pathname === `/.well-known/oauth-protected-resource/mcp/${GATEWAY_ID}`) {
+        return Response.json({ resource: `${state.url}/mcp/${GATEWAY_ID}`, authorization_servers: [`${state.url}/`] });
+      }
+
+      if (pathname === "/.well-known/oauth-authorization-server") {
+        return Response.json({
+          issuer: `${state.url}/`,
+          authorization_endpoint: `${state.url}/oauth/authorize`,
+          token_endpoint: `${state.url}/oauth/token`,
+          registration_endpoint: `${state.url}/oauth/register`,
+          code_challenge_methods_supported: ["S256"],
+        });
+      }
+
+      if (pathname === "/oauth/register" && request.method === "POST") {
+        const body = (await request.json()) as { redirect_uris?: string[] };
+        const clientId = `mcp-client-${state.registrations.length + 1}`;
+        state.registrations.push({ client_id: clientId, redirect_uris: body.redirect_uris ?? [] });
+        return Response.json({ client_id: clientId, redirect_uris: body.redirect_uris }, { status: 201 });
+      }
+
+      // Arcade's own gateway consent screen — once per persona per MCP client
+      // id. Rendered as a form so the suite has to press it, the way a human
+      // does, rather than having the flow complete invisibly.
+      if (pathname === "/oauth/authorize" && request.method === "GET") {
+        const query = url.search;
+        return new Response(
+          `<!doctype html><title>Arcade — allow access</title><form method="post" action="/oauth/authorize${query}">` +
+            `<button name="decision" value="allow">Allow</button></form>`,
+          { headers: { "content-type": "text/html; charset=utf-8" } },
+        );
+      }
+
+      if (pathname === "/oauth/authorize" && request.method === "POST") {
+        const clientId = url.searchParams.get("client_id") ?? "";
+        const redirectUri = url.searchParams.get("redirect_uri") ?? "";
+        state.consents.push(clientId);
+        const code = `gw-code-${crypto.randomUUID()}`;
+        codes.set(code, {
+          challenge: url.searchParams.get("code_challenge") ?? "",
+          clientId,
+          redirectUri,
+        });
+        const back = new URL(redirectUri);
+        back.searchParams.set("code", code);
+        back.searchParams.set("state", url.searchParams.get("state") ?? "");
+        return new Response(null, { status: 303, headers: { location: back.toString() } });
+      }
+
+      if (pathname === "/oauth/token" && request.method === "POST") {
+        const form = new URLSearchParams(await request.text());
+        if (form.get("grant_type") === "refresh_token") {
+          const clientId = refreshTokens.get(form.get("refresh_token") ?? "");
+          if (!clientId || clientId !== form.get("client_id")) {
+            return Response.json({ error: "invalid_grant" }, { status: 400 });
+          }
+          state.refreshes += 1;
+          return Response.json(issue(clientId));
+        }
+
+        const record = codes.get(form.get("code") ?? "");
+        if (!record) return Response.json({ error: "invalid_grant" }, { status: 400 });
+        codes.delete(form.get("code")!);
+        // PKCE, checked rather than accepted: a stand-in that ignores the
+        // verifier would let a broken challenge pass every test here.
+        const digest = await crypto.subtle.digest(
+          "SHA-256",
+          new TextEncoder().encode(form.get("code_verifier") ?? ""),
+        );
+        if (Buffer.from(digest).toString("base64url") !== record.challenge) {
+          return Response.json({ error: "invalid_grant", error_description: "PKCE verification failed" }, { status: 400 });
+        }
+        if (form.get("client_id") !== record.clientId) {
+          return Response.json({ error: "invalid_client" }, { status: 400 });
+        }
+        return Response.json(issue(record.clientId));
+      }
+
+      // Hop 2. The project API key is demanded, because the real one does.
+      if (pathname === "/api/v1/oauth/confirm_user" && request.method === "POST") {
+        if (request.headers.get("authorization") !== `Bearer ${ARCADE_API_KEY}`) {
+          return new Response(JSON.stringify({ code: 401, msg: "Unauthorized" }), { status: 401 });
+        }
+        if (state.failConfirm) {
+          const { status, body } = state.failConfirm;
+          return new Response(body, { status });
+        }
+        const body = (await request.json()) as { flow_id?: string; user_id?: string };
+        if (!body.flow_id || !body.user_id) {
+          return new Response(JSON.stringify({ code: 400, msg: "Bad request" }), { status: 400 });
+        }
+        const nextUri = `${state.url}/api/v1/oauth/callback_success?flow_id=${encodeURIComponent(body.flow_id)}`;
+        flows.set(body.flow_id, { user_id: body.user_id, next_uri: nextUri, authorized: false });
+        state.confirmations.push({ flow_id: body.flow_id, user_id: body.user_id, authorized: false });
+        return Response.json({
+          auth_id: `auth_${body.flow_id}`,
+          ...(state.omitNextUri ? {} : { next_uri: nextUri }),
+        });
+      }
+
+      // Measured on #75: the grant is not finalised until something lands here.
+      if (pathname === "/api/v1/oauth/callback_success") {
+        const flowId = url.searchParams.get("flow_id") ?? "";
+        state.nextUriFetches.push(flowId);
+        const flow = flows.get(flowId);
+        if (flow) {
+          flow.authorized = true;
+          for (const confirmation of state.confirmations) {
+            if (confirmation.flow_id === flowId) confirmation.authorized = true;
+          }
+        }
+        return new Response("authorized", { headers: { "content-type": "text/plain" } });
+      }
+
+      return new Response("not found", { status: 404 });
+    },
+  });
+
+  state.url = `http://localhost:${server.port}`;
+  return state;
+}
+
+// ---------------------------------------------------------------------------
+// The whole thing
+// ---------------------------------------------------------------------------
+
+export interface IdentityHarness {
+  webUrl: string;
+  idpUrl: string;
+  arcade: ArcadeStandIn;
+  config: WebConfig;
+  /** Everything `apps/idp` printed, for assertions about what it was asked. */
+  idpLog(): Promise<string>;
+  stop(): Promise<void>;
+}
+
+export async function startIdentityHarness(): Promise<IdentityHarness> {
+  // Registration is a module-level cache keyed by gateway URL, and every run of
+  // this harness stands a new one up on a new port. Clearing it is what keeps
+  // one suite's registration out of the next suite's flow.
+  forgetGatewayClients();
+
+  const arcade = startArcadeStandIn();
+
+  // The web server needs the IdP's issuer and the IdP needs the web server's
+  // callback URL, so one of them has to be known before the other is up. The
+  // port is taken from the OS first and the server bound to it after the IdP is
+  // configured — the same trick, and the same reason, as binding `:0`.
+  const webPort = freePort();
+  const webUrl = `http://localhost:${webPort}`;
+
+  const idpPort = freePort();
+  const idpUrl = `http://localhost:${idpPort}`;
+  const dbPath = join(tmpdir(), `cg-web-identity-${crypto.randomUUID()}`, "idp.db");
+  const logPath = join(dirname(dbPath), "idp.log");
+  mkdirSync(dirname(dbPath), { recursive: true });
+
+  // A developer's own PERSONA_* and IDP_* values are deliberately not passed
+  // through: these tests are about the fixture.
+  const inherited = Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([key, value]) => value !== undefined && !key.startsWith("PERSONA_") && !key.startsWith("IDP_"),
+    ),
+  ) as Record<string, string>;
+
+  const idpEnv: Record<string, string> = {
+    ...inherited,
+    PORT: String(idpPort),
+    IDP_DB_PATH: dbPath,
+    IDP_PUBLIC_URL: idpUrl,
+    BETTER_AUTH_SECRET: "identity-suite-idp-secret".padEnd(48, "x"),
+    // Client A stays the Arcade registration; client C is `apps/web`'s own —
+    // DESIGN.md's "one OAuth client per relying party", settled on #75/#79.
+    IDP_OAUTH_CLIENTS: "web",
+    IDP_OAUTH_REDIRECT_URIS_WEB: `${webUrl}/api/auth/callback`,
+    NODE_ENV: "test",
+  };
+
+  const idp = spawn(["bun", join(REPO_ROOT, "apps", "idp", "src", "index.ts")], {
+    env: idpEnv,
+    stdout: Bun.file(logPath),
+    stderr: "pipe",
+  });
+
+  const deadline = Date.now() + 30_000;
+  for (;;) {
+    try {
+      if ((await fetch(`${idpUrl}/health`)).ok) break;
+    } catch {
+      /* not listening yet */
+    }
+    if (Date.now() > deadline) {
+      idp.kill();
+      throw new Error(`apps/idp did not come up:\n${await new Response(idp.stderr as ReadableStream).text()}`);
+    }
+    await Bun.sleep(50);
+  }
+
+  // The secret is stored hashed and cannot be printed twice (#70), so the
+  // operational path a human takes on a fresh deploy is the one taken here:
+  // rotate once, under the same client id, to obtain a readable one.
+  const rotate = spawn(
+    ["bun", join(REPO_ROOT, "apps", "idp", "scripts", "oauth-client.ts"), "--json", "--client", "web", "--rotate"],
+    { env: idpEnv, stdout: "pipe", stderr: "pipe" },
+  );
+  const [rotateOut, rotateErr, rotateCode] = await Promise.all([
+    new Response(rotate.stdout).text(),
+    new Response(rotate.stderr).text(),
+    rotate.exited,
+  ]);
+  if (rotateCode !== 0) throw new Error(`oauth-client --client web --rotate exited ${rotateCode}: ${rotateErr}`);
+  const credentials = JSON.parse(rotateOut) as {
+    clients: Array<{ key: string; client_id: string; client_secret: string | null }>;
+  };
+  const clientC = credentials.clients.find((each) => each.key === "web");
+  if (!clientC?.client_secret) throw new Error(`no readable secret for client C in:\n${rotateOut}`);
+
+  const config = readWebConfig({
+    ARCADE_API_URL: arcade.url,
+    ARCADE_API_KEY: ARCADE_API_KEY,
+    ARCADE_CLOUD_URL: arcade.url,
+    ARCADE_GATEWAY_ID: GATEWAY_ID,
+    IDP_ISSUER: idpUrl,
+    IDP_CLIENT_ID: clientC.client_id,
+    IDP_CLIENT_SECRET: clientC.client_secret,
+    SESSION_SECRET,
+    PUBLIC_URL: webUrl,
+  });
+
+  const web = Bun.serve({
+    port: webPort,
+    idleTimeout: 30,
+    fetch(request) {
+      const { pathname } = new URL(request.url);
+      if (pathname === "/api/auth/signin") return signin(request, config);
+      if (pathname === "/api/auth/callback") return signinCallback(request, config);
+      if (pathname === "/api/auth/signout" && request.method === "POST") return signout(request, config);
+      if (pathname === "/api/arcade/start") return gatewayStart(request, config);
+      if (pathname === "/api/arcade/callback") return gatewayCallback(request, config);
+      if (pathname === "/api/arcade/verify") return verify(request, config);
+      // Stands in for the app shell: the landing page a completed sign-in
+      // reaches. It renders no form, so the browser stops here.
+      if (pathname === "/") return new Response("<!doctype html><p>home", { headers: { "content-type": "text/html" } });
+      return new Response("not found", { status: 404 });
+    },
+  });
+
+  return {
+    webUrl,
+    idpUrl,
+    arcade,
+    config,
+    idpLog: () => Bun.file(logPath).text(),
+    async stop() {
+      web.stop(true);
+      arcade.stop();
+      idp.kill();
+      await idp.exited;
+      rmSync(dirname(dbPath), { recursive: true, force: true });
+    },
+  };
+}
+
+/**
+ * Sign a persona in from scratch: press their button, land on the IdP, type the
+ * password, accept consent if it is offered, and come back.
+ *
+ * Returns where the chain ended, so a caller can assert it reached hop 1 rather
+ * than an error page.
+ */
+export async function signInAs(
+  browser: Browser,
+  harness: IdentityHarness,
+  persona: PersonaKey,
+  options: { from?: string; stopAt?: string } = {},
+): Promise<{ url: string; response: Response; html: string }> {
+  const person = PEOPLE[persona];
+  return browser.follow(
+    options.from ?? `${harness.webUrl}/api/auth/signin?persona=${persona}`,
+    (fields) => {
+      const filled: Record<string, string> = { ...fields };
+      // The login form asks for an identifier and a password; the consent form
+      // does not. Filling by shape rather than by page means this helper does
+      // not have to know how many pages the IdP decided to show.
+      if ("email" in fields) {
+        filled.email = person.email;
+        filled.password = person.password;
+      }
+      if ("decision" in fields) filled.decision = "allow";
+      return filled;
+    },
+    { ...(options.stopAt !== undefined && { stopAt: options.stopAt }) },
+  );
+}

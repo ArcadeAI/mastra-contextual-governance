@@ -2,7 +2,17 @@
  * Placeholder. The real thing is a split screen: a deliberately boring
  * enterprise loan app on the left, the Arcade control plane on the right.
  * The shell lands in #22, the control-plane panel in #21.
+ *
+ * Since #82 it carries one real thing: the sign-in panel. A server component,
+ * so the session is unsealed on the server and only the email and whether a
+ * gateway token exists ever reach the browser.
  */
+import { cookies } from "next/headers";
+
+import { configurationProblems, readIdentitySurface } from "../lib/config.ts";
+import { readSessionFromCookies } from "../lib/identity/session.ts";
+import { SignInPanel } from "../components/identity/SignInPanel.tsx";
+
 const SERVICES = [
   ["apps/web", "this app — chat, persona switcher, approval page, panel"],
   ["apps/hooks", "the control plane — /access, /pre, /post, audit, SSE"],
@@ -11,7 +21,23 @@ const SERVICES = [
   ["tools/approvals", "Python arcade-mcp toolkit — ships via arcade deploy"],
 ] as const;
 
-export default function Home() {
+/**
+ * Dynamic, because it reads a session cookie. Saying so explicitly rather than
+ * relying on `cookies()` to infer it keeps `next build` from evaluating this
+ * component at all — a prerender of a page about who is signed in is either
+ * wrong or empty, and it runs under `NODE_ENV=production` with none of the
+ * deployment's environment.
+ */
+export const dynamic = "force-dynamic";
+
+export default async function Home() {
+  const jar = await cookies();
+  const config = readIdentitySurface();
+  const session = await readSessionFromCookies(
+    new Map(jar.getAll().map((cookie) => [cookie.name, cookie.value])),
+    config,
+  );
+
   return (
     <main
       style={{
@@ -39,6 +65,8 @@ export default function Home() {
         point of this slice is that the deploy pipeline works before any logic
         goes into it.
       </p>
+
+      <SignInPanel session={session} problems={configurationProblems(config)} />
 
       <ul style={{ listStyle: "none", padding: 0, marginTop: "2rem" }}>
         {SERVICES.map(([name, role]) => (

@@ -190,6 +190,22 @@ services:
       # code is Arcade Cloud's; set this if the dashboard shows another.
       - key: IDP_OAUTH_REDIRECT_URIS
         sync: false
+      # One OAuth client per relying party, by key (#79). `web` is client C —
+      # cg-web's own sign-in (#82) — alongside the `arcade` client the Arcade
+      # dashboard is registered against. Set it to `web`, and give that client
+      # its own allowlist below; a client without a per-key override falls back
+      # to IDP_OAUTH_REDIRECT_URIS, which is Arcade's callback and not cg-web's.
+      #
+      # The secret is printed exactly once, by
+      # `bun run oauth-client --client web --rotate` in this service's shell.
+      - key: IDP_OAUTH_CLIENTS
+        sync: false
+      # `${PUBLIC_URL}/api/auth/callback` on cg-web — in the live environment
+      # `https://cg-web-sa31.onrender.com/api/auth/callback`. An OAuth redirect
+      # URI is matched byte for byte, and a mismatch is refused at the authorize
+      # step, where no hook fires and the panel stays dark.
+      - key: IDP_OAUTH_REDIRECT_URIS_WEB
+        sync: false
       # The persona emails, same values as cg-web's — they are the join key
       # across the whole system. Read only when idp.db is first seeded.
       - key: PERSONA_DANA_EMAIL
@@ -226,6 +242,92 @@ services:
         sync: false
       - key: ARCADE_GATEWAY_ID
         sync: false
+      # --- identity (#82) ---------------------------------------------------
+      # This service signs each persona in against cg-idp under its own OAuth
+      # client ("client C"), then drives the gateway OAuth itself and answers
+      # Arcade's custom user verifier. DESIGN.md → Identity and OAuth.
+      #
+      # cg-idp's public origin, as a URL — not HOST-form like the keys below,
+      # because it is an origin a browser is redirected to and an OAuth issuer.
+      # Read it off the cg-idp service page in the Render dashboard; in the live
+      # environment that is `https://cg-idp-or5b.onrender.com`.
+      - key: IDP_ISSUER
+        sync: false
+      # Client C, minted on cg-idp by adding `web` to IDP_OAUTH_CLIENTS and
+      # running `bun run oauth-client --client web --rotate` in that service's
+      # shell. It prints the secret exactly once (#70). Its redirect URI must be
+      # allowlisted as `${PUBLIC_URL}/api/auth/callback` via
+      # IDP_OAUTH_REDIRECT_URIS_WEB on cg-idp. Separate from the two
+      # registrations Arcade holds — one client per relying party, settled on
+      # #75/#79.
+      - key: IDP_CLIENT_ID
+        sync: false
+      - key: IDP_CLIENT_SECRET
+        sync: false
+      # Seals the per-browser session cookie (AES-256-GCM), which carries the
+      # persona's email and their gateway access and refresh tokens. Run
+      # `openssl rand -hex 32` and paste the result; nothing else produces a
+      # value this service will accept.
+      #
+      # At least 32 characters, and at least 8 distinct ones. That floor is
+      # enforced, not advised: below it /health reports signin, gateway and
+      # verifier all `missing` and every identity route answers 503 naming the
+      # minimum. `SESSION_SECRET=x` used to be accepted, and a guessable key
+      # over two bearer tokens with every surface reporting `configured` is the
+      # silent control this project argues against.
+      #
+      # Rotating it signs every browser out. That is the whole blast radius.
+      - key: SESSION_SECRET
+        sync: false
+      # This service's own public origin, as a URL with the scheme. Every OAuth
+      # redirect_uri is built from it, and each has to match an allowlist byte
+      # for byte, so it cannot be derived: onrender.com subdomains are global and
+      # Render suffixes a name that is taken — cg-web is `cg-web-sa31`, and the
+      # bare subdomain belongs to a stranger. Read it off this service's page:
+      # `https://cg-web-sa31.onrender.com`.
+      #
+      # It also decides whether the session cookie carries `Secure` (it does,
+      # for anything but an http:// loopback value).
+      - key: PUBLIC_URL
+        sync: false
+      # The three below have working defaults in the code and are named here so
+      # the blueprint is the whole list rather than most of it. **Leave all
+      # three blank on cg-web**; each comment says the one case for setting it.
+      #
+      # What sign-in asks cg-idp for. Defaults to `openid email`. `email` is the
+      # join key between Arcade's user_id, the OAuth subject and the loan book's
+      # actor column, so a value here that omits it breaks identity rather than
+      # narrowing it. Set it only to ask for more, never fewer.
+      - key: IDP_SCOPES
+        sync: false
+      # Where `confirm_user` lives, which is NOT api.arcade.dev. Defaults to
+      # https://cloud.arcade.dev, measured on spike #75. It exists so a test can
+      # point the verifier's two calls at a stand-in without moving the
+      # gateway's; set it only if Arcade Cloud moves.
+      - key: ARCADE_CLOUD_URL
+        sync: false
+      # Pins the MCP client id hop 1 authorizes under, instead of letting cg-web
+      # register one dynamically per process. Blank is correct and is what this
+      # deployment starts with: there is no value to put here until a
+      # registration exists.
+      #
+      # The one reason to fill it in later: Arcade renders its gateway consent
+      # screen once per persona per MCP client id, so with this blank every
+      # redeploy costs each persona one more consent click. If that becomes a
+      # nuisance during rehearsal, pin it to a client id Arcade already knows.
+      # Whether the dashboard lists the dynamically-registered client is
+      # unmeasured — nobody has looked — so treat that as a thing to check
+      # before relying on it, not as an instruction.
+      - key: ARCADE_MCP_CLIENT_ID
+        sync: false
+      #
+      # One step is not an environment variable at all: the Arcade dashboard's
+      # Auth → Settings → Custom verifier route must be
+      # `${PUBLIC_URL}/api/arcade/verify`. Without it Arcade uses its own
+      # verifier, which demands an Arcade account that is a project member —
+      # our personas are not, the grant binds to whoever is signed in at
+      # account.arcade.dev, and the tool re-challenges forever with nothing on
+      # the panel to say why (DESIGN.md open risk 4).
       # The approval page reads GET /approvals/{id} from cg-hooks, and presses
       # Approvals.Decide through Arcade. Both need naming here: the same
       # shared bearer cg-hooks requires, and the toolkit name the tool is

@@ -20,7 +20,7 @@ import { join } from "node:path";
 
 import { ApprovalRecord } from "@cg/policy-schema";
 
-import type { WebConfig } from "../lib/config.ts";
+import { readWebConfig, type WebConfig } from "../lib/config.ts";
 import { submitDecision } from "../lib/decide.ts";
 import {
   DANA,
@@ -69,6 +69,10 @@ beforeAll(async () => {
     // make `lib/arcade.ts` add its "the key is unset" hint to any failure.
     arcadeApiKey: "not-a-real-key",
     approvalsToolkit: "Approvals",
+    // Nothing in these suites signs anyone in; `identity-flow.test.ts` builds
+    // its own configuration for that. Read from an empty environment rather
+    // than written out, so a new field cannot be forgotten here.
+    identity: readWebConfig({}).identity,
   };
 });
 

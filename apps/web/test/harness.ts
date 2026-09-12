@@ -30,7 +30,7 @@ import { spawn, type Subprocess } from "bun";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import type { WebConfig } from "../lib/config.ts";
+import { readWebConfig, type WebConfig } from "../lib/config.ts";
 import { createArcadeStandIn } from "../scripts/arcade-stand-in.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -75,6 +75,10 @@ export async function startHarness(): Promise<Harness> {
     arcadeApiUrl: `http://localhost:${arcade.port}`,
     arcadeApiKey: "arcade-key-for-web-tests",
     approvalsToolkit: "Approvals",
+    // Nothing in these suites signs anyone in; `identity-flow.test.ts` builds
+    // its own configuration for that. Read from an empty environment rather
+    // than written out, so a new field cannot be forgotten here.
+    identity: readWebConfig({}).identity,
   };
 
   const store = (method: string, path: string, body?: unknown) =>
