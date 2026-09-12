@@ -16,7 +16,8 @@
 import type { Metadata } from "next";
 
 import { ControlPlanePanel } from "../../components/governance/ControlPlanePanel.tsx";
-import { governanceStreamSource, withFixtureParams } from "../../lib/governance/stream-url.ts";
+import { PanelStreamError } from "../../components/governance/PanelStreamError.tsx";
+import { resolvePanelStream } from "../../lib/governance/stream-url.ts";
 
 export const metadata: Metadata = { title: "Control plane — Contextual Governance" };
 
@@ -29,15 +30,25 @@ export default async function PanelPage({
 }: {
   searchParams: Promise<Record<string, string | string[] | undefined>>;
 }) {
-  // In fixture mode the page's own query string tunes the replay, so
+  // The query string does two jobs here. `?fixture=1` asks for the replay
+  // explicitly — the only way to get one out of a deployed panel since #81 —
+  // and in fixture mode the rest of it tunes the replay, so
   // `/panel?repeat=2000&delayMs=0` is ten thousand events as fast as the socket
-  // will carry them — the shape of a whole-project `/access` call, and the way
+  // will carry them: the shape of a whole-project `/access` call, and the way
   // to watch the panel absorb one rather than take a test's word for it.
-  const { url, mode } = withFixtureParams(governanceStreamSource(process.env), await searchParams);
+  const stream = resolvePanelStream(process.env, await searchParams);
 
+  // An unconfigured stream renders instead of the panel, not above it. The
+  // whole failure #81 records is a replay that nobody could tell from the live
+  // control plane, and a warning over a running replay is still a running
+  // replay. Nothing subscribes on this path.
   return (
     <main className="cg-page">
-      <ControlPlanePanel streamUrl={url} mode={mode} />
+      {stream.mode === "unconfigured" ? (
+        <PanelStreamError problem={stream.problem} />
+      ) : (
+        <ControlPlanePanel stream={stream} />
+      )}
     </main>
   );
 }

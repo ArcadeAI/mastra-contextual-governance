@@ -221,7 +221,7 @@ function render(events: readonly GovernanceEvent[]): string {
     <ControlPlanePanelView
       timeline={appendEvents(emptyTimeline(), events)}
       status="live"
-      mode="fixture"
+      source={{ mode: "fixture" }}
     />,
   );
 }
@@ -376,7 +376,7 @@ describe("fixture mode replays the measured fan-out", () => {
     const { timeline } = await play(`${serveFixtureRoute()}?fanout=1&delayMs=0`, 10);
 
     const markup = renderToStaticMarkup(
-      <ControlPlanePanelView timeline={timeline} status="live" mode="fixture" />,
+      <ControlPlanePanelView timeline={timeline} status="live" source={{ mode: "fixture" }} />,
     );
 
     expect(cardsIn(markup, "access")).toHaveLength(3);

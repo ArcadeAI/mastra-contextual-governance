@@ -176,14 +176,71 @@ body {
   }
 }
 
-/* Named rather than styled as a warning: a fixture replay is a correct mode to
-   be in, and the only failure it causes is mistaking it for the live plane. */
+/* The badge that names which stream this is. Always present, in every mode —
+   #81: a panel that does not say whether it is live is a panel whose claim to
+   be live rests on whoever is talking.
+
+   Chartreuse for live, because chartreuse is this panel's chrome signifier and
+   already means "the live dot" six rules above. A fixture replay is a correct
+   mode to be in and is styled plainly rather than as a warning; its only
+   failure is being mistaken for the live plane, which the words now prevent.
+   Neither borrows a status colour — those mean a decision and nothing else. */
 .cg-mode {
   font-family: var(--font-mono);
   font-size: 0.78em;
+  letter-spacing: 0.04em;
+  padding: 0.15em 0.5em;
+  color: var(--neutral);
+  box-shadow: inset 0 0 0 1px var(--line-strong);
+}
+
+.cg-mode[data-mode="hooks"] {
   color: var(--ink);
   background: var(--chartreuse);
-  padding: 0.15em 0.5em;
+  box-shadow: none;
+}
+
+.cg-mode[data-mode="unconfigured"] {
+  color: var(--deny);
+  box-shadow: inset 0 0 0 1px var(--deny-edge);
+}
+
+/* --- the panel with no stream (#81) --------------------------------------- */
+
+/* Takes the place of the lanes rather than sitting over them. A warning above a
+   running replay is still a running replay, and the rows underneath it would
+   still be pointed at. */
+.cg-stream-error {
+  padding: 1.6em 1.4em 2em;
+  border-left: 6px solid var(--deny);
+  background: var(--deny-tint);
+}
+
+.cg-stream-error-title {
+  margin: 0 0 0.5em;
+  font-family: var(--font-display);
+  font-size: 1.35em;
+  font-weight: 400;
+  color: var(--white);
+}
+
+.cg-stream-error-problem {
+  margin: 0 0 0.9em;
+  font-size: 1em;
+  line-height: 1.45;
+  color: var(--white);
+}
+
+.cg-stream-error-note {
+  margin: 0 0 0.6em;
+  font-size: 0.85em;
+  line-height: 1.5;
+  color: var(--neutral);
+}
+
+.cg-stream-error code {
+  font-family: var(--font-mono);
+  color: var(--chartreuse);
 }
 
 /* --- the global tally ----------------------------------------------------- */
