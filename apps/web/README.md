@@ -141,13 +141,15 @@ so and what to do — it is never dropped in silence.
 
 ```
 curl -s localhost:3000/health
-{"status":"ok","service":"web","signin":"configured","gateway":"configured","verifier":"configured"}
+{"status":"ok","service":"web","signin":"configured","gateway":"configured","verifier":"configured","agent":"configured"}
 ```
 
-Three capabilities rather than one flag, because they fail independently and the person
-reading this is trying to find out which step is outstanding.
+Four capabilities rather than one flag, because they fail independently and the person
+reading this is trying to find out which step is outstanding. The fourth arrived with
+#14: a cg-web with no `ANTHROPIC_API_KEY` signs Dana in, holds a gateway token, answers
+the verifier — and then `/chat` answers 503 the first time somebody presses Send.
 
-**`status` is `degraded` whenever any of the three is `missing`, and the response is
+**`status` is `degraded` whenever any of the four is `missing`, and the response is
 still HTTP 200.** Round 2 of #84's review ran a cg-web with sign-in configured and
 `ARCADE_GATEWAY_ID` absent and got `{"status":"ok", … "gateway":"missing"}` — the
 field anybody actually reads, describing a deployment that could not make a tool call
@@ -174,10 +176,14 @@ disabled buttons, and the fully-configured case where neither appears.
 | `IDP_SCOPES` | defaults to `openid email`. `email` is the join key, so it is not optional |
 | `ARCADE_CLOUD_URL` | defaults to `https://cloud.arcade.dev`, which is **not** `ARCADE_API_URL`. A test seam |
 | `ARCADE_MCP_CLIENT_ID` | optional, and blank is correct. Pins the gateway's MCP client id instead of registering one per process |
+| `ANTHROPIC_API_KEY` | the agent's model key (#14). No default; `/chat` refuses without it |
+| `MODEL_ID` | defaults to `claude-sonnet-5`. Set on `cg-web` explicitly so the blueprint is the whole list |
+| `ARCADE_LOAN_TOOLKIT` | `Loan`. Here it is the **allow-list** deciding which gateway tools the agent is handed |
 
 Every one of them is in `.env.example` and is a `sync: false` entry on `cg-web` in
-`render.yaml`. The first six a human sets; the last three have working defaults and
-should be left blank — they are named in the blueprint so it is the whole list rather
+`render.yaml`. The ones with no default a human sets; `IDP_SCOPES`, `ARCADE_CLOUD_URL`,
+`ARCADE_MCP_CLIENT_ID` and `MODEL_ID` have working defaults — the first three should be
+left blank, and `MODEL_ID` is pinned in the blueprint so the list is complete rather
 than most of it.
 
 Two steps are not environment variables on this service:
@@ -425,6 +431,150 @@ pins both halves of the guard on both sides, and CI hands the token to the
 `/health` deliberately does not read configuration, so it answers `200` either
 way; the guard fires on the first request that needs the token, which is any
 view of an approval.
+
+## The agent — `/chat`, and the denial it is built to show
+
+`POST /api/chat` runs one turn of a Mastra agent on Claude Sonnet 5 at temperature 0,
+in a Next.js route handler. `GET /chat` is the bare page that drives it. Both arrived
+with #14, the tracer bullet: the first end-to-end path through every layer.
+
+    this browser's session  →  gateway token (#82)  →  MCPClient, static bearer
+      →  api.arcade.dev/mcp/cg-demo-us  →  /access, /pre  →  tools/loan
+        →  apps/loan-app
+
+**"Acting as Dana" means signed in as Dana in this browser.** There is no branch in
+`lib/agent/handlers.ts` that reads an identity from the body, the query string or a
+header — the persona comes from the sealed session and the gateway resolves the bearer
+that came out of it. An actor a request can name is an actor the model can forge
+(`DESIGN.md` rule 1), and act 4 is the model trying.
+
+### The system prompt says nothing about being denied
+
+This is the load-bearing decision and it is easy to undo by accident. `lib/agent/agent.ts`
+tells the model what it could not know — that it is working in a bank's loan book and
+that its tools write to a system of record — and nothing about authority, escalation,
+approvals or retrying. `DESIGN.md` → Determinism: **the hook writes the remediation
+instruction, not the system prompt.** A prompt that also wrote it would make the demo
+pass while proving nothing.
+
+Measured, on the wire, by `test/tracer-bullet.test.ts`:
+
+```
+Tool execution was denied by an extension policy: DENIED: approving LN-2291 for 95000
+exceeds your approval authority of 50000. To proceed, call Approvals.RequestApproval
+with action=approve_loan, resource_id=LN-2291, amount=95000 and justification=<…>,
+then wait for the approval and retry Loan.ApproveLoan with loan_id=LN-2291 and
+amount=95000 unchanged. [ref evt_tkgv4b30gj]
+```
+
+Everything after Arcade's prefix is `pre.approve-within-clearance`'s own `reason`,
+rendered with the call's values, with the audit row's id appended (#6). It reaches the
+model's next prompt intact — the suite reads that off the conversation the model was
+handed, not off the stream the page renders.
+
+### Eight tools come back, six reach the model
+
+A live `tools/list` for a signed-in persona returns **eight** entries: the project's six
+plus the gateway's own `System_ManageAuthorization` and `Arcade_ListApps`. The agent is
+given the ones whose wire names start with `Loan_` and `Approvals_` and nothing else —
+an allow-list keyed on `ARCADE_LOAN_TOOLKIT`, not a deny-list on those two names, so a
+built-in Arcade adds tomorrow does not appear in front of the model either. Handing a
+model that has just been refused the tool whose job is acquiring authorization is not a
+thing to do by omission.
+
+A toolkit name that matches nothing selects nothing, and `/chat` answers 502 naming the
+variable. An agent with no tools still answers — fluently, from memory, about a loan
+book it never read — and that is the worst output this demo could produce.
+
+### Two spellings of one tool name
+
+MCP says `Loan_GetLoan`. A hook frame says `Loan.GetLoan`. Both are real, neither is
+invented here, and `scripts/gateway-stand-in.ts::qualifiedToolName` is the only place
+that converts between them. There is no third form.
+
+### Layer 2 is a link, not a refusal
+
+A persona's first governed call can come back with an `authorization_url` and
+`llm_instructions` instead of a result: Arcade evaluates tool auth requirements *before*
+`/pre`. It arrives in the same `isError: true` envelope a hook denial does, so the two
+are told apart by reading the text (`lib/agent/authorization.ts`). The page renders it as
+a clickable step and stops.
+
+**No hook fires and no audit row is written** — `DESIGN.md` open risk 2, which
+`tracer-bullet.test.ts` now measures rather than restates. Reported as a denial it would
+put a refusal on screen that no rule produced, and somebody would go looking for the rule.
+Dana and Sam hold live `cg-idp` grants so a rehearsal will not reach this path, which is
+exactly why it has a test: the first person it breaks for is a forker on their first run.
+
+### What the route refuses before a token is spent
+
+| | |
+|---|---|
+| the environment is not configured | `503`, naming the variables |
+| nobody is signed in | `401`, pointing at `/api/auth/signin` |
+| signed in, no gateway token | `401`, pointing at `/api/arcade/start` |
+| the toolkit name matched nothing | `502`, naming `ARCADE_LOAN_TOOLKIT` |
+
+### The stream
+
+NDJSON, one object per line, seven kinds: `text`, `tool-call`, `tool-result`, `denied`,
+`authorization`, `error`, `done`. Not the AI SDK's UI message stream — three of these are
+not text, and a plain text stream would flatten a hook denial, a tool call and an
+authorization link into prose the page would have to parse as English. `lib/agent/events.ts`
+is the whole vocabulary and both sides import it.
+
+The denial's remediation text is rendered verbatim, `[ref evt_…]` token included. #21's
+panel joins on that token; a UI that tidied it away would make the two screens describe
+different events.
+
+### Running it
+
+Against the deployed system, signed in as a persona, at `${PUBLIC_URL}/chat`. That needs
+Arcade, so it is the live-acceptance path rather than something a laptop can do.
+
+Locally, the whole governed chain runs under `bun test`:
+
+```sh
+bun test --cwd apps/web test/tracer-bullet.test.ts
+```
+
+That boots the real `apps/hooks`, the real `apps/loan-app` and the repo's own dev IdP as
+subprocesses on OS-assigned ports, puts `scripts/gateway-stand-in.ts` where Arcade would
+be, and drives `POST /api/chat` over real HTTP with a cookie jar. Every denial you see is
+the actual rule refusing the actual call, and every approval is a row in a real
+`loans.db`.
+
+**Which model ran matters, and the suite says so on the first line:**
+
+```
+[tracer-bullet] model: SCRIPTED (ANTHROPIC_API_KEY is not set)
+[tracer-bullet] model: LIVE claude-sonnet-5 at temperature 0
+```
+
+With no key the scripted model plays the tool calls and everything on both sides of it is
+real — the call reaches `/pre` as the right persona, the hook's message crosses into the
+model's prompt, a denied write leaves `loans.db` untouched. What it cannot prove is that
+Claude, handed that text, says the right thing and stops. Export `ANTHROPIC_API_KEY` and
+the same tests run against the real model and do prove it. **A green run that says
+`SCRIPTED` has not measured the three criteria that are claims about the model.**
+
+`scripts/gateway-stand-in.ts` is runnable on its own and prints a bearer per persona,
+which is enough to drive `tools/call` by hand with curl:
+
+```sh
+ARCADE_API_URL=http://localhost:4405 HOOKS_PUBLIC_HOST=localhost:4401 \
+  LOAN_APP_PUBLIC_HOST=localhost:4402 PERSONA_DANA_EMAIL=dana.okafor@bank.example \
+  bun run --cwd apps/web gateway-stand-in
+```
+
+It binds the port in `ARCADE_API_URL` and **never** `PORT` — `PORT` in
+`apps/web/.env.local` belongs to the web app, and reading it made the stand-in announce
+`:4400` and answer on it, which is where `next dev` wants to be. That is #56's bug and
+this is #56's fix, the same one `apps/loan-app/scripts/dev-idp.ts` uses. Leave
+`ARCADE_API_URL` off and it binds `:0` and tells you what it got. It is not enough to drive `/chat` from a browser offline: that needs a gateway token in a
+sealed session, which means hop 1's authorization server, and the only stand-in for that
+lives in `test/identity-harness.ts`. Folding the two stand-ins together so the chat runs
+offline end to end is worth doing and is filed, not done here.
 
 ## Driving the two beats locally
 

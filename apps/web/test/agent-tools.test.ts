@@ -14,6 +14,7 @@ import { authorizationRequired, DENIAL_PREFIX, remediationText } from "../lib/ag
 import { decodeEvents, encodeEvent, replyText, type ChatEvent } from "../lib/agent/events.ts";
 import { correlationRef, failureText } from "../lib/agent/run.ts";
 import { GATEWAY_BUILTINS, selectGoverned, wirePrefixes } from "../lib/agent/tools.ts";
+import { resolveStandInPort } from "../scripts/gateway-stand-in.ts";
 
 /**
  * A live `tools/list` for a signed-in persona on `cg-demo-us`, measured
@@ -179,5 +180,31 @@ describe("the stream protocol", () => {
 
   test("the reply is every text event in order and nothing else", () => {
     expect(replyText(events)).toBe("I could not approve it.");
+  });
+});
+
+describe("the runnable stand-in's port", () => {
+  test("it comes from ARCADE_API_URL, never from PORT", () => {
+    // #56's bug, arriving in a new script: `bun run --cwd apps/web
+    // gateway-stand-in` loads `apps/web/.env.local`, whose `PORT` belongs to
+    // the web app. Measured while writing this — the stand-in announced :4400
+    // and answered on it, which is where `next dev` wants to be.
+    expect(resolveStandInPort({ ARCADE_API_URL: "http://localhost:4405", PORT: "4400" })).toBe(4405);
+  });
+
+  test("unset means :0, so the OS picks and the boot line says what it got", () => {
+    expect(resolveStandInPort({ PORT: "4400" })).toBe(0);
+    expect(resolveStandInPort({ ARCADE_API_URL: "   " })).toBe(0);
+  });
+
+  test("a URL with no port is refused rather than defaulted", () => {
+    // `https://api.arcade.dev` is real Arcade on 443, not something this can
+    // stand in for. A default here would bind a port nobody is calling and
+    // look like it worked.
+    expect(() => resolveStandInPort({ ARCADE_API_URL: "https://api.arcade.dev" })).toThrow("names no port");
+    // `new URL("localhost:4405")` reads `localhost:` as the scheme and hands
+    // back an empty port, so an unchecked parse would report this as "names no
+    // port" and send somebody looking for a port that is right there.
+    expect(() => resolveStandInPort({ ARCADE_API_URL: "localhost:4405" })).toThrow("is not an http(s) URL");
   });
 });

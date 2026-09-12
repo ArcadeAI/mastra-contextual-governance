@@ -436,18 +436,69 @@ function authorizationChallenge(authorizationUrl: string): string {
   });
 }
 
+/**
+ * Which port the runnable stand-in binds — from `ARCADE_API_URL`, and
+ * deliberately **not** from `PORT`.
+ *
+ * `PORT` here belongs to `apps/web`. This script lives under `apps/web/scripts/`
+ * and `bun run --cwd apps/web gateway-stand-in` loads `apps/web/.env.local` into
+ * it: the right file for the wrong service. Measured while writing this —
+ * in a worktree owning 4400-4409 the stand-in announced `:4400` and answered on
+ * it, which is `apps/web`'s own port, so whichever process started second lost
+ * and nothing was listening where anybody was calling.
+ *
+ * That is #56's bug exactly, and this is #56's fix:
+ * `apps/loan-app/scripts/dev-idp.ts` reads the port out of `IDP_PUBLIC_HOST` —
+ * the address the loan API already asks for — so the two agree by construction.
+ * `ARCADE_API_URL` is the same kind of value here: it is where `apps/web` is
+ * told to reach Arcade, so binding it leaves no second number to keep in step.
+ *
+ * Unset means `:0`: the OS picks, the boot line says what it got, and you paste
+ * that into `ARCADE_API_URL`.
+ */
+export function resolveStandInPort(env: Record<string, string | undefined> = process.env): number {
+  const configured = env.ARCADE_API_URL?.trim();
+  if (!configured) return 0;
+
+  // The scheme is checked rather than left to `new URL`, which reads
+  // `localhost:4405` as the *scheme* `localhost:` with an empty port — a
+  // perfectly wrong value that would otherwise be reported as "names no port"
+  // and send somebody looking for a port that is right there.
+  let parsed: URL | null = null;
+  try {
+    parsed = new URL(configured);
+  } catch {
+    parsed = null;
+  }
+  if (parsed === null || (parsed.protocol !== "http:" && parsed.protocol !== "https:")) {
+    throw new Error(`ARCADE_API_URL=${configured} is not an http(s) URL — expected something like http://localhost:4405.`);
+  }
+  // A URL with no port is real Arcade on 443, not something this can stand in
+  // for. Falling back to a default would bind a port nothing is calling and
+  // look like it worked, which is the failure this function exists to end.
+  if (parsed.port === "") {
+    throw new Error(
+      `ARCADE_API_URL=${configured} names no port, so there is nothing here for the stand-in to bind. ` +
+        `It wants a local host:port, e.g. http://localhost:4405.`,
+    );
+  }
+  return Number(parsed.port);
+}
+
 // ---------------------------------------------------------------------------
 // Runnable
 // ---------------------------------------------------------------------------
 
 if (import.meta.main) {
   const env = process.env;
-  // Never a hard-coded port, and never a guess: this worktree owns a block of
-  // ten and another worktree owns a different block.
-  const port = env.PORT === undefined || env.PORT.trim() === "" ? 0 : Number(env.PORT);
-  if (!Number.isInteger(port) || port < 0) {
-    console.error(`[gateway-stand-in] PORT="${env.PORT}" is not a port number`);
-    process.exit(1);
+  let port: number;
+  try {
+    port = resolveStandInPort(env);
+  } catch (cause) {
+    console.error(`[gateway-stand-in] ${cause instanceof Error ? cause.message : String(cause)}`);
+    // 78 is sysexits' EX_CONFIG: the environment is wrong, not the invocation.
+    // The same code `apps/loan-app/scripts/dev-idp.ts` exits with.
+    process.exit(78);
   }
 
   const gatewayId = env.ARCADE_GATEWAY_ID?.trim() || "cg-demo-us";
@@ -467,6 +518,7 @@ if (import.meta.main) {
     `[gateway-stand-in] listening on :${standIn.port} — this is a STAND-IN for the Arcade gateway, ` +
       `for local runs only. It is not the product and it is not in the deployed image.`,
   );
+  console.log(`[gateway-stand-in] point apps/web at it with ARCADE_API_URL=http://localhost:${standIn.port}`);
   console.log(
     `[gateway-stand-in] every tools/call asks ${env.HOOKS_PUBLIC_HOST ?? "localhost:8081"}/pre first and runs ` +
       `nothing when the answer is not OK. /access and /post are NOT called — those are #15 and #16.`,
