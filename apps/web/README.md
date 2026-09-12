@@ -551,6 +551,14 @@ the actual rule refusing the actual call, and every approval is a row in a real
 [tracer-bullet] model: LIVE claude-sonnet-5 at temperature 0
 ```
 
+`bun test` sets `NODE_ENV=test`, and **Bun does not load `.env.local` under that**, so a key
+sitting in `apps/web/.env.local` will not reach the suite and it will quietly report
+`SCRIPTED`. Pass it on the command line:
+
+```sh
+ANTHROPIC_API_KEY=… bun test --cwd apps/web test/tracer-bullet.test.ts
+```
+
 With no key the scripted model plays the tool calls and everything on both sides of it is
 real — the call reaches `/pre` as the right persona, the hook's message crosses into the
 model's prompt, a denied write leaves `loans.db` untouched. What it cannot prove is that
