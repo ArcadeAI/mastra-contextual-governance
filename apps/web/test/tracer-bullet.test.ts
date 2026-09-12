@@ -217,17 +217,41 @@ describe("the $95K prompt, as Dana, whose authority is $50,000", () => {
   });
 
   test("the reply states the reason the hook gave, not a summary of it", () => {
-    // The thesis: the hook writes the remediation instruction, and nothing in
-    // the system prompt tells the model what to do when it is refused.
+    if (!LIVE_KEY) {
+      // Not measurable without a real completion, and pretending otherwise is
+      // the point of writing this branch out: the scripted model wrote the
+      // reply, so asserting on it would be asserting on this suite's own
+      // fixture. What the scripted run does prove is the line above — the
+      // rule's sentence reached the model's prompt intact. Whether Claude then
+      // repeats it is the live run's question, and only the live run answers it.
+      expect(result.prompt).toContain("exceeds your approval authority of 50000");
+      return;
+    }
+
+    // The thesis, measured: the hook writes the remediation instruction,
+    // nothing in the system prompt tells the model what to do when it is
+    // refused, and the model says why anyway.
     expect(result.reply.toLowerCase()).toContain("approval authority");
     expect(result.reply).toContain("50000");
   });
 
-  test("it does not retry the denied call", () => {
+  test("nothing below the model retries the denied call", () => {
+    // True in both modes, and worth pinning in both for different reasons.
+    //
+    // Scripted: the model asked for one `ApproveLoan` and the gateway saw
+    // exactly one, which says no layer underneath the model — `MCPClient`, the
+    // agent loop, this route — inserted a retry of its own. That is a real
+    // claim about our code and a cheap one to break.
+    //
+    // Live: this is the acceptance criterion. Claude reads a refusal telling
+    // it to escalate and does not hammer the same call, with nothing in the
+    // system prompt telling it not to.
     const approvals = harness.calls.filter(
       (call) => call.tool === "Loan_ApproveLoan" && call.inputs.loan_id === OVER_LIMIT_LOAN,
     );
     expect(approvals).toHaveLength(1);
+    // Every tool call is counted, denials included, so a spin would show as a
+    // number rather than as a quiet cap.
     expect(of(result.events, "done")[0]?.calls).toBe(result.events.filter((e) => e.kind === "tool-call").length);
   });
 
