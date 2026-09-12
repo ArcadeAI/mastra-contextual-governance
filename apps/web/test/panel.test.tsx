@@ -13,7 +13,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import { ControlPlanePanelView } from "../components/governance/ControlPlanePanelView.tsx";
 import type { CorrelationKey } from "../lib/governance/correlation.ts";
-import type { StreamMode } from "../lib/governance/stream-url.ts";
+import type { PanelSource } from "../lib/governance/stream-url.ts";
 import type { StreamStatus } from "../lib/governance/subscribe.ts";
 import { appendEvents, emptyTimeline } from "../lib/governance/timeline.ts";
 
@@ -21,7 +21,7 @@ function render(
   events: readonly GovernanceEvent[],
   options: {
     status?: StreamStatus;
-    mode?: StreamMode;
+    source?: PanelSource;
     correlationKey?: CorrelationKey;
   } = {},
 ): string {
@@ -30,7 +30,7 @@ function render(
     <ControlPlanePanelView
       timeline={timeline}
       status={options.status ?? "live"}
-      mode={options.mode ?? "fixture"}
+      source={options.source ?? { mode: "fixture" }}
       correlationKey={options.correlationKey}
     />,
   );
@@ -352,11 +352,16 @@ describe("the connection, said out loud", () => {
   });
 
   test("a fixture replay is labelled, so a rehearsal cannot mistake it for live", () => {
-    expect(render([], { mode: "fixture" })).toContain("Fixture replay");
+    expect(render([], { source: { mode: "fixture" } })).toContain("FIXTURE REPLAY");
   });
 
-  test("the live stream carries no such label", () => {
-    expect(render([], { mode: "hooks" })).not.toContain("Fixture replay");
+  test("the live stream says LIVE and names the host it is watching", () => {
+    // #81: "Live" alone is a word a replay could print. The host is the part
+    // somebody at the back of the room can check against the deployment.
+    const markup = render([], { source: { mode: "hooks", host: "cg-hooks.onrender.com" } });
+
+    expect(markup).toContain("LIVE · cg-hooks.onrender.com");
+    expect(markup).not.toContain("FIXTURE REPLAY");
   });
 });
 

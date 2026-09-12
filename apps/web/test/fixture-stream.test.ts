@@ -12,9 +12,19 @@ import { subscribeToGovernanceEvents } from "../lib/governance/subscribe.ts";
 import { allEvents, appendEvents, emptyTimeline, type Timeline } from "../lib/governance/timeline.ts";
 import {
   FIXTURE_STREAM_PATH,
-  governanceStreamSource,
+  panelStreamHealth,
+  resolvePanelStream,
   withFixtureParams,
+  type PanelStream,
+  type WatchableStream,
 } from "../lib/governance/stream-url.ts";
+
+/** Narrows to a stream there is something to subscribe to, failing loudly if there is not. */
+function watching(stream: PanelStream): WatchableStream {
+  if (stream.mode === "unconfigured") throw new Error(`expected a stream, got: ${stream.problem}`);
+  return stream;
+}
+
 
 const servers: Array<ReturnType<typeof Bun.serve>> = [];
 
@@ -149,44 +159,108 @@ describe("the fixture stream", () => {
 });
 
 describe("which stream the panel is pointed at", () => {
-  // `apps/hooks` has served /events since #54. The default is still the
-  // fixture because the hook server is a second process that usually is not
-  // running, not because the endpoint is missing.
-  test("defaults to the fixture, so a clone with no control plane running still plays", () => {
-    expect(governanceStreamSource({})).toEqual({
+  // #81. Every one of these used to resolve to the fixture, including the two
+  // that describe a production deployment — which is what the live cg-web was
+  // doing while a human watched it replay the demo over a real governed call.
+  // `render.yaml` never declared GOVERNANCE_STREAM, so that was every deploy
+  // since #21.
+  const DEPLOYED = { NODE_ENV: "production" } as const;
+
+  test("a development clone with nothing set still plays the replay", () => {
+    expect(resolvePanelStream({})).toEqual({
       url: "/api/governance/fixture-stream",
       mode: "fixture",
     });
   });
 
   test("a configured hook host alone is not enough to switch away from the fixture", () => {
-    expect(governanceStreamSource({ HOOKS_PUBLIC_HOST: "localhost:8081" }).mode).toBe("fixture");
+    expect(resolvePanelStream({ HOOKS_PUBLIC_HOST: "localhost:8081" }).mode).toBe("fixture");
   });
 
-  test("GOVERNANCE_STREAM=hooks points at the hook server", () => {
+  test("GOVERNANCE_STREAM=hooks points at the hook server, and carries the host for the badge", () => {
     expect(
-      governanceStreamSource({ GOVERNANCE_STREAM: "hooks", HOOKS_PUBLIC_HOST: "localhost:8081" }),
-    ).toEqual({ url: "http://localhost:8081/events", mode: "hooks" });
+      resolvePanelStream({ GOVERNANCE_STREAM: "hooks", HOOKS_PUBLIC_HOST: "localhost:8081" }),
+    ).toEqual({ url: "http://localhost:8081/events", mode: "hooks", host: "localhost:8081" });
   });
 
   test("a deployed host gets https, a local one gets http", () => {
-    const deployed = governanceStreamSource({
+    const deployed = resolvePanelStream({
       GOVERNANCE_STREAM: "hooks",
       HOOKS_PUBLIC_HOST: "cg-hooks.onrender.com",
     });
-    const local = governanceStreamSource({
+    const local = resolvePanelStream({
       GOVERNANCE_STREAM: "hooks",
       HOOKS_PUBLIC_HOST: "127.0.0.1:4421",
     });
 
-    expect(deployed.url).toBe("https://cg-hooks.onrender.com/events");
-    expect(local.url).toBe("http://127.0.0.1:4421/events");
+    expect(watching(deployed).url).toBe("https://cg-hooks.onrender.com/events");
+    expect(watching(local).url).toBe("http://127.0.0.1:4421/events");
   });
 
-  test("asking for hooks without a host falls back to the fixture rather than a bad URL", () => {
-    expect(governanceStreamSource({ GOVERNANCE_STREAM: "hooks" }).mode).toBe("fixture");
-    expect(governanceStreamSource({ GOVERNANCE_STREAM: "hooks", HOOKS_PUBLIC_HOST: "  " }).mode).toBe(
-      "fixture",
+  test("asking for hooks without a host is unconfigured, not a quiet replay", () => {
+    for (const env of [
+      { GOVERNANCE_STREAM: "hooks" },
+      { GOVERNANCE_STREAM: "hooks", HOOKS_PUBLIC_HOST: "  " },
+      { ...DEPLOYED, GOVERNANCE_STREAM: "hooks" },
+    ]) {
+      const stream = resolvePanelStream(env);
+      expect(stream.mode).toBe("unconfigured");
+      // The sentence names the variable, because whoever reads it is about to
+      // go and set it.
+      expect(stream).toHaveProperty("problem", expect.stringContaining("HOOKS_PUBLIC_HOST"));
+    }
+  });
+
+  test("a deployment that was told nothing at all is unconfigured", () => {
+    // The exact shape of the live cg-web on 2026-09-11: a host set by hand and
+    // no GOVERNANCE_STREAM, which used to be indistinguishable from a demo.
+    for (const env of [
+      DEPLOYED,
+      { ...DEPLOYED, HOOKS_PUBLIC_HOST: "cg-hooks.onrender.com" },
+      { RENDER: "true", HOOKS_PUBLIC_HOST: "cg-hooks.onrender.com" },
+    ]) {
+      const stream = resolvePanelStream(env);
+      expect(stream.mode).toBe("unconfigured");
+      expect(stream).toHaveProperty("problem", expect.stringContaining("GOVERNANCE_STREAM"));
+    }
+  });
+
+  test("a value this service does not understand is refused by name", () => {
+    const stream = resolvePanelStream({ GOVERNANCE_STREAM: "hook" });
+
+    expect(stream.mode).toBe("unconfigured");
+    expect(stream).toHaveProperty("problem", expect.stringContaining("GOVERNANCE_STREAM=hook"));
+  });
+
+  test("a typo is not rescued by ?fixture=1, which would hide it behind a replay", () => {
+    expect(resolvePanelStream({ GOVERNANCE_STREAM: "Hooks" }, { fixture: "1" }).mode).toBe(
+      "unconfigured",
+    );
+  });
+
+  test("fixture is available in production, but only when it is asked for", () => {
+    expect(resolvePanelStream({ ...DEPLOYED, GOVERNANCE_STREAM: "fixture" }).mode).toBe("fixture");
+    expect(resolvePanelStream(DEPLOYED, { fixture: "1" }).mode).toBe("fixture");
+    expect(resolvePanelStream(DEPLOYED, { fixture: "true" }).mode).toBe("fixture");
+    // Not an incantation anybody would type by accident.
+    expect(resolvePanelStream(DEPLOYED, { fixture: "0" }).mode).toBe("unconfigured");
+  });
+
+  test("?fixture=1 still tunes the replay it asked for", () => {
+    expect(watching(resolvePanelStream(DEPLOYED, { fixture: "1", delayMs: "0" })).url).toBe(
+      "/api/governance/fixture-stream?delayMs=0",
+    );
+  });
+
+  test("what /health reports is the page's own resolution, not a second opinion", () => {
+    expect(panelStreamHealth({ GOVERNANCE_STREAM: "hooks", HOOKS_PUBLIC_HOST: "cg-hooks.onrender.com" })).toBe("live");
+    expect(panelStreamHealth({ GOVERNANCE_STREAM: "fixture" })).toBe("fixture");
+    expect(panelStreamHealth({ NODE_ENV: "production" })).toBe("unconfigured");
+    // A bare service name throws on the page (#67) — loudly, at a developer.
+    // /health must still answer, because Render drops an instance whose health
+    // check fails and takes the endpoint that explains why with it.
+    expect(panelStreamHealth({ GOVERNANCE_STREAM: "hooks", HOOKS_PUBLIC_HOST: "cg-hooks" })).toBe(
+      "unconfigured",
     );
   });
 });
@@ -256,7 +330,11 @@ describe("fixture pacing carried from the page's own query string", () => {
   });
 
   test("the hook server's stream is never given query parameters", () => {
-    const hooks = { url: "https://cg-hooks.onrender.com/events", mode: "hooks" } as const;
+    const hooks = {
+      url: "https://cg-hooks.onrender.com/events",
+      mode: "hooks",
+      host: "cg-hooks.onrender.com",
+    } as const;
 
     expect(withFixtureParams(hooks, { repeat: "2000" })).toEqual(hooks);
   });

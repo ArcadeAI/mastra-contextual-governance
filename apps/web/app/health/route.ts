@@ -2,14 +2,28 @@
  * Same shape as the `/health` endpoints on `hooks` and `loan-app`, so the
  * Render blueprint can point all three services at one path.
  *
- * Since #82 it also reports which of this deployment's capabilities are
- * actually configured — the three identity ones, and since #14 the agent. That is not decoration: sign-in, the gateway hop and
- * the custom verifier each depend on variables a human sets by hand in the
- * Render dashboard and in the Arcade dashboard, they fail independently, and
- * two of the three fail at a step no hook observes — so an unset variable is
- * otherwise discovered mid-rehearsal as "the demo does nothing". The fields say
- * `configured` or `missing` and never which value is wrong, because the value
- * is a credential in two cases out of three.
+ * **Five fields, and they arrived from three different slices.** Each is a
+ * thing a human configures by hand, each fails on its own, and each fails at a
+ * point where nothing else on screen would say so.
+ *
+ * Since #82: `signin`, `gateway` and `verifier` — sign-in, the gateway hop and
+ * the custom verifier depend on variables set by hand in the Render dashboard
+ * and in the Arcade dashboard, and two of the three fail at a step no hook
+ * observes, so an unset one is otherwise discovered mid-rehearsal as "the demo
+ * does nothing". They say `configured` or `missing` and never which value is
+ * wrong, because the value is a credential in two cases out of three.
+ *
+ * Since #14: `agent`. A cg-web with no `ANTHROPIC_API_KEY` signs Dana in, holds
+ * a gateway token and answers the verifier — and then `/chat` answers 503 the
+ * first time somebody presses Send.
+ *
+ * Since #81: `panel_stream` — `live`, `fixture` or `unconfigured`. The odd one
+ * out, because it has three answers rather than two: a panel can be watching
+ * the live control plane, replaying the fixture on purpose, or watching
+ * nothing. Only the last is a fault; `fixture` is a mode somebody chose and the
+ * panel says so on screen. It failed quietly for every production deploy
+ * between #21 and #81 — the panel replayed a fixture and nothing, here or on
+ * screen, said the live control plane was never being watched.
  *
  * It still does not read `APPROVALS_STORE_TOKEN`'s production guard, and it
  * answers `200` whatever it finds — a health check that fails on a
@@ -21,14 +35,24 @@
  * the guard that belongs to a credential this endpoint does not use.
  */
 import { deploymentReadiness, readIdentitySurface } from "../../lib/config.ts";
+import { panelStreamHealth } from "../../lib/governance/stream-url.ts";
 
 export const dynamic = "force-dynamic";
 
 export function GET() {
-  const { status, ...capabilities } = deploymentReadiness(readIdentitySurface());
+  // `deploymentReadiness` owns the four `configured`/`missing` capabilities and
+  // its own roll-up; `panel_stream` is read separately because it is not one of
+  // them — see the note above about it having three answers.
+  const { status: deployment, ...capabilities } = deploymentReadiness(readIdentitySurface());
+  const panel_stream = panelStreamHealth(process.env);
+
   // `status` first, because it is the field anybody actually reads and the one
-  // the other three services answer. `degraded` whenever any capability is
-  // missing — and still HTTP 200, so Render brings the instance up and a human
-  // can read the four fields that say which one.
-  return Response.json({ status, service: "web", ...capabilities });
+  // the other three services answer. `ok` only when every capability is
+  // configured *and* the panel is watching something — and still HTTP 200, so
+  // Render brings the instance up and a human can read the fields that say
+  // which one. #86 and #88 each added a field to this expression; a deployment
+  // that satisfies one half and not the other is `degraded`.
+  const status = deployment === "ok" && panel_stream !== "unconfigured" ? "ok" : "degraded";
+
+  return Response.json({ status, service: "web", ...capabilities, panel_stream });
 }

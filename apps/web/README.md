@@ -141,17 +141,25 @@ so and what to do — it is never dropped in silence.
 
 ```
 curl -s localhost:3000/health
-{"status":"ok","service":"web","signin":"configured","gateway":"configured","verifier":"configured","agent":"configured"}
+{"status":"ok","service":"web","signin":"configured","gateway":"configured","verifier":"configured","agent":"configured","panel_stream":"fixture"}
 ```
 
-Four capabilities rather than one flag, because they fail independently and the person
-reading this is trying to find out which step is outstanding. The fourth arrived with
-#14: a cg-web with no `ANTHROPIC_API_KEY` signs Dana in, holds a gateway token, answers
-the verifier — and then `/chat` answers 503 the first time somebody presses Send.
+Five fields rather than one flag, because they fail independently and the person reading
+this is trying to find out which step is outstanding. They arrived from three slices:
+`signin`, `gateway` and `verifier` with #82; `agent` with #14 — a cg-web with no
+`ANTHROPIC_API_KEY` signs Dana in, holds a gateway token, answers the verifier, and then
+`/chat` answers 503 the first time somebody presses Send; and `panel_stream` with #81.
 
-**`status` is `degraded` whenever any of the four is `missing`, and the response is
-still HTTP 200.** Round 2 of #84's review ran a cg-web with sign-in configured and
-`ARCADE_GATEWAY_ID` absent and got `{"status":"ok", … "gateway":"missing"}` — the
+`panel_stream` is the odd one out and has three values, not two: `live`, `fixture` or
+`unconfigured`. A replay somebody asked for is a mode, not a fault — the panel says
+`FIXTURE REPLAY` on screen — while `unconfigured` means the panel is watching nothing.
+See [Which stream it watches](#which-stream-it-watches) and #81. The other four say
+`configured` or `missing`, and never which value is wrong, because the value is a
+credential in most cases.
+
+**`status` is `degraded` whenever any capability is `missing` or the panel is
+`unconfigured`, and the response is still HTTP 200.** Round 2 of #84's review ran a
+cg-web with sign-in configured and `ARCADE_GATEWAY_ID` absent and got `{"status":"ok", … "gateway":"missing"}` — the
 field anybody actually reads, describing a deployment that could not make a tool call
 as fine. The status line stays 200 on purpose: Render treats a non-200 on
 `healthCheckPath` as a dead instance and abandons the deploy, and an instance that
@@ -274,23 +282,53 @@ variable — `.env.example` explains why at length: `next build` inlines those i
 client bundle while Render supplies service variables at runtime, so one would be
 `undefined` in the deployed browser and perfectly fine under `next dev`.
 
-| `GOVERNANCE_STREAM` | Stream |
-|---|---|
-| unset (default) | `/api/governance/fixture-stream` — this app, replaying #5's fixture sequence |
-| `hooks` | `http(s)://$HOOKS_PUBLIC_HOST/events` |
+One knob, `GOVERNANCE_STREAM`, and three states:
 
-**Fixture is the default deliberately.** `apps/hooks` *does* serve `/events` — the
-stream half of #20 landed on #54 — but it is a second service with a database of its
-own, and most of the time a fresh clone does not have it running. Defaulting to it would
-open the panel on a connection retrying against nothing, which reads as a broken app
-rather than as a control plane nobody started. Opting in is two variables:
+| `GOVERNANCE_STREAM` | Stream | Badge on screen |
+|---|---|---|
+| `hooks` | `http(s)://$HOOKS_PUBLIC_HOST/events` | `LIVE · cg-hooks.onrender.com` |
+| `fixture` | `/api/governance/fixture-stream` — this app, replaying #5's fixture sequence | `FIXTURE REPLAY` |
+| unset, under `next dev` | the same replay | `FIXTURE REPLAY` |
+| unset, **deployed** | nothing. `/panel` is an error state naming the variable | `NO STREAM` |
+
+Anything else is refused by name rather than resolved to something, because a typo on
+a Render service page would otherwise be a panel quietly showing the demo.
+
+**The replay is the development default deliberately.** `apps/hooks` *does* serve
+`/events` — the stream half of #20 landed on #54 — but it is a second service with a
+database of its own, and most of the time a fresh clone does not have it running.
+Defaulting to it would open the panel on a connection retrying against nothing, which
+reads as a broken app rather than as a control plane nobody started. Opting in is two
+variables:
 
 ```sh
 GOVERNANCE_STREAM=hooks HOOKS_PUBLIC_HOST=localhost:4411 bun run --cwd apps/web dev
 ```
 
-The panel labels which mode it is in. A rehearsal must not mistake a replay for the
-live control plane.
+**That reasoning does not survive a deploy, which is #81.** A deployed panel is in
+front of an audience and has a control plane to watch, so an unset variable there is
+not a convenience — it is the panel answering "is this real?" with a replay. It did
+exactly that: `render.yaml` never declared `GOVERNANCE_STREAM` for `cg-web` between #21
+and #81, so every production deploy was in fixture replay by construction, and on
+2026-09-11 a human made a real governed `Loan_GetLoan` against the live gateway and
+watched the panel play #5's demo sequence instead. Nothing on the page said so.
+
+So, deployed (`NODE_ENV=production`, or Render's `RENDER=true`):
+
+- an unset `GOVERNANCE_STREAM`, or `hooks` with no `HOOKS_PUBLIC_HOST`, renders an
+  error state in place of the lanes — naming the variable, opening no socket, and
+  replaying nothing. A warning *above* a running replay would still be a running
+  replay, and the rows are the lie.
+- `GET /health` reports `"panel_stream"` as `live`, `fixture` or `unconfigured`, and
+  answers `"status":"degraded"` on the last — beside the three identity capabilities
+  #82 added, for the same reason and in the same shape.
+- the replay is still available when it is asked for: `GOVERNANCE_STREAM=fixture`, or
+  `/panel?fixture=1` for a single request. It says `FIXTURE REPLAY` on screen either way.
+
+Both modes carry a badge, always. `LIVE` names the host, because "live" on its own is a
+word a fixture could print and the host is the part somebody at the back of the room can
+check. A rehearsal must not mistake a replay for the live control plane, and the answer
+belongs on the projector rather than in the presenter's narration.
 
 ### Watching it absorb a burst
 
@@ -428,9 +466,10 @@ and doing it quietly, because the fallback works locally. `test/config.test.ts`
 pins both halves of the guard on both sides, and CI hands the token to the
 `build web image` smoke the same way it hands it to `build hooks image`.
 
-`/health` deliberately does not read configuration, so it answers `200` either
-way; the guard fires on the first request that needs the token, which is any
-view of an approval.
+`/health` deliberately does not read *this* variable — it reports the identity
+capabilities and the panel's stream, never the approvals token — so it answers
+`200` either way; the guard fires on the first request that needs the token,
+which is any view of an approval.
 
 ## The agent — `/chat`, and the denial it is built to show
 
