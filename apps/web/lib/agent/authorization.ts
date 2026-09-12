@@ -25,6 +25,8 @@
  * run, when every persona is unauthorized.
  */
 
+import { CORRELATION_TOKEN } from "../governance/correlation.ts";
+
 export interface AuthorizationRequired {
   /** Where the persona has to go. Rendered as a link; never followed server-side. */
   url: string;
@@ -77,6 +79,47 @@ export function authorizationRequired(text: string): AuthorizationRequired | nul
  * and undocumented — so anything reading it fails soft.
  */
 export const DENIAL_PREFIX = "Tool execution was denied by an extension policy: ";
+
+/**
+ * Was this tool failure a decision the control plane made?
+ *
+ * Round 1 of #88's review found the answer being assumed rather than asked.
+ * Every non-authorization tool error was labelled `denied`, so a loan API that
+ * could not be reached rendered as *"denied by the control plane"* with the
+ * connection error as the rule's reason — a refusal on screen that no hook
+ * made, no rule produced and no audit row backs. On a demo whose entire claim
+ * is *"the control plane decided this"*, that is the worst possible lie for the
+ * UI to tell, and it is indistinguishable from the real thing.
+ *
+ * So a denial now needs **positive evidence** of the control plane, and
+ * anything else is a `fault`. Four markers, any one of which is enough:
+ *
+ * - Arcade's prefix, which is what a hook denial crosses MCP behind (spike #2).
+ * - `CHECK_FAILED`, the `/pre` refusal code.
+ * - `CONTEXT_DENIED`, the `/access` one — `@arcadeai/arcadejs`'s typed errors,
+ *   which flatten toward text over MCP but keep the word.
+ * - The `[ref evt_…]` correlation token (#6). Only `apps/hooks` writes one, and
+ *   it writes one on every decision it makes.
+ *
+ * Any of them rather than all of them, deliberately. The prefix is Arcade's,
+ * undocumented and liable to change; the token is ours and survives a change to
+ * theirs. Requiring both would mean one vendor string away from every denial in
+ * the demo silently becoming an infrastructure error.
+ *
+ * The asymmetry is on purpose in the other direction too. A hook denial
+ * mislabelled `fault` reads as "something broke" — wrong, and obviously wrong
+ * to anyone watching, because the panel will show the decision this screen
+ * denies. A fault mislabelled `denied` reads as governance working, and nobody
+ * ever finds out.
+ */
+export function isHookDecision(text: string): boolean {
+  return (
+    text.startsWith(DENIAL_PREFIX) ||
+    text.includes("CHECK_FAILED") ||
+    text.includes("CONTEXT_DENIED") ||
+    CORRELATION_TOKEN.test(text)
+  );
+}
 
 /**
  * The hook's own message out of a failed tool call's text.

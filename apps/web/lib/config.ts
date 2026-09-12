@@ -71,17 +71,26 @@ export interface AgentConfig {
   /** `MODEL_ID` — `claude-sonnet-5`. */
   modelId: string;
   /**
-   * `tool.toolkit` as Arcade files the deployed loan toolkit — `Loan`,
-   * measured on #35.
+   * Every toolkit this project owns, as Arcade files them — `["Loan",
+   * "Approvals"]`, measured on #35. The agent's **allow-list**.
+   *
+   * Both, not just `Loan`. Round 1 of #88's review found the chat handler
+   * passing the loan toolkit alone: the documented eight-tool surface selected
+   * four, `Approvals_RequestApproval` and `Approvals_Decide` were dropped
+   * alongside the gateway's built-ins, and the pre-hook's own remediation
+   * instruction — *"call Approvals.RequestApproval"* — named a tool the model
+   * could not see. That is the failure #89 records the live model reasoning
+   * its way to, out loud.
    *
    * Load-bearing in the way this repo keeps warning about, but pointing the
-   * other way from the hooks' copy. There, a wrong value is a rule that matches
-   * nothing. Here, a wrong value is an **allow-list that selects nothing**, and
-   * the agent is handed no tools at all — which is loud rather than silent, and
-   * `lib/agent/handlers.ts` refuses the turn rather than letting a model answer
-   * from memory about a loan book it could not read.
+   * other way from the hooks' copy of the same two values. There, a wrong name
+   * is a rule that matches nothing. Here, a wrong name is an allow-list that
+   * **selects** nothing, and the agent is handed no tools at all — which is
+   * loud rather than silent, because `lib/agent/handlers.ts` refuses the turn
+   * rather than letting a model answer from memory about a loan book it could
+   * not read.
    */
-  loanToolkit: string;
+  toolkits: readonly string[];
 }
 
 export interface WebConfig {
@@ -147,7 +156,13 @@ export function readIdentitySurface(
       // runs the model `DESIGN.md` names, and `render.yaml` sets it explicitly
       // so the blueprint is the whole list rather than most of it.
       modelId: env.MODEL_ID?.trim() || "claude-sonnet-5",
-      loanToolkit: env.ARCADE_LOAN_TOOLKIT?.trim() || "Loan",
+      // The same two variables `apps/hooks` keys its rules on, read here as an
+      // allow-list. Blank entries are dropped rather than turned into a bare
+      // `_` prefix, which would match every tool the gateway advertises.
+      toolkits: [
+        env.ARCADE_LOAN_TOOLKIT?.trim() || "Loan",
+        env.ARCADE_APPROVALS_TOOLKIT?.trim() || "Approvals",
+      ].filter((name) => name !== ""),
     },
     identity: {
       idpIssuer: trimUrl(env.IDP_ISSUER),
@@ -370,7 +385,7 @@ export function agentProblems(config: IdentitySurface): string[] {
   return [
     ...gatewayProblems(config),
     ...(config.agent.anthropicApiKey ? [] : ["ANTHROPIC_API_KEY is not set"]),
-    ...(config.agent.loanToolkit ? [] : ["ARCADE_LOAN_TOOLKIT is not set"]),
+    ...(config.agent.toolkits.length > 0 ? [] : ["ARCADE_LOAN_TOOLKIT is not set"]),
   ];
 }
 

@@ -1,17 +1,24 @@
 /**
  * What the chat route streams, one JSON object per line.
  *
- * NDJSON rather than plain text because three of these are not text: a tool
+ * NDJSON rather than plain text because four of these are not text: a tool
  * call the person should see happening, a hook denial that the panel will later
- * join on its `[ref …]` token (#21), and layer 2's authorization link, which
- * has to be clickable and has to be distinguishable from a refusal. A plain
- * text stream would flatten all of that into prose and the page would have to
- * parse English.
+ * join on its `[ref …]` token (#21), layer 2's authorization link, which has to
+ * be clickable, and a plumbing failure that must not be mistaken for either. A
+ * plain text stream would flatten all of that into prose and the page would
+ * have to parse English.
+ *
+ * **Three of the kinds describe a tool that did not return, and they are three
+ * kinds rather than one because they are three different claims about the
+ * world.** `denied`: a hook decided, and there is an audit row. `authorization`:
+ * a credential is missing, no hook fired, no row exists. `fault`: something
+ * broke, and nothing decided anything. Collapsing any two of them puts a
+ * statement on screen that the control plane never made.
  *
  * Deliberately not the AI SDK's UI message stream. That protocol is richer than
  * this slice needs and it would put the shape of a vendor's stream between the
- * control plane and the screen; these seven kinds are the whole vocabulary and
- * `test/chat-stream.test.ts` reads them back.
+ * control plane and the screen; these eight kinds are the whole vocabulary and
+ * `test/agent-tools.test.ts` reads them back.
  */
 
 export type ChatEvent =
@@ -33,6 +40,17 @@ export type ChatEvent =
    * which is why it is its own kind and not a `denied`.
    */
   | { kind: "authorization"; tool: string; url: string; instructions?: string }
+  /**
+   * The tool failed and **no hook decided anything**: the loan API was
+   * unreachable, the gateway could not answer, the toolkit threw. Plumbing.
+   *
+   * Its own kind because round 1 of #88's review found all of this arriving as
+   * `denied` — a connection error rendered as *"denied by the control plane"*,
+   * with the socket error standing in for a rule's remediation text. There is
+   * no rule, no decision and no audit row behind a `fault`, and a demo that
+   * claims one is claiming the thing it exists to prove.
+   */
+  | { kind: "fault"; tool: string; message: string }
   /** Anything that stopped the run. The message is shown; it is not a tool outcome. */
   | { kind: "error"; message: string }
   /** The run finished. `calls` is every tool call attempted, denials included. */

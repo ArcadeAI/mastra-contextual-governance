@@ -10,10 +10,16 @@
  */
 import { describe, expect, test } from "bun:test";
 
-import { authorizationRequired, DENIAL_PREFIX, remediationText } from "../lib/agent/authorization.ts";
+import {
+  authorizationRequired,
+  DENIAL_PREFIX,
+  isHookDecision,
+  remediationText,
+} from "../lib/agent/authorization.ts";
 import { decodeEvents, encodeEvent, replyText, type ChatEvent } from "../lib/agent/events.ts";
 import { correlationRef, failureText } from "../lib/agent/run.ts";
 import { GATEWAY_BUILTINS, selectGoverned, wirePrefixes } from "../lib/agent/tools.ts";
+import { readIdentitySurface } from "../lib/config.ts";
 import { resolveStandInPort } from "../scripts/gateway-stand-in.ts";
 
 /**
@@ -62,6 +68,40 @@ describe("which tools the agent is given", () => {
     );
     expect(Object.keys(governed)).toEqual(["Loan_SearchLoans", "Loan_GetLoan", "Loan_ApproveLoan", "Loan_DenyLoan"]);
     expect(dropped).toContain("Arcade_SomethingNew");
+  });
+
+  test("the agent's own configured allow-list selects all six, from an empty environment", () => {
+    // Round 1 of #88's review reproduced the bug with exactly these eight names
+    // and `{ toolkits: ["Loan"] }`, which selected four and dropped
+    // `Approvals_RequestApproval` and `Approvals_Decide` alongside the gateway
+    // built-ins — so the pre-hook's own remediation instruction ("call
+    // Approvals.RequestApproval") named a tool the model could not see.
+    //
+    // This asserts against `readIdentitySurface`'s value rather than a literal,
+    // because the bug was not in `selectGoverned` — it was in what the chat
+    // handler passed it. A test that hand-wrote `["Loan", "Approvals"]` here
+    // would have passed while the handler stayed wrong.
+    const { agent } = readIdentitySurface({});
+    expect(agent.toolkits).toEqual(["Loan", "Approvals"]);
+
+    const { governed, dropped } = selectGoverned(asRecord(LIVE_TOOLS_LIST), agent);
+    expect(Object.keys(governed)).toHaveLength(6);
+    expect(Object.keys(governed)).toContain("Approvals_RequestApproval");
+    expect(Object.keys(governed)).toContain("Approvals_Decide");
+    expect(dropped).toEqual([...GATEWAY_BUILTINS]);
+  });
+
+  test("a blank toolkit name does not become a prefix that matches everything", () => {
+    // `"" + "_"` is `"_"`, and `startsWith("_")` matches nothing — but a bare
+    // empty prefix in a different implementation would match every tool the
+    // gateway advertises, built-ins included. `wirePrefixes` drops blanks, and
+    // `readIdentitySurface` filters them out before they get here.
+    expect(readIdentitySurface({ ARCADE_APPROVALS_TOOLKIT: "   " }).agent.toolkits).toEqual([
+      "Loan",
+      "Approvals",
+    ]);
+    const { governed } = selectGoverned(asRecord(LIVE_TOOLS_LIST), { toolkits: ["", "  "] });
+    expect(Object.keys(governed)).toEqual([]);
   });
 
   test("a misspelled toolkit selects nothing rather than selecting loosely", () => {
@@ -206,5 +246,46 @@ describe("the runnable stand-in's port", () => {
     // back an empty port, so an unchecked parse would report this as "names no
     // port" and send somebody looking for a port that is right there.
     expect(() => resolveStandInPort({ ARCADE_API_URL: "localhost:4405" })).toThrow("is not an http(s) URL");
+  });
+});
+
+describe("a tool that failed is not the same as a tool that was refused", () => {
+  // Round 1 of #88's review: every non-authorization tool error was labelled
+  // `denied`. A probe with `Loan_GetLoan` failing as "The loan origination
+  // system could not be reached" produced
+  // `{kind:"denied", reason:"The loan origination system could not be reached", ref:null}`
+  // — a refusal on screen that no hook made and no audit row backs.
+
+  test("a socket error is not a hook decision", () => {
+    for (const text of [
+      "The loan origination system could not be reached.",
+      "the control plane at http://localhost:4401 could not be reached: Unable to connect.",
+      "fetch failed",
+      "No loan application found with ID LN-9999.",
+      "",
+    ]) {
+      expect(isHookDecision(text)).toBe(false);
+    }
+  });
+
+  test("any one of the four control-plane markers is enough", () => {
+    // Any rather than all, deliberately: Arcade's prefix is undocumented and
+    // liable to change, and the `[ref …]` token is ours. Requiring both would
+    // put every denial in the demo one vendor string away from silently
+    // becoming an infrastructure error.
+    expect(isHookDecision(`${DENIAL_PREFIX}DENIED: over your limit.`)).toBe(true);
+    expect(isHookDecision("CHECK_FAILED: policy refused this call")).toBe(true);
+    expect(isHookDecision("CONTEXT_DENIED: you cannot see this tool")).toBe(true);
+    expect(isHookDecision("DENIED: over your limit. [ref evt_tkgv4b30gj]")).toBe(true);
+  });
+
+  test("a fail-closed denial, which carries a token but not the prefix, still reads as a decision", () => {
+    // `apps/hooks` fails closed when its policy will not compile, and that
+    // refusal is a decision with an audit row behind it. Rendering it as
+    // plumbing would hide the one state an operator most needs to see.
+    const failClosed =
+      "DENIED: the control plane cannot evaluate Loan.ApproveLoan because its policy is " +
+      "unavailable. Do not retry; report the reference to an administrator. [ref evt_tkgv4b30gj]";
+    expect(isHookDecision(failClosed)).toBe(true);
   });
 });

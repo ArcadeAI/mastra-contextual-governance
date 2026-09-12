@@ -16,6 +16,12 @@
  * because…". Both the model and the person see the rule author's sentence,
  * which is the claim the demo is making.
  *
+ * **A tool that failed is not the same as a tool that was refused.** Three
+ * different things arrive as one chunk type and they are separated by reading
+ * the text, never by the fact of failure: a hook decision, a layer-2
+ * authorization challenge, and plumbing. Round 1 of #88's review found the
+ * third rendering as the first.
+ *
  * **Retrying is not this code's decision.** There is no retry loop here and no
  * back-off. If the model calls the same denied tool twice, that is the model
  * doing it and the stream will show two `denied` events — which is the thing
@@ -27,7 +33,7 @@
  * that a model which *does* spin hits it visibly rather than being quietly
  * capped at one call.
  */
-import { authorizationRequired, remediationText } from "./authorization.ts";
+import { authorizationRequired, isHookDecision, remediationText } from "./authorization.ts";
 import { CORRELATION_TOKEN } from "../governance/correlation.ts";
 import type { ChatEvent } from "./events.ts";
 
@@ -147,10 +153,12 @@ export async function runTurn(options: RunOptions): Promise<void> {
 
       // The branch the demo is about. A hook denial, a layer-2 challenge and an
       // unreachable loan book all arrive here — one chunk type, three very
-      // different things to say — so they are told apart by reading the text.
+      // different claims about the world — so they are told apart by reading
+      // the text, and nothing is assumed from the fact that a tool failed.
       if (chunk.type === "tool-error") {
         const tool = String(payload.toolName ?? "unknown");
         const text = failureText(payload.error ?? payload);
+
         // Layer 2 first: it arrives in the same `isError` envelope as a hook
         // denial and is not one. See `authorization.ts`.
         const authorization = authorizationRequired(text);
@@ -161,6 +169,15 @@ export async function runTurn(options: RunOptions): Promise<void> {
             url: authorization.url,
             ...(authorization.instructions ? { instructions: authorization.instructions } : {}),
           });
+          continue;
+        }
+
+        // Then a denial, but only on positive evidence that a hook made a
+        // decision. Everything else is plumbing, and saying "denied by the
+        // control plane" about a socket error is the one lie this UI must not
+        // tell — see `isHookDecision`.
+        if (!isHookDecision(text)) {
+          await emit({ kind: "fault", tool, message: text });
           continue;
         }
 

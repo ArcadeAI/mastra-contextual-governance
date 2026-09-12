@@ -31,7 +31,8 @@
  * The last one is the interesting one. An agent with no tools still answers —
  * fluently, from memory, about a loan book it never read. That is the worst
  * possible output of this demo, so an empty toolset is an error rather than a
- * turn. It is also the shape a wrong `ARCADE_LOAN_TOOLKIT` takes.
+ * turn. It is also the shape a wrong `ARCADE_LOAN_TOOLKIT` or
+ * `ARCADE_APPROVALS_TOOLKIT` takes.
  */
 import { agentProblems, readIdentitySurface, type IdentitySurface } from "../config.ts";
 import { anthropicModel, buildAgent } from "./agent.ts";
@@ -108,7 +109,7 @@ export async function chat(request: Request, options: ChatOptions = {}): Promise
 
   let selected: Awaited<ReturnType<typeof governedToolset>>;
   try {
-    selected = await governedToolset(client, { toolkits: [config.agent.loanToolkit] });
+    selected = await governedToolset(client, { toolkits: config.agent.toolkits });
   } catch (cause) {
     await client.disconnect().catch(() => undefined);
     return refuse(502, `The gateway would not list its tools: ${String(cause)}`);
@@ -124,9 +125,10 @@ export async function chat(request: Request, options: ChatOptions = {}): Promise
     await client.disconnect().catch(() => undefined);
     return refuse(
       502,
-      `The gateway advertised ${selected.advertised.length} tools and none of them belong to the ` +
-        `"${config.agent.loanToolkit}" toolkit, so this agent has nothing to call. Check ` +
-        `ARCADE_LOAN_TOOLKIT against a real tools/list.`,
+      `The gateway advertised ${selected.advertised.length} tools and none of them belong to ` +
+        `${config.agent.toolkits.map((name) => `"${name}"`).join(" or ")}, so this agent has ` +
+        `nothing to call. Check ARCADE_LOAN_TOOLKIT and ARCADE_APPROVALS_TOOLKIT against a real ` +
+        `tools/list.`,
       selected.dropped,
     );
   }

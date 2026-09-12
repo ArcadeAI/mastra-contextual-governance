@@ -17,6 +17,10 @@
  *    person to take, not a refusal (`lib/agent/authorization.ts`). Printing the
  *    URL as text would leave a persona stuck on their first call with no
  *    visible way forward.
+ * 4. **It gives a plumbing failure a different colour and different words.**
+ *    Red means a hook refused. A `fault` is grey and says no decision was made,
+ *    because a demo whose claim is *"the control plane stopped this"* must not
+ *    put that claim on screen when an unreachable API stopped it.
  *
  * The denial's remediation text is rendered **verbatim**, including the
  * `[ref evt_…]` token the control plane embedded. That token is what #21's panel
@@ -173,6 +177,23 @@ function EventView({ event }: { event: ChatEvent }) {
         <div style={{ ...box, borderColor: "#b3261e", background: "#fdecea", color: "#5f1412" }}>
           <strong style={{ fontFamily: mono }}>{event.tool} — denied by the control plane</strong>
           <p style={{ margin: "0.5rem 0 0", whiteSpace: "pre-wrap" }}>{event.reason}</p>
+        </div>
+      );
+
+    case "fault":
+      return (
+        // Grey, and worded as plumbing. Not red: red on this page means the
+        // control plane refused, and a socket error wearing that colour is the
+        // demo claiming a decision nobody made. Round 1 of #88's review found
+        // exactly that, with a connection error standing in for a rule's
+        // remediation text.
+        <div role="alert" style={{ ...box, borderColor: "var(--line)", background: "#f4f4f5", color: "#3f3f46" }}>
+          <strong style={{ fontFamily: mono }}>{event.tool} — the tool did not complete</strong>
+          <p style={{ margin: "0.5rem 0", whiteSpace: "pre-wrap" }}>{event.message}</p>
+          <p style={{ margin: 0, color: "var(--muted)" }}>
+            No policy decision was made and nothing was recorded. This is a failure in the plumbing,
+            not the control plane refusing.
+          </p>
         </div>
       );
 
