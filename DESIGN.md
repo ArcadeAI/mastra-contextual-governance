@@ -35,6 +35,15 @@ stage a beat we want to *show* as a layer-2 refusal. See open risk 2.
 | 3 | `get_loan` returns a bank account number → redacted before it reaches the model | Post | `POST /post` → `override.output` |
 | 4 | Seeded underwriter note contains an injected instruction → stripped | Post | `POST /post` → regex scanner |
 
+**Measured on #14 (2026-09-12), and it reorders the build:** acts 2 and 4 share `LN-2291`.
+Until `/post` strips the injected note (act 4's control, #16/#17), the model reads it, refuses
+it, and about two runs in three ends the turn asking the officer whether to proceed, so
+`ApproveLoan` is never called and `/pre` never fires. The same prompt on a clean over-limit
+loan (`LN-2299`) reaches the hook 12 of 12. Act 4's control therefore lands **before** act 2 is
+rehearsed, and #16 re-measures the $95K rate with `/post` live (#91). Act 2's second half
+additionally needs the agent to hold `Approvals_*` and the remediation text to name the tool
+as the wire spells it (#89). No prompt steering is an acceptable fix for either.
+
 ## Decisions
 
 | Area | Decision |
@@ -57,6 +66,8 @@ stage a beat we want to *show* as a layer-2 refusal. See open risk 2.
 | Approver routing | Deterministic minimum-sufficient-clearance, requester excluded. The LLM does not choose the approver. |
 | The wait | Agent ends its turn; SSE `approval.granted` event auto-resumes it |
 | Determinism | The **hook** writes the remediation instruction, not the system prompt |
+| **No model-side controls** | **The agent's system prompt and every tool description carry no behavioural instruction in either direction: nothing about confirming, refusing, escalating, retrying, caution or irreversibility. Measured on #14: one "irreversible, no undo" line made Claude ask permission and `/pre` never fired; one "do not ask the person to confirm" line pushed it the other way. Both removed. The prompt states role, tools, how to resolve a loan named by amount, and how to report verbatim. `tools/loan` descriptions follow (#90).** |
+| **Readiness** | **Each Render service answers `/health` with one field per capability and `status: ok|degraded`, HTTP 200 either way so Render deploys and a human can read it. cg-web: `signin, gateway, verifier, agent, panel_stream`. A missing capability is named; the home page and panel show it; nothing falls back silently. Decided across #81, #82, #14.** |
 | Redaction | Declarative per-tool field rules + regex over free text |
 | Database | `bun:sqlite`, three files: `loans.db` (domain), `governance.db` (policy + audit), `idp.db` (people) |
 | Durability | Data persists; resetting is something you deliberately run. Both databases sit on Render disks and seed from their fixture only when empty. Reset is a script (#23), never a redeploy. Decided on #29 |
@@ -187,15 +198,16 @@ client alone. Owned by #36, stated in #23's runbook.
 - `request_approval(action, resource_id, amount, justification)` — routes deterministically, posts Block Kit
 - `decide(request_id, decision, note?)` — called from the approval page as the clicker
 
-⚠️ **Neither toolkit's name has been observed yet.** `arcade deploy` derives it from the
-package, but whether it is the raw package name or a normalised form is unmeasured — spike
-#2 found that Remote MCP registration applies an aggressive normalisation (lowercase, strip
-every `mcp`/`server` substring, PascalCase) and that a hyphenated segment cannot form a
-parseable tool name at all. A policy rule keyed on the wrong toolkit matches nothing, which
-is indistinguishable from a rule that permits. **Read both names off a real `/pre` payload
-and pin them in `.env.example` before #7 writes a rule.** Tracked on #35.
+**Names, as measured on the wire (#35, #82, #14).** Toolkits deploy as `Loan` and `Approvals`.
+MCP advertises `Loan_SearchLoans`, `Loan_GetLoan`, `Loan_ApproveLoan`, `Loan_DenyLoan`,
+`Approvals_RequestApproval`, `Approvals_Decide` (underscore). Hook payloads and audit rows name
+the same tools with a dot: `Loan.GetLoan`. Policy rules are keyed the dot way; remediation text
+that tells the model which tool to call must use the underscore spelling the model actually
+sees (#89). A gateway `tools/list` carries **eight** entries: the six above plus Arcade's
+built-ins `System_ManageAuthorization` and `Arcade_ListApps`; the agent filters to the two
+project toolkits (`ARCADE_LOAN_TOOLKIT`, `ARCADE_APPROVALS_TOOLKIT`).
 
-## Cast (emails to be confirmed)
+## Cast (emails confirmed 2026-09-11; held in `PERSONA_*_EMAIL`, lowercase)
 
 | Persona | Role | Limit | Notes |
 |---|---|---:|---|
@@ -212,9 +224,28 @@ Seed loan `LN-2291`, Northwind Bakery LLC, $95,000. Carries `bank_account_number
 
 ## Event contract
 
+Audit row and SSE frame (unchanged, confirmed on the wire on #14):
+
     { id, ts, execution_id, hook: 'access'|'pre'|'post',
       user_id, tool, decision: 'allow'|'deny'|'modify',
       reason, rule_id, before?, after? }
+
+What each layer answers, as measured:
+
+- `POST /pre` denial: HTTP 200, `{ code: "CHECK_FAILED", error_message: "DENIED: … [ref evt_…]" }`;
+  allow: `{ code: "OK" }`. The `[ref evt_…]` token is the correlation to the audit row (#6).
+- Over MCP the denial flattens to `{ isError: true, content: [{ type: "text", text:
+  "Tool execution was denied by an extension policy: DENIED: … [ref evt_…]" }] }`. Mastra
+  surfaces it as a tool-error with the text in `payload.error.cause.message`.
+- Layer 2 (no token yet) is the same `isError: true` envelope whose text is JSON carrying
+  `authorization_url` and `llm_instructions`. No hook fires, no audit row. The chat renders
+  it as an authorization link, never as a denial.
+- The chat stream (`POST /api/chat`) is `application/x-ndjson`, one event per line, kinds
+  `text`, `tool-call`, `tool-result`, `denied`, `fault`, `authorization`, `error`, `done`.
+  `denied` requires positive evidence of a hook decision (Arcade's prefix, `CHECK_FAILED`,
+  `CONTEXT_DENIED`, or the `[ref evt_…]` token); every other tool failure is `fault` and the
+  UI says no decision was made. A control surface must never assert a control-plane action
+  that did not happen (#14 review).
 
 ## Open risks
 
@@ -233,7 +264,7 @@ Seed loan `LN-2291`, Northwind Bakery LLC, $95,000. Carries `bank_account_number
    cannot claim `governance.db` is a complete record of refusals. Worth a line in the panel
    naming the layer that refuses upstream of the hooks.
 
-3. **Toolkit names are unmeasured.** See **Tool surface**. Tracked on #35, blocks #7.
+3. ~~**Toolkit names are unmeasured.**~~ Measured: `Loan`, `Approvals`; see **Tool surface**.
 
 4. **Identity could silently split.** Arcade `user_id` and the OAuth subject must be the
    same email. Both hops now have a mechanism: the User Source signs the persona in at
@@ -248,10 +279,20 @@ Seed loan `LN-2291`, Northwind Bakery LLC, $95,000. Carries `bank_account_number
    The tool must request four scopes, not three: `users:read` is a prerequisite for
    `users:read.email`.*
 
-6. **What survives a hook denial over MCP?** `@arcadeai/arcadejs` exposes `execution_id` and
-   typed `CONTEXT_CHECK_FAILED` / `CONTEXT_DENIED` errors, but over MCP those flatten toward
-   `isError: true` + text. Resolved for our purposes by the hook-embedded correlation token
-   (#6); noted here because it shapes what the panel can claim.
+6. ~~**What survives a hook denial over MCP?**~~ Measured on #14; see **Event contract**. The
+   `[ref evt_…]` token survives and is what lets the chat tell a denial from a fault.
+
+7. **Act 2 depends on act 4's control (#91).** With the injected note visible, the $95K beat
+   reaches `/pre` about 5 of 17 runs; on a clean over-limit loan 12 of 12. Fix is `/post`
+   stripping the note before the model sees it (#16/#17), then re-measure. Until then do not
+   rehearse act 2 on `LN-2291`. The local tracer's gateway stand-in does not call `/post`
+   (#87), so it is more hostile than production; align it when #16 lands.
+
+8. **The remediation instruction names a tool the agent may not hold, in a spelling it never
+   sees (#89).** `pre.approve-within-clearance` says `Approvals.RequestApproval`; the model
+   sees `Approvals_RequestApproval`, and only if the approvals toolkit is in its surface.
+   Claude refused the instruction in 2 of 5 runs on principle, which is the instinct this
+   project wants. Decide the spelling on #19/#20 before act 2's second half is built.
 
 ## Sequence (~2.5 weeks)
 
@@ -260,10 +301,12 @@ Seed loan `LN-2291`, Northwind Bakery LLC, $95,000. Carries `bank_account_number
 3. Split into `apps/loan-app` + `tools/loan`; measure the toolkit names (#34, #35).
    In parallel: `apps/idp` (#36).
 4. Arcade wiring: gateway, hook extension, OAuth provider (#13).
-5. Identity in `apps/web`: sign-in as client C, gateway token, verifier route (#14a).
-   Then the thinnest vertical slice, end to end and ugly: agent → gateway → tool → API,
-   one denying pre-hook (#14). Hard gate after #14: re-ground this document.
-6. Acts 1, 3, 4 — access hook, redaction, injection.
-7. Approvals: Slack, approval page, `decide` as a governed call, auto-resume.
+5. Identity in `apps/web` (#82) and the tracer bullet (#14). **Done 2026-09-12**; this
+   document re-grounded from the wire the same day.
+6. Acts 3 and 4 first — `/post` redaction and injection strip (#16, #17) — because act 2
+   cannot fire reliably while the note is visible (#91). Act 1's UI (#15) in parallel.
+   #16 re-measures the $95K beat with `/post` live.
+7. Approvals: Slack, approval page, `decide` as a governed call, auto-resume. Resolve #89
+   (tool spelling in remediation text, approvals toolkit in the agent's surface) first.
 8. Control-plane panel and the split-screen UI.
 9. Rehearsal, reset script, README for forkers.
