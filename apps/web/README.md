@@ -574,7 +574,7 @@ this is #56's fix, the same one `apps/loan-app/scripts/dev-idp.ts` uses. Leave
 `ARCADE_API_URL` off and it binds `:0` and tells you what it got. It is not enough to drive `/chat` from a browser offline: that needs a gateway token in a
 sealed session, which means hop 1's authorization server, and the only stand-in for that
 lives in `test/identity-harness.ts`. Folding the two stand-ins together so the chat runs
-offline end to end is worth doing and is filed, not done here.
+offline end to end is worth doing and is filed as #87, not done here.
 
 ## Driving the two beats locally
 

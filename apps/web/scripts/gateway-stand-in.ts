@@ -58,7 +58,8 @@
  * token, `confirm_user`, `next_uri`. This file does not duplicate any of that —
  * it starts where a token already exists. The two overlap only in that both
  * answer on an `/mcp/{gateway}` path, and folding them together is worth doing
- * but would mean editing #82's suite from this slice. Filed instead.
+ * but would mean editing #82's suite from this slice. Filed as #87 instead,
+ * which is also what would let `/chat` be driven offline from a browser.
  */
 
 /** Arcade's fixed prefix ahead of the hook's own message. Measured, spike #2. */
