@@ -12,18 +12,24 @@
 import { useEffect, useState } from "react";
 
 import type { CorrelationKey } from "../../lib/governance/correlation.ts";
-import type { StreamMode } from "../../lib/governance/stream-url.ts";
+import type { WatchableStream } from "../../lib/governance/stream-url.ts";
 import { subscribeToGovernanceEvents, type StreamStatus } from "../../lib/governance/subscribe.ts";
 import { appendEvents, emptyTimeline } from "../../lib/governance/timeline.ts";
 import { ControlPlanePanelView } from "./ControlPlanePanelView.tsx";
 
 export interface ControlPlanePanelProps {
-  readonly streamUrl: string;
-  readonly mode: StreamMode;
+  /**
+   * Address *and* mode together, never separately: the badge this renders
+   * claims which stream the events came from, and two props could disagree.
+   * An unconfigured stream never reaches here — `app/panel/page.tsx` renders
+   * `PanelStreamError` instead, so no socket is opened and no fixture plays.
+   */
+  readonly stream: WatchableStream;
   readonly correlationKey?: CorrelationKey | undefined;
 }
 
-export function ControlPlanePanel({ streamUrl, mode, correlationKey }: ControlPlanePanelProps) {
+export function ControlPlanePanel({ stream, correlationKey }: ControlPlanePanelProps) {
+  const streamUrl = stream.url;
   const [timeline, setTimeline] = useState(emptyTimeline);
   const [status, setStatus] = useState<StreamStatus>("connecting");
 
@@ -52,7 +58,7 @@ export function ControlPlanePanel({ streamUrl, mode, correlationKey }: ControlPl
     <ControlPlanePanelView
       timeline={timeline}
       status={status}
-      mode={mode}
+      source={stream}
       correlationKey={correlationKey}
     />
   );

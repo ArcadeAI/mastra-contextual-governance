@@ -18,7 +18,7 @@ import type { GovernanceEvent } from "@cg/policy-schema";
 
 import { correlate, isCorrelated, type CorrelationKey } from "../../lib/governance/correlation.ts";
 import type { StreamStatus } from "../../lib/governance/subscribe.ts";
-import type { StreamMode } from "../../lib/governance/stream-url.ts";
+import type { PanelSource } from "../../lib/governance/stream-url.ts";
 import { allEvents, HOOK_POINTS, type Timeline } from "../../lib/governance/timeline.ts";
 import { DECISION_ORDER, DECISIONS } from "./decisions.ts";
 import { Lane } from "./Lane.tsx";
@@ -35,7 +35,8 @@ const CONNECTION: Readonly<Record<StreamStatus, string>> = {
 export interface ControlPlanePanelViewProps {
   readonly timeline: Timeline;
   readonly status: StreamStatus;
-  readonly mode: StreamMode;
+  /** Which stream this is, so the badge can say so. Never inferred from the events. */
+  readonly source: PanelSource;
   /**
    * What the chat is currently showing, if anything — a denial's text, or an
    * execution id. Everything it joins to is outlined. Absent means no
@@ -47,7 +48,7 @@ export interface ControlPlanePanelViewProps {
 export function ControlPlanePanelView({
   timeline,
   status,
-  mode,
+  source,
   correlationKey,
 }: ControlPlanePanelViewProps) {
   const correlated: GovernanceEvent[] =
@@ -59,7 +60,7 @@ export function ControlPlanePanelView({
       <header className="cg-header">
         <h2 className="cg-title">Control plane</h2>
         <div className="cg-connection" data-status={status}>
-          {mode === "fixture" && <span className="cg-mode">Fixture replay</span>}
+          <StreamBadge source={source} />
           <span className="cg-dot" aria-hidden="true" />
           <span>{CONNECTION[status]}</span>
         </div>
@@ -93,6 +94,30 @@ export function ControlPlanePanelView({
         ))}
       </div>
     </div>
+  );
+}
+
+/**
+ * Which stream this is, named on screen, always.
+ *
+ * The audience is being asked to believe that what they are watching is a real
+ * control plane deciding real calls. Before #81 the live panel said nothing at
+ * all and a replay said "Fixture replay" in small type, so the claim rested on
+ * the presenter's word. Both modes carry a badge now: the question "is this
+ * real?" is answered on the projector rather than from the stage.
+ *
+ * `LIVE` carries the host because that is the falsifiable part. "Live" alone is
+ * a word a fixture could print; `LIVE · cg-hooks.onrender.com` names the
+ * service whose `/events` this is, and a wrong one is visible at the back of
+ * the room. Chartreuse is Arcade's chrome signifier and already means "the live
+ * dot" on this header, so live gets it and the replay is deliberately plainer —
+ * never a status colour, which on this panel only ever means a decision.
+ */
+function StreamBadge({ source }: { source: PanelSource }) {
+  return (
+    <span className="cg-mode" data-mode={source.mode}>
+      {source.mode === "hooks" ? `LIVE · ${source.host}` : "FIXTURE REPLAY"}
+    </span>
   );
 }
 

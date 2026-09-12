@@ -23,7 +23,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { readWebConfig } from "../lib/config.ts";
-import { governanceStreamSource } from "../lib/governance/stream-url.ts";
+import { resolvePanelStream } from "../lib/governance/stream-url.ts";
 import { assertPublicHost, publicHost, PublicHostError } from "../lib/public-host.ts";
 
 /** Values a consumer can actually reach, or is free to leave unset. */
@@ -120,17 +120,17 @@ test("readWebConfig refuses a bare service name, and passes a hostname through",
  * fine on a deployment that cannot reach the control plane at all.
  */
 test("the panel's stream source refuses a bare service name in either mode", () => {
-  expect(() => governanceStreamSource({ HOOKS_PUBLIC_HOST: "cg-hooks" })).toThrow(PublicHostError);
+  expect(() => resolvePanelStream({ HOOKS_PUBLIC_HOST: "cg-hooks" })).toThrow(PublicHostError);
   expect(() =>
-    governanceStreamSource({ GOVERNANCE_STREAM: "hooks", HOOKS_PUBLIC_HOST: "cg-hooks" }),
+    resolvePanelStream({ GOVERNANCE_STREAM: "hooks", HOOKS_PUBLIC_HOST: "cg-hooks" }),
   ).toThrow(PublicHostError);
 
-  const live = governanceStreamSource({
+  const live = resolvePanelStream({
     GOVERNANCE_STREAM: "hooks",
     HOOKS_PUBLIC_HOST: "cg-hooks.onrender.com",
   });
-  expect(live.url).toBe("https://cg-hooks.onrender.com/events");
-  expect(governanceStreamSource({}).mode).toBe("fixture");
+  expect(live).toHaveProperty("url", "https://cg-hooks.onrender.com/events");
+  expect(resolvePanelStream({}).mode).toBe("fixture");
 });
 
 /**

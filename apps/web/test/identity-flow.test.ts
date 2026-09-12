@@ -552,6 +552,10 @@ describe("/health", () => {
         PUBLIC_URL: harness.webUrl,
         ARCADE_GATEWAY_ID: "cg-demo-us",
         ARCADE_API_KEY: "k",
+        // The fourth capability #81 added. Pinned rather than left to the
+        // ambient environment so this stays a test about identity: without it
+        // the answer would depend on whoever ran the suite.
+        GOVERNANCE_STREAM: "fixture",
       });
       const { GET } = await import("../app/health/route.ts");
       expect(await GET().json()).toEqual({
@@ -560,9 +564,10 @@ describe("/health", () => {
         signin: "configured",
         gateway: "configured",
         verifier: "configured",
+        panel_stream: "fixture",
       });
     } finally {
-      for (const key of ["IDP_ISSUER", "IDP_CLIENT_ID", "IDP_CLIENT_SECRET", "SESSION_SECRET", "PUBLIC_URL", "ARCADE_GATEWAY_ID", "ARCADE_API_KEY"]) {
+      for (const key of ["IDP_ISSUER", "IDP_CLIENT_ID", "IDP_CLIENT_SECRET", "SESSION_SECRET", "PUBLIC_URL", "ARCADE_GATEWAY_ID", "ARCADE_API_KEY", "GOVERNANCE_STREAM"]) {
         if (previous[key] === undefined) delete process.env[key];
         else process.env[key] = previous[key];
       }
@@ -663,7 +668,12 @@ describe("a SESSION_SECRET that is set but too weak", () => {
     // And through the route the reviewer actually curled.
     const previous = { ...process.env };
     try {
-      Object.assign(process.env, { ...FILLED, NODE_ENV: "production", SESSION_SECRET: "x" });
+      Object.assign(process.env, {
+        ...FILLED,
+        NODE_ENV: "production",
+        SESSION_SECRET: "x",
+        GOVERNANCE_STREAM: "fixture",
+      });
       const { GET } = await import("../app/health/route.ts");
       const answer = GET();
       // 200 on the wire, `degraded` in the body: Render abandons a deploy whose
@@ -676,9 +686,10 @@ describe("a SESSION_SECRET that is set but too weak", () => {
         signin: "missing",
         gateway: "missing",
         verifier: "missing",
+        panel_stream: "fixture",
       });
     } finally {
-      restoreEnv(previous, [...Object.keys(FILLED), "NODE_ENV", "SESSION_SECRET"]);
+      restoreEnv(previous, [...Object.keys(FILLED), "NODE_ENV", "SESSION_SECRET", "GOVERNANCE_STREAM"]);
     }
   });
 
