@@ -344,15 +344,44 @@ services:
         sync: false
       - key: PERSONA_MORGAN_EMAIL
         sync: false
-      # Server-side only, and no NEXT_PUBLIC_ twin on purpose. `next build`
-      # inlines NEXT_PUBLIC_* into the client bundle, but Render supplies
-      # service env vars at runtime — the value would be empty at build time
-      # and the browser would get `undefined`. The control-plane panel gets
-      # this host from a server component as a prop instead (#21).
+      # --- the control-plane panel's stream (#81) ---------------------------
+      # Which stream /panel watches. Three states, and the panel says which one
+      # it is in on screen:
       #
-      # Read it off the cg-hooks service page in the Render dashboard. This one
-      # is the worst of the three to get wrong: the value reaches the browser,
-      # so a bare service name fails in a visitor's DevTools rather than in a
-      # log. `apps/web/lib/public-host.ts` refuses one before that.
+      #   hooks    the live control plane at HOOKS_PUBLIC_HOST. Badge:
+      #            `LIVE · cg-hooks.onrender.com`
+      #   fixture  the built-in replay of #5's sequence. Badge: `FIXTURE REPLAY`
+      #   unset    the replay under `next dev`; NO STREAM AT ALL when deployed —
+      #            /panel renders an error state naming this variable and
+      #            /health answers `"panel_stream":"unconfigured"`, `degraded`
+      #
+      # A plain value rather than `sync: false`, unlike almost everything else
+      # here, because it is not a credential and not an address: `hooks` is what
+      # a deployment of this blueprint is for, every time.
+      #
+      # It is declared here at all because it was not. Between #21 and #81 this
+      # key was absent from the blueprint, an unset value silently meant the
+      # replay, and on 2026-09-11 a human made a real governed call against the
+      # live gateway and watched cg-web play the demo sequence over the top of
+      # it. Nothing on the page or in /health said so. The fallback is gone; the
+      # blueprint now says what it wants.
+      - key: GOVERNANCE_STREAM
+        value: hooks
+      # The host the above watches. Server-side only, and no NEXT_PUBLIC_ twin
+      # on purpose: `next build` inlines NEXT_PUBLIC_* into the client bundle,
+      # but Render supplies service env vars at runtime — the value would be
+      # empty at build time and the browser would get `undefined`. The
+      # control-plane panel gets this host from a server component as a prop
+      # instead (#21).
+      #
+      # `sync: false`, and stays that way: onrender.com subdomains are global
+      # and Render suffixes a name that is taken, so this cannot be derived or
+      # guessed. Read it off the cg-hooks service page in the Render dashboard
+      # (the host part of the URL shown there). This one is the worst of the
+      # three to get wrong: the value reaches the browser, so a bare service
+      # name fails in a visitor's DevTools rather than in a log.
+      # `apps/web/lib/public-host.ts` refuses one before that, and with
+      # GOVERNANCE_STREAM=hooks above, leaving it blank is the error state
+      # rather than a quiet replay.
       - key: HOOKS_PUBLIC_HOST
         sync: false

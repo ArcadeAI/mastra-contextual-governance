@@ -16,10 +16,14 @@
  * itself rather than as an absence of events.
  */
 import { afterEach, describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { renderToStaticMarkup } from "react-dom/server";
 
 import PanelPage from "../app/panel/page.tsx";
 import { GET as health } from "../app/health/route.ts";
+import { resolvePanelStream } from "../lib/governance/stream-url.ts";
 
 /**
  * The variables that decide the panel's stream, and the only ones these tests
@@ -246,5 +250,50 @@ describe("live mode", () => {
     const markup = await panel({ GOVERNANCE_STREAM: "hooks", HOOKS_PUBLIC_HOST: "localhost:4411" });
 
     expect(text(markup)).toContain("LIVE · localhost:4411");
+  });
+});
+
+/**
+ * The blueprint, because none of the above can make a deployment loud on its
+ * own. `render.yaml` decides what the live cg-web's environment contains, and
+ * between #21 and #81 it simply never mentioned GOVERNANCE_STREAM — which is
+ * why production was in fixture replay by construction rather than by anyone's
+ * choice. The panel refuses that state now instead of hiding it; this keeps the
+ * blueprint from re-creating it.
+ */
+describe("what render.yaml gives cg-web", () => {
+  const blueprint = Bun.YAML.parse(
+    readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "render.yaml"), "utf8"),
+  ) as { services: Array<{ name: string; envVars?: Array<Record<string, unknown>> }> };
+
+  const web = blueprint.services.find((service) => service.name === "cg-web");
+  const envVars = web?.envVars ?? [];
+  const entry = (key: string) => envVars.find((each) => each["key"] === key);
+
+  test("GOVERNANCE_STREAM is declared, as a plain value, and it is hooks", () => {
+    // Not `sync: false`: this is neither a credential nor an address, and
+    // `hooks` is what a deployment of this blueprint is for every time. Left
+    // for a human to fill in, it would be blank on the first deploy — which is
+    // the exact state #81 was opened for.
+    expect(entry("GOVERNANCE_STREAM")).toEqual({ key: "GOVERNANCE_STREAM", value: "hooks" });
+  });
+
+  test("HOOKS_PUBLIC_HOST stays sync: false, because it cannot be derived", () => {
+    // onrender.com subdomains are global and Render suffixes a name that is
+    // taken (#59: cg-web is cg-web-sa31). A value here would address somebody
+    // else's deployment.
+    expect(entry("HOOKS_PUBLIC_HOST")).toEqual({ key: "HOOKS_PUBLIC_HOST", sync: false });
+  });
+
+  test("and the pair is what the page reads as live", () => {
+    // The blueprint's own values, run through the resolution the page runs, so
+    // a blueprint that parses but says the wrong thing cannot pass.
+    const stream = resolvePanelStream({
+      NODE_ENV: "production",
+      GOVERNANCE_STREAM: entry("GOVERNANCE_STREAM")?.["value"] as string,
+      HOOKS_PUBLIC_HOST: HOOKS_HOST,
+    });
+
+    expect(stream.mode).toBe("hooks");
   });
 });
