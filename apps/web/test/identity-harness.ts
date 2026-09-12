@@ -517,6 +517,12 @@ export async function startIdentityHarness(): Promise<IdentityHarness> {
     IDP_CLIENT_SECRET: clientC.client_secret,
     SESSION_SECRET,
     PUBLIC_URL: webUrl,
+    // Not used by any route this suite drives — nothing here runs the agent.
+    // Present because `deploymentReadiness` counts the agent as the fourth
+    // capability since #14, and the assertion below is about what a *fully*
+    // configured deployment reports. Leaving it out would make this harness
+    // describe a deployment whose chat page cannot run.
+    ANTHROPIC_API_KEY: "anthropic-key-for-identity-tests",
   });
 
   const web = Bun.serve({

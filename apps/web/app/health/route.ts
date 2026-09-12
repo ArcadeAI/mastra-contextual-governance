@@ -2,8 +2,8 @@
  * Same shape as the `/health` endpoints on `hooks` and `loan-app`, so the
  * Render blueprint can point all three services at one path.
  *
- * Since #82 it also reports which of the three identity capabilities this
- * deployment actually has. That is not decoration: sign-in, the gateway hop and
+ * Since #82 it also reports which of this deployment's capabilities are
+ * actually configured — the three identity ones, and since #14 the agent. That is not decoration: sign-in, the gateway hop and
  * the custom verifier each depend on variables a human sets by hand in the
  * Render dashboard and in the Arcade dashboard, they fail independently, and
  * two of the three fail at a step no hook observes — so an unset variable is
@@ -16,19 +16,19 @@
  * misconfiguration would take the service out of rotation instead of telling
  * anyone what to fix, and Render would abandon the deploy before anybody could
  * read this. The refusal lives in the body (`"status":"degraded"`), on the home
- * page, and in the 503 every identity route answers.
+ * page, and in the 503 every identity route and the chat route answer.
  * That is what `readIdentitySurface` is for: the same environment, read without
  * the guard that belongs to a credential this endpoint does not use.
  */
-import { identityReadiness, readIdentitySurface } from "../../lib/config.ts";
+import { deploymentReadiness, readIdentitySurface } from "../../lib/config.ts";
 
 export const dynamic = "force-dynamic";
 
 export function GET() {
-  const { status, ...capabilities } = identityReadiness(readIdentitySurface());
+  const { status, ...capabilities } = deploymentReadiness(readIdentitySurface());
   // `status` first, because it is the field anybody actually reads and the one
   // the other three services answer. `degraded` whenever any capability is
   // missing — and still HTTP 200, so Render brings the instance up and a human
-  // can read the three fields that say which one.
+  // can read the four fields that say which one.
   return Response.json({ status, service: "web", ...capabilities });
 }

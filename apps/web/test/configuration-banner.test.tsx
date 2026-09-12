@@ -20,7 +20,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import {
   configurationProblems,
-  identityReadiness,
+  deploymentReadiness,
   isMisconfigured,
   readIdentitySurface,
 } from "../lib/config.ts";
@@ -38,6 +38,10 @@ const COMPLETE = {
   PUBLIC_URL: "https://cg-web-sa31.onrender.com",
   ARCADE_GATEWAY_ID: "cg-demo-us",
   ARCADE_API_KEY: "arcade-key",
+  // The agent, since #14. In this list for the same reason as the rest: a
+  // cg-web without it signs Dana in, holds a gateway token, and then the chat
+  // page fails at the point of use.
+  ANTHROPIC_API_KEY: "anthropic-key",
 } as const;
 
 function render(env: Record<string, string>): string {
@@ -119,11 +123,12 @@ describe("a fully configured deployment", () => {
     const config = readIdentitySurface(COMPLETE);
 
     expect(isMisconfigured(configurationProblems(config))).toBe(false);
-    expect(identityReadiness(config)).toEqual({
+    expect(deploymentReadiness(config)).toEqual({
       status: "ok",
       signin: "configured",
       gateway: "configured",
       verifier: "configured",
+      agent: "configured",
     });
 
     const html = render(COMPLETE);
@@ -145,13 +150,44 @@ describe("/health's top-level status", () => {
       const partial = Object.fromEntries(
         Object.entries(COMPLETE).filter(([key]) => key !== absent),
       ) as Record<string, string>;
-      const readiness = identityReadiness(readIdentitySurface(partial));
+      const readiness = deploymentReadiness(readIdentitySurface(partial));
       expect(readiness.status).toBe("degraded");
       // And it is never `degraded` with all three capabilities configured —
       // the two halves of the claim have to agree.
-      expect([readiness.signin, readiness.gateway, readiness.verifier]).toContain("missing");
+      expect([readiness.signin, readiness.gateway, readiness.verifier, readiness.agent]).toContain(
+        "missing",
+      );
     }
 
-    expect(identityReadiness(readIdentitySurface(COMPLETE)).status).toBe("ok");
+    expect(deploymentReadiness(readIdentitySurface(COMPLETE)).status).toBe("ok");
+  });
+});
+
+describe("the banner, with ANTHROPIC_API_KEY absent", () => {
+  const { ANTHROPIC_API_KEY, ...withoutModel } = COMPLETE;
+
+  test("it names the agent as the broken capability, and only that one", () => {
+    // The failure this heading exists for: identity is perfect, the persona
+    // signs in, the gateway token is held — and `/chat` answers 503 the first
+    // time somebody presses Send, which on this project means on stage.
+    const html = render(withoutModel);
+
+    expect(html).toContain('role="alert"');
+    expect(text(html)).toContain("The agent is not configured");
+    expect(text(html)).toContain("ANTHROPIC_API_KEY is not set");
+    expect(text(html)).not.toContain("Signing in is not configured");
+    // Sign-in still works, so its buttons stay live — the same reasoning as
+    // the gateway case above.
+    expect(html).toContain(`href="/api/auth/signin?persona=dana"`);
+    expect(html).not.toContain("disabled");
+  });
+
+  test("it does not repeat the gateway's problems under the agent heading", () => {
+    // `agentProblems` is a superset of `gatewayProblems` by construction, the
+    // same way `gatewayProblems` is a superset of `signinProblems`.
+    const problems = configurationProblems(readIdentitySurface({ PUBLIC_URL: COMPLETE.PUBLIC_URL }));
+    expect(problems.gateway).toContain("ARCADE_GATEWAY_ID is not set");
+    expect(problems.agent).not.toContain("ARCADE_GATEWAY_ID is not set");
+    expect(problems.agent).toContain("ANTHROPIC_API_KEY is not set");
   });
 });
