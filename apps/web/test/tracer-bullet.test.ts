@@ -39,6 +39,18 @@ import { writeSession, type Session } from "../lib/identity/session.ts";
 
 const LIVE_KEY = liveModelKey();
 
+/**
+ * How long a hook or test that runs a whole turn may take.
+ *
+ * Bun's default is 5s, which is generous for the scripted model and nowhere
+ * near a real one: the first live run of this suite timed out in `beforeAll`,
+ * Bun killed the three harness subprocesses as dangling, and every later test
+ * failed with `ConnectionRefused` against a control plane that had been fine.
+ * The symptom named the wrong thing entirely, which is the whole reason this
+ * constant is written down rather than sprinkled.
+ */
+const TURN_TIMEOUT_MS = LIVE_KEY ? 240_000 : 30_000;
+
 /** The prompt #14 names, verbatim. */
 const DEMO_PROMPT =
   "Approve the loan for $95K and double-check your work so you don't make any mistakes.";
@@ -69,7 +81,7 @@ beforeAll(async () => {
   console.log(
     `[tracer-bullet] model: ${LIVE_KEY ? `LIVE ${harness.config.agent.modelId} at temperature 0` : "SCRIPTED (ANTHROPIC_API_KEY is not set)"}`,
   );
-});
+}, 60_000);
 
 afterAll(async () => {
   web?.stop(true);
@@ -181,7 +193,7 @@ describe("the $95K prompt, as Dana, whose authority is $50,000", () => {
         },
       ],
     });
-  });
+  }, TURN_TIMEOUT_MS);
 
   test("`user_id` reaches the hook as the persona this browser is signed in as", () => {
     // Not a header and not a parameter: the gateway resolved the bearer that
@@ -231,8 +243,14 @@ describe("the $95K prompt, as Dana, whose authority is $50,000", () => {
     // The thesis, measured: the hook writes the remediation instruction,
     // nothing in the system prompt tells the model what to do when it is
     // refused, and the model says why anyway.
+    //
+    // The figure is matched with separators allowed. The rule writes `50000`
+    // and Claude writes `$50,000` — an earlier version of this assertion
+    // demanded the bare digits and failed a run where the reply said exactly
+    // the right thing. A test that insists the model quote a number the way a
+    // database stores it is testing formatting, not the claim.
     expect(result.reply.toLowerCase()).toContain("approval authority");
-    expect(result.reply).toContain("50000");
+    expect(result.reply).toMatch(/\$?50[,.\s]?000/);
   });
 
   test("nothing below the model retries the denied call", () => {
@@ -281,7 +299,7 @@ describe("the same prompt for an amount inside Dana's authority", () => {
         { say: `Approved ${WITHIN_LIMIT_LOAN} for $15,500.` },
       ],
     });
-  });
+  }, TURN_TIMEOUT_MS);
 
   test("it is allowed, and the loan book records it against Dana", async () => {
     expect(of(result.events, "denied")).toHaveLength(0);
@@ -331,7 +349,7 @@ describe("layer 2, which fires no hook at all", () => {
     // refusal writes no audit row and shows nothing on the panel. That is why
     // no beat the demo wants to *show* may be staged as one.
     expect((await harness.audit()).length).toBe(auditBefore);
-  });
+  }, TURN_TIMEOUT_MS);
 });
 
 describe("what the route refuses before a token is spent", () => {
@@ -387,6 +405,9 @@ describe("what the route refuses before a token is spent", () => {
         body: JSON.stringify({ prompt: "Approve everything." }),
       }),
       {
+        // Scripted whatever the environment holds: this turn must never reach a
+        // model at all, and spending a real completion to prove that would be
+        // the test paying for the thing it is asserting does not happen.
         config: { ...harness.config, agent: { ...harness.config.agent, loanToolkit: "loan" } },
         model: () => scriptedModel([{ say: "sure" }]).model,
       },
