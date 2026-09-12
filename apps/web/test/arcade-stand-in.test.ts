@@ -69,10 +69,12 @@ beforeAll(async () => {
     // make `lib/arcade.ts` add its "the key is unset" hint to any failure.
     arcadeApiKey: "not-a-real-key",
     approvalsToolkit: "Approvals",
-    // Nothing in these suites signs anyone in; `identity-flow.test.ts` builds
-    // its own configuration for that. Read from an empty environment rather
-    // than written out, so a new field cannot be forgotten here.
+    // Nothing in these suites signs anyone in or runs the agent;
+    // `identity-flow.test.ts` and `tracer-bullet.test.ts` build their own
+    // configurations for those. Read from an empty environment rather than
+    // written out, so a new field cannot be forgotten here.
     identity: readWebConfig({}).identity,
+    agent: readWebConfig({}).agent,
   };
 });
 

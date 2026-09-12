@@ -35,9 +35,13 @@ const STREAM_KEYS = [
   "HOOKS_PUBLIC_HOST",
   "NODE_ENV",
   "RENDER",
-  // Identity, because `/health`'s `status` folds four capabilities together and
-  // "degraded" proves nothing about the panel on a deployment where sign-in is
-  // also unset — which is every deployment this suite builds by default.
+  // Identity and the agent, because `/health`'s `status` folds five fields
+  // together and "degraded" proves nothing about the panel on a deployment
+  // where sign-in is also unset — which is every deployment this suite builds
+  // by default. `ANTHROPIC_API_KEY` is here for the same reason and one more:
+  // it may well be set in the ambient environment of whoever runs the suite
+  // (see `test/model.ts`), so a case that means "configured" has to say so
+  // rather than inherit it.
   "IDP_ISSUER",
   "IDP_CLIENT_ID",
   "IDP_CLIENT_SECRET",
@@ -45,6 +49,7 @@ const STREAM_KEYS = [
   "PUBLIC_URL",
   "ARCADE_GATEWAY_ID",
   "ARCADE_API_KEY",
+  "ANTHROPIC_API_KEY",
 ] as const;
 
 /**
@@ -111,6 +116,11 @@ const IDENTITY = {
   PUBLIC_URL: "https://cg-web-sa31.onrender.com",
   ARCADE_GATEWAY_ID: "cg-demo-us",
   ARCADE_API_KEY: "arcade-key",
+  // The agent capability (#14), which `/health` counts alongside the three
+  // identity ones. In this fixture for the same reason every other value here
+  // is: these tests are about `panel_stream`, and without it `status` would be
+  // `degraded` for a reason that has nothing to do with the panel.
+  ANTHROPIC_API_KEY: "anthropic-key",
 } as const;
 
 describe("a deployed panel that was never told which stream to watch", () => {
@@ -159,6 +169,7 @@ describe("a deployed panel that was never told which stream to watch", () => {
       signin: "configured",
       gateway: "configured",
       verifier: "configured",
+      agent: "configured",
       panel_stream: "unconfigured",
     });
   });

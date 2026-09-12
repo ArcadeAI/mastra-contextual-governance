@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "bun scripts/next.ts dev",
     "arcade-stand-in": "bun scripts/arcade-stand-in.ts",
+    "gateway-stand-in": "bun scripts/gateway-stand-in.ts",
     "build": "next build",
     "start": "bun scripts/next.ts start",
     "typecheck": "tsc --noEmit",
@@ -12,7 +13,11 @@
   },
   "//": "`dev` and `start` go through `scripts/next.ts` so that PORT comes from this service's own `.env.local`, the way it does for the three Bun services. `next dev --port ${PORT:-3000}` did not: the shell expanded it before anything read the file, and the service bound 3000 in a worktree that owns 4410. See #50 and the comment at the top of that script; `test/dev-port.test.ts` fails if the shell-expanded form comes back.",
   "dependencies": {
+    "@ai-sdk/anthropic": "^4.0.53",
     "@cg/policy-schema": "workspace:*",
+    "@mastra/core": "^1.66.0",
+    "@mastra/mcp": "^1.17.3",
+    "ai": "^7.0.99",
     "next": "^15.5.4",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",

@@ -57,6 +57,42 @@ export interface IdentityConfig {
   cloudUrl: string;
 }
 
+/**
+ * The model the agent runs on, and the toolkits it is allowed to reach.
+ *
+ * `DESIGN.md` → Model: Claude Sonnet 5 via `@ai-sdk/anthropic`, temperature 0,
+ * **model id from env** so it can be swapped without a code change. Temperature
+ * is not here because it is not configurable — a demo about determinism does
+ * not put its determinism in a variable somebody can raise.
+ */
+export interface AgentConfig {
+  /** `ANTHROPIC_API_KEY`. Server-side only; it never reaches a route's response. */
+  anthropicApiKey: string;
+  /** `MODEL_ID` — `claude-sonnet-5`. */
+  modelId: string;
+  /**
+   * Every toolkit this project owns, as Arcade files them — `["Loan",
+   * "Approvals"]`, measured on #35. The agent's **allow-list**.
+   *
+   * Both, not just `Loan`. Round 1 of #88's review found the chat handler
+   * passing the loan toolkit alone: the documented eight-tool surface selected
+   * four, `Approvals_RequestApproval` and `Approvals_Decide` were dropped
+   * alongside the gateway's built-ins, and the pre-hook's own remediation
+   * instruction — *"call Approvals.RequestApproval"* — named a tool the model
+   * could not see. That is the failure #89 records the live model reasoning
+   * its way to, out loud.
+   *
+   * Load-bearing in the way this repo keeps warning about, but pointing the
+   * other way from the hooks' copy of the same two values. There, a wrong name
+   * is a rule that matches nothing. Here, a wrong name is an allow-list that
+   * **selects** nothing, and the agent is handed no tools at all — which is
+   * loud rather than silent, because `lib/agent/handlers.ts` refuses the turn
+   * rather than letting a model answer from memory about a loan book it could
+   * not read.
+   */
+  toolkits: readonly string[];
+}
+
 export interface WebConfig {
   /** `apps/hooks`, which owns `governance.db` and the approvals store. */
   hooksHost: string;
@@ -69,6 +105,8 @@ export interface WebConfig {
   approvalsToolkit: string;
   /** Sign-in, the gateway hop, and the custom verifier route. */
   identity: IdentityConfig;
+  /** The model, and which toolkits the agent may reach through the gateway. */
+  agent: AgentConfig;
 }
 
 /**
@@ -104,7 +142,7 @@ const DEV_STORE_TOKEN = "cg-approvals-store-dev-token-not-for-production";
  * Still one place reading the environment — this file — and `readWebConfig`
  * builds on it rather than repeating it.
  */
-export type IdentitySurface = Pick<WebConfig, "identity" | "arcadeApiUrl" | "arcadeApiKey">;
+export type IdentitySurface = Pick<WebConfig, "identity" | "arcadeApiUrl" | "arcadeApiKey" | "agent">;
 
 export function readIdentitySurface(
   env: Record<string, string | undefined> = process.env,
@@ -112,6 +150,20 @@ export function readIdentitySurface(
   return {
     arcadeApiUrl: trimUrl(env.ARCADE_API_URL) || "https://api.arcade.dev",
     arcadeApiKey: env.ARCADE_API_KEY?.trim() ?? "",
+    agent: {
+      anthropicApiKey: env.ANTHROPIC_API_KEY?.trim() ?? "",
+      // Defaulted rather than required: a deployment that never set it still
+      // runs the model `DESIGN.md` names, and `render.yaml` sets it explicitly
+      // so the blueprint is the whole list rather than most of it.
+      modelId: env.MODEL_ID?.trim() || "claude-sonnet-5",
+      // The same two variables `apps/hooks` keys its rules on, read here as an
+      // allow-list. Blank entries are dropped rather than turned into a bare
+      // `_` prefix, which would match every tool the gateway advertises.
+      toolkits: [
+        env.ARCADE_LOAN_TOOLKIT?.trim() || "Loan",
+        env.ARCADE_APPROVALS_TOOLKIT?.trim() || "Approvals",
+      ].filter((name) => name !== ""),
+    },
     identity: {
       idpIssuer: trimUrl(env.IDP_ISSUER),
       idpClientId: env.IDP_CLIENT_ID?.trim() ?? "",
@@ -161,11 +213,12 @@ function trimUrl(value: string | undefined): string {
 /**
  * What `/health` reports, and what each route refuses to run without.
  *
- * Three capabilities rather than one flag, because they fail independently and
+ * Four capabilities rather than one flag, because they fail independently and
  * the person reading `/health` is trying to find out which human step is
  * outstanding. Sign-in needs client C; the gateway hop needs a gateway id on
  * top of a signed-in person; the verifier needs the Arcade project API key,
- * which nothing else here uses.
+ * which nothing else here uses; and the agent needs a model key on top of the
+ * gateway hop (#14).
  *
  * A control that silently does nothing is worse than no control, and a
  * half-configured identity is exactly that: the browser gets a persona label
@@ -180,10 +233,10 @@ function trimUrl(value: string | undefined): string {
  * control this project exists to argue against, so the same check that decides
  * whether a key may be derived decides what this function reports.
  */
-export interface IdentityReadiness {
+export interface DeploymentReadiness {
   /**
-   * `degraded` whenever any of the three below is `missing`, `ok` only when all
-   * three are configured.
+   * `degraded` whenever any of the four below is `missing`, `ok` only when all
+   * four are configured.
    *
    * Round 2 of #84's review ran a cg-web with sign-in configured and
    * `ARCADE_GATEWAY_ID` absent and got `{"status":"ok", … "gateway":"missing"}`.
@@ -203,13 +256,24 @@ export interface IdentityReadiness {
   signin: "configured" | "missing";
   gateway: "configured" | "missing";
   verifier: "configured" | "missing";
+  /**
+   * The agent (#14). Fourth because it arrived fourth, and reported for exactly
+   * the reason the other three are: a cg-web with no `ANTHROPIC_API_KEY` signs
+   * personas in, holds gateway tokens, answers the verifier — and then the chat
+   * page fails at the point of use, which is the one moment nobody wants to
+   * discover it. This is the same argument rounds 1 and 2 of #84's review made
+   * about `SESSION_SECRET` and `ARCADE_GATEWAY_ID`, applied to the variable
+   * this slice added.
+   */
+  agent: "configured" | "missing";
 }
 
-export function identityReadiness(config: IdentitySurface): IdentityReadiness {
+export function deploymentReadiness(config: IdentitySurface): DeploymentReadiness {
   const capabilities = {
     signin: state(signinProblems(config)),
     gateway: state(gatewayProblems(config)),
     verifier: state(verifierProblems(config)),
+    agent: state(agentProblems(config)),
   } as const;
   return {
     status: Object.values(capabilities).every((each) => each === "configured") ? "ok" : "degraded",
@@ -236,6 +300,7 @@ export interface ConfigurationProblems {
   signin: string[];
   gateway: string[];
   verifier: string[];
+  agent: string[];
 }
 
 export function configurationProblems(config: IdentitySurface): ConfigurationProblems {
@@ -246,6 +311,7 @@ export function configurationProblems(config: IdentitySurface): ConfigurationPro
     // something people stop reading. Show only what sign-in did not already say.
     gateway: withoutAll(gatewayProblems(config), signinProblems(config)),
     verifier: withoutAll(verifierProblems(config), signinProblems(config)),
+    agent: withoutAll(agentProblems(config), gatewayProblems(config)),
   };
 }
 
@@ -301,6 +367,25 @@ export function verifierProblems(config: IdentitySurface): string[] {
     ...(config.arcadeApiKey ? [] : ["ARCADE_API_KEY is not set"]),
     ...(config.identity.cloudUrl ? [] : ["ARCADE_CLOUD_URL is not set"]),
     ...(secret ? [secret] : []),
+  ];
+}
+
+/**
+ * Everything wrong with this environment for running a turn of the agent.
+ *
+ * A superset of `gatewayProblems`, because the agent reaches its tools through
+ * the gateway with the signed-in persona's token: no token, no tools, and a
+ * model answering about a loan book it never read is worse than a refusal.
+ *
+ * `MODEL_ID` is absent from this list on purpose — it has a working default and
+ * a deployment that never sets it runs the model `DESIGN.md` names. A key is
+ * different: there is no default that could stand in for it.
+ */
+export function agentProblems(config: IdentitySurface): string[] {
+  return [
+    ...gatewayProblems(config),
+    ...(config.agent.anthropicApiKey ? [] : ["ANTHROPIC_API_KEY is not set"]),
+    ...(config.agent.toolkits.length > 0 ? [] : ["ARCADE_LOAN_TOOLKIT is not set"]),
   ];
 }
 

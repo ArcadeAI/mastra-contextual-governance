@@ -234,13 +234,35 @@ services:
     envVars:
       - key: PORT
         value: 8080
+      # --- the agent (#14) --------------------------------------------------
+      # A Mastra agent in a route handler reaches the loan tools through the
+      # gateway as the signed-in persona. DESIGN.md → Model, Integration.
+      #
+      # Pinned here rather than left to the code's default so the blueprint is
+      # the whole list. Swapping the model is this line and a redeploy.
       - key: MODEL_ID
         value: claude-sonnet-5
+      # SECRET. console.anthropic.com → Settings → API keys. Without it `/chat`
+      # answers 503 naming this variable and /health reports
+      # `"agent": "missing"`, because a deployment that signs Dana in and then
+      # cannot run a turn is not `ok`.
       - key: ANTHROPIC_API_KEY
         sync: false
       - key: ARCADE_API_KEY
         sync: false
       - key: ARCADE_GATEWAY_ID
+        sync: false
+      # `tool.toolkit` as Arcade files the deployed loan toolkit — `Loan`,
+      # measured on #35, the same value cg-hooks holds. Here it is an
+      # ALLOW-LIST: the agent is given the tools whose wire names start with
+      # `Loan_` and nothing else, so a live tools/list's eight entries become
+      # six and the gateway's own `System_ManageAuthorization` and
+      # `Arcade_ListApps` never reach the model.
+      #
+      # A wrong value here selects nothing, and `/chat` answers 502 naming this
+      # variable rather than letting a model with no tools answer fluently
+      # about a loan book it never read.
+      - key: ARCADE_LOAN_TOOLKIT
         sync: false
       # --- identity (#82) ---------------------------------------------------
       # This service signs each persona in against cg-idp under its own OAuth

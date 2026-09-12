@@ -22,7 +22,7 @@
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 
-import { identityReadiness, readIdentitySurface, readWebConfig } from "../lib/config.ts";
+import { deploymentReadiness, readIdentitySurface, readWebConfig } from "../lib/config.ts";
 import { readSession } from "../lib/identity/session.ts";
 import { SESSION_SECRET_MIN_LENGTH, sessionSecretProblem } from "../lib/identity/seal.ts";
 import {
@@ -506,20 +506,25 @@ describe("hop 2 — the no-session path, which is the human's case", () => {
 });
 
 describe("/health", () => {
-  test("it reports the three identity fields", async () => {
-    const ready = identityReadiness(harness.config);
+  test("it reports the four capability fields", async () => {
+    const ready = deploymentReadiness(harness.config);
     expect(ready).toEqual({
       status: "ok",
       signin: "configured",
       gateway: "configured",
       verifier: "configured",
+      // The fourth since #14. `ANTHROPIC_API_KEY` is set on this harness for
+      // this line alone — a deployment that signs Dana in and then cannot run
+      // a turn is not `ok` either.
+      agent: "configured",
     });
 
-    expect(identityReadiness(readWebConfig({}))).toEqual({
+    expect(deploymentReadiness(readWebConfig({}))).toEqual({
       status: "degraded",
       signin: "missing",
       gateway: "missing",
       verifier: "missing",
+      agent: "missing",
     });
 
     // Each capability fails on its own variables rather than as one flag.
@@ -530,14 +535,15 @@ describe("/health", () => {
       SESSION_SECRET: GOOD_SECRET,
       PUBLIC_URL: harness.webUrl,
     });
-    expect(identityReadiness(signinOnly)).toEqual({
-      // Two of three configured is still `degraded`: a deployment that can sign
+    expect(deploymentReadiness(signinOnly)).toEqual({
+      // One of four configured is still `degraded`: a deployment that can sign
       // Dana in and then cannot make a tool call is not `ok`, and round 2 of
       // this PR's review found exactly that shape reporting itself as fine.
       status: "degraded",
       signin: "configured",
       gateway: "missing",
       verifier: "missing",
+      agent: "missing",
     });
   });
 
@@ -552,9 +558,11 @@ describe("/health", () => {
         PUBLIC_URL: harness.webUrl,
         ARCADE_GATEWAY_ID: "cg-demo-us",
         ARCADE_API_KEY: "k",
-        // The fourth capability #81 added. Pinned rather than left to the
-        // ambient environment so this stays a test about identity: without it
-        // the answer would depend on whoever ran the suite.
+        // The two capabilities that arrived after #82, both pinned rather
+        // than left to the ambient environment so this stays a test about
+        // identity: without them the answer would depend on whoever ran the
+        // suite, and on this machine `ANTHROPIC_API_KEY` may well be set.
+        ANTHROPIC_API_KEY: "a",
         GOVERNANCE_STREAM: "fixture",
       });
       const { GET } = await import("../app/health/route.ts");
@@ -564,10 +572,11 @@ describe("/health", () => {
         signin: "configured",
         gateway: "configured",
         verifier: "configured",
+        agent: "configured",
         panel_stream: "fixture",
       });
     } finally {
-      for (const key of ["IDP_ISSUER", "IDP_CLIENT_ID", "IDP_CLIENT_SECRET", "SESSION_SECRET", "PUBLIC_URL", "ARCADE_GATEWAY_ID", "ARCADE_API_KEY", "GOVERNANCE_STREAM"]) {
+      for (const key of ["IDP_ISSUER", "IDP_CLIENT_ID", "IDP_CLIENT_SECRET", "SESSION_SECRET", "PUBLIC_URL", "ARCADE_GATEWAY_ID", "ARCADE_API_KEY", "ANTHROPIC_API_KEY", "GOVERNANCE_STREAM"]) {
         if (previous[key] === undefined) delete process.env[key];
         else process.env[key] = previous[key];
       }
@@ -656,13 +665,14 @@ describe("a SESSION_SECRET that is set but too weak", () => {
     expect(sessionSecretProblem("hunter2-hunter2-hunter2-hunter2!")).toBeNull();
   });
 
-  test("/health reports signin, gateway and verifier as missing", async () => {
+  test("/health reports every capability as missing", async () => {
     const weak = readIdentitySurface({ ...FILLED, SESSION_SECRET: "x" });
-    expect(identityReadiness(weak)).toEqual({
+    expect(deploymentReadiness(weak)).toEqual({
       status: "degraded",
       signin: "missing",
       gateway: "missing",
       verifier: "missing",
+      agent: "missing",
     });
 
     // And through the route the reviewer actually curled.
@@ -686,6 +696,11 @@ describe("a SESSION_SECRET that is set but too weak", () => {
         signin: "missing",
         gateway: "missing",
         verifier: "missing",
+        agent: "missing",
+        // `fixture` rather than `unconfigured`: the panel is watching something
+        // it was told to watch, so it is not what makes this `degraded` — the
+        // four missing capabilities are. Both halves of the status expression
+        // are exercised, one at a time.
         panel_stream: "fixture",
       });
     } finally {

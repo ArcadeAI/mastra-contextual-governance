@@ -60,12 +60,15 @@ const button: React.CSSProperties = {
  *
  * The sentences are the ones `lib/config.ts` already produces for the 503 pages
  * and counts for `/health`. One source, three surfaces, so nothing here can
- * describe a different deployment from the one the routes refuse for.
+ * describe a different deployment from the one the routes refuse for. #14 added
+ * the fourth heading on the same argument: an `ANTHROPIC_API_KEY` nobody set is
+ * discovered when somebody presses Send.
  */
 const BANNER_HEADINGS: ReadonlyArray<readonly [keyof ConfigurationProblems, string]> = [
   ["signin", "Signing in is not configured"],
   ["gateway", "The gateway hop is not configured"],
   ["verifier", "The custom verifier is not configured"],
+  ["agent", "The agent is not configured"],
 ] as const;
 
 export function ConfigurationBanner({ problems }: { problems: ConfigurationProblems }) {
@@ -87,7 +90,7 @@ export function ConfigurationBanner({ problems }: { problems: ConfigurationProbl
       <h2 style={{ fontSize: "1rem", margin: "0 0 0.5rem" }}>This deployment is not fully configured</h2>
       <p style={{ margin: "0 0 0.75rem", fontSize: "0.875rem" }}>
         Some of it will work and some of it will fail at the point of use. <code>GET /health</code>{" "}
-        answers <code>&quot;status&quot;: &quot;degraded&quot;</code> and names the same three
+        answers <code>&quot;status&quot;: &quot;degraded&quot;</code> and names the same
         capabilities; <code>apps/web/README.md</code> says where each value comes from.
       </p>
       {BANNER_HEADINGS.map(([key, heading]) =>
